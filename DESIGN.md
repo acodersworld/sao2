@@ -111,9 +111,28 @@ accessed by zero-based position, such as `value.0`, `value.1`, and `value.2`.
 
 Structs are objects with reference semantics. Tuples are immutable value types;
 their members cannot be modified after construction. Primitive and tuple
-members are stored inline. Object-valued members are stored as garbage-collected
-references rather than embedded inline. A recursive tuple definition that would
-have infinite inline size is rejected.
+members are stored inline. Struct-valued members are also embedded inline by
+default. Prefixing a struct member's type with `&` instead stores a
+garbage-collected reference:
+
+```text
+type Target(x float, y float);
+type Body(target Target, sharedTarget &Target);
+```
+
+Here `target` is inline and `sharedTarget` is a reference. `&` selects member
+storage and does not define a separate first-class reference type. Other
+object-valued members are stored as garbage-collected references. A recursive
+tuple or inline-struct definition that would have infinite size is rejected;
+recursive struct relationships must cross a referenced `&` member.
+
+Access syntax is identical for inline and referenced members. Accessing an
+inline struct member produces a reference to its stable embedded slot, which
+may be passed or returned like any other struct reference. Assigning a struct
+to an inline member copies its language-visible fields into that slot while
+preserving the slot's identity and collector timestamp. Referenced members are
+rebound instead. Copies preserve the collector metadata of every destination
+inline subobject and share any referenced objects.
 
 ### Unions
 
@@ -298,9 +317,10 @@ copies its payload according to the payload type: inline values are copied and
 object references remain shared.
 
 An unqualified object reference provides read-only access rather than promising
-that the object never changes. Mutability is shallow: `var` permits mutation of
-the directly referred object and replacement of its fields, but does not grant
-mutable access to separate objects referenced by those fields.
+that the object never changes. Mutability is transitive: `var` permits mutation
+of the directly referred object and objects reached through its references, as
+well as replacement of their fields. Immutable values such as strings and
+tuples remain immutable.
 
 Whether escape analysis places an object on the stack or the garbage-collected
 heap is not observable by the program.
@@ -436,10 +456,45 @@ values are conceptually stored inline. Objects are allocated on the
 garbage-collected heap unless escape analysis proves that they do not outlive
 the current function, in which case they are allocated on the stack.
 
-The compiler performs whole-program escape analysis. Functions are analysed
-from the leaves of the call graph upward. Recursive groups are analysed together
-until their escape information reaches a fixed point. When safety cannot be
-proven, the object is allocated on the garbage-collected heap.
+The compiler performs conservative, context-insensitive escape analysis one
+function at a time. For each function it records only the functions called
+directly and the functions which call it. Each function tracks its number of
+unresolved direct callees. Functions with none are placed in a queue. After a
+function is analysed, the compiler updates its callers and queues any whose
+unresolved count reaches zero. Every direct call edge is processed once; no
+call-path traversal is needed. A summary records which parameters may escape,
+including parameters whose value or inline member may be returned.
+
+A caller trusts the callee's summary without reconsidering it based on how the
+caller uses the result. Passing an object to a parameter classified as escaping
+therefore causes the complete object allocation to use the garbage-collected
+heap, even when a more context-sensitive analysis could prove stack allocation
+safe. Functions left unresolved after the queue is exhausted are conservatively
+treated as escaping because they are recursive or depend on recursion. Whenever
+safety cannot be proven, allocation uses the GC heap.
+
+The initial collector is non-moving, stop-the-world, and mark-and-sweep. Every
+struct contains a mark timestamp, including a struct embedded within another
+struct. Each root heap allocation records its complete generated layout,
+including the locations and layouts of embedded structs, and participates in
+the collector's allocation list.
+
+At the start of collection, the runtime advances a global collection timestamp.
+A typed root reference marks the exact struct it references with that timestamp
+and recursively traces values reachable from that struct. Referencing an outer
+struct makes its embedded structs reachable; referencing only an embedded
+struct does not make its parent or siblings reachable.
+
+During sweeping, the collector walks each root allocation and recursively
+checks the timestamps of all structs described by its layout. The allocation is
+retained if its root or any embedded struct was marked during the current
+collection. It is freed only when none were marked. This permits an ordinary
+interior pointer to keep its complete enclosing allocation alive without first
+recovering the allocation's root address.
+
+If a reference to an embedded struct escapes a function, escape analysis places
+the complete enclosing allocation on the heap. Replacing an embedded struct
+updates its language-visible fields but preserves its collector metadata.
 
 ## Static analysis
 
@@ -512,8 +567,7 @@ ascribes a type to an empty collection literal.
 
 ## Remaining implementation specification
 
-The core language design is complete. Implementation work must make the
-following details precise:
+Implementation work must make the following details precise:
 
 - Formal EBNF grammar
 - Lexer and parser edge cases
