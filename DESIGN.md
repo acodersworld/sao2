@@ -272,8 +272,41 @@ matter, and direct and mutual recursion are allowed. Arguments are evaluated
 from left to right. Default and variadic parameters are not initially
 supported. Every path through a value-returning function must return a value.
 
-The program entry point is `fn main()`. It may omit its return type or return an
-`int`, which becomes the process exit code.
+The program entry point has one of four forms:
+
+```text
+fn main() {}
+fn main() int {}
+fn main(args [str]) {}
+fn main(args [str]) int {}
+```
+
+Command-line arguments exclude the executable name and retain their original
+order. Every argument must be valid ASCII; otherwise the runtime panics before
+entering `main`. A `main` with no return type exits successfully, while an
+`int` return becomes the process exit code.
+
+## Runtime built-ins
+
+The runtime provides minimal standard output:
+
+```text
+print(value);
+println(value);
+println();
+```
+
+`print` writes without a newline, while `println` appends one. They accept one
+primitive value or an immutable tuple recursively containing printable values;
+the zero-argument `println` writes an empty line. Strings and characters print
+their contents without quotes, integers use decimal, floats use the shortest
+decimal representation that round-trips exactly, and booleans print as `true`
+or `false`. An output failure causes a panic. These operations are compiler
+intrinsics rather than overloaded or variadic user functions.
+
+The `panic(message)` intrinsic accepts a `str` and never returns. Standard
+input, files, environment variables, clocks, randomness, and process APIs are
+not initially provided.
 
 ## Panics
 
@@ -641,9 +674,3 @@ Runtime stack traces are not initially provided.
 
 Failure to compile generated C is considered a compiler bug. A debug option may
 expose the generated C file and compiler diagnostics for investigation.
-
-## Remaining implementation specification
-
-Implementation work must make the following details precise:
-
-- Minimal runtime built-ins, including output and command-line arguments
