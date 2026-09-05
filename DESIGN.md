@@ -14,7 +14,7 @@ The initial primitive types are:
 
 | Type | Meaning |
 | --- | --- |
-| `int` | 64-bit integer |
+| `int` | Signed 64-bit two's-complement integer |
 | `float` | 64-bit floating-point number |
 | `str` | String |
 | `bool` | Boolean |
@@ -349,8 +349,10 @@ equivalent for strings.
 
 Boolean operations use `!`, `&&`, and `||` and require `bool` operands. `&&`
 and `||` short-circuit. Bitwise operations use `~`, `&`, `|`, `^`, `<<`, and
-`>>` and require `int` operands. A negative shift count or one greater than 63
-causes a runtime panic. Overflow from a left shift also causes a runtime panic.
+`>>` and require `int` operands. Shift counts must be between 0 and 63 inclusive;
+other counts cause a runtime panic. Right shift is arithmetic and preserves the
+sign bit. Left shift behaves as checked multiplication by a power of two and
+panics when the mathematical result is outside the signed 64-bit range.
 
 Numeric conversions are explicit:
 
@@ -368,7 +370,11 @@ not produce values. Increment, decrement, comma, and ternary operators are not
 initially supported.
 
 Integer arithmetic is checked. Overflow or underflow causes a runtime panic.
-Integer or floating-point division by zero also causes a runtime panic.
+Integer division truncates toward zero. Remainder has the same sign as the
+dividend and satisfies `a == (a / b) * b + (a % b)`. Integer division or
+remainder by zero causes a runtime panic. Both `-2^63 / -1` and `-2^63 % -1`
+panic because the corresponding division is not representable. Floating-point
+division by zero also causes a runtime panic.
 Floating-point values use IEEE 754 binary64 representation. An operation that
 produces infinity or NaN causes a runtime panic. Underflow follows IEEE 754
 rounding and may produce a subnormal value or zero. Negative zero compares equal
@@ -565,12 +571,53 @@ type position and bitwise OR in expression position; `:` separates a map entry
 or introduces a single-statement control-flow body, and postfix `: type`
 ascribes a type to an empty collection literal.
 
+### Lexical and parsing edge cases
+
+The lexer uses longest-token matching, so `>>=` is recognized before `>>` and
+`:=` before `:`. A keyword is recognized only when it forms a complete token.
+Comments are recognized only outside literals. Unterminated strings, character
+literals, escapes, and block comments are errors. Raw newlines are not allowed
+inside string or character literals, and a character literal must contain
+exactly one ASCII character after escape decoding.
+
+Numeric signs are operators rather than part of literal tokens. `_` separators
+may appear only between digits. A leading zero does not imply octal. A decimal
+point requires digits on both sides: `1.0` is a float and `value.0` accesses a
+tuple member, while `.5` and `1.` are invalid.
+
+An `else` binds to the nearest unmatched `if`. Assignment is a statement, so
+`Point(x = 1)` unambiguously contains a named constructor argument. In type
+context, `|` declares a union and `&Type` selects referenced storage for a
+struct member. In expression context, `|` and `&` are bitwise operators.
+
+Calls, indexing, member access, and postfix `?` have the highest expression
+precedence and may be chained. Braces following `fn`, `if`, `else`, `while`,
+`for`, or a braced switch arm always delimit a block. Otherwise, expression
+braces are distinguished as follows:
+
+```text
+{key: value} // map
+{value}      // block expression returning value
+{value;}     // block discarding value
+{}           // empty map in expression position
+```
+
+An expression followed by `;` is a statement which discards its value. An
+expression followed directly by `}` supplies its block's value. In an
+expression-form single-line `if`, `else` terminates the preceding branch:
+
+```text
+value := if condition: 1 else: 2;
+```
+
+The intended implementation uses a longest-match lexer, recursive-descent type
+and statement parsing, and Pratt expression parsing. Invalid or ambiguous input
+produces a syntax error rather than being interpreted automatically.
+
 ## Remaining implementation specification
 
 Implementation work must make the following details precise:
 
 - Formal EBNF grammar
-- Lexer and parser edge cases
-- Exact signed integer division, remainder, and shift behaviour
 - Minimal runtime built-ins, including output and command-line arguments
 - Diagnostics and source locations
