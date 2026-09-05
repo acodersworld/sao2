@@ -614,10 +614,33 @@ The intended implementation uses a longest-match lexer, recursive-descent type
 and statement parsing, and Pratt expression parsing. Invalid or ambiguous input
 produces a syntax error rather than being interpreted automatically.
 
+## Diagnostics and source locations
+
+Every token and syntax-tree node carries a half-open source byte span. The
+compiler records line-start offsets and presents one-based line and column
+numbers. Tabs expand to four columns when diagnostics are rendered. A
+compiler-generated node inherits the span of the source construct that caused
+it.
+
+Compile-time diagnostics show the source filename, line, column, relevant
+source line, and a caret marking the primary span. Related spans may identify
+previous declarations or conflicting types. Diagnostics are sorted by source
+position. The compiler recovers at safe boundaries such as semicolons and
+closing braces to report multiple errors, but stops after 20 errors to limit
+cascades. There are no warnings initially; every diagnostic represents a
+definite problem.
+
+Runtime checks receive a compact location identifier. A generated table maps
+each identifier to its SAO2 source location and function. A panic reports the
+exact SAO2 location and function without exposing generated C locations.
+Runtime stack traces are not initially provided.
+
+Failure to compile generated C is considered a compiler bug. A debug option may
+expose the generated C file and compiler diagnostics for investigation.
+
 ## Remaining implementation specification
 
 Implementation work must make the following details precise:
 
 - Formal EBNF grammar
 - Minimal runtime built-ins, including output and command-line arguments
-- Diagnostics and source locations
