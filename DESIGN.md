@@ -526,6 +526,10 @@ false.
 
 ## Grammar
 
+The complete syntax is defined by the [formal EBNF grammar](GRAMMAR.ebnf).
+That file also explains the EBNF notation and lists contextual constraints
+which are enforced after parsing.
+
 Source files use UTF-8. Identifiers contain ASCII letters, digits, and
 underscores, cannot begin with a digit, and are case-sensitive. Keywords are
 reserved. Identifiers and character and string contents are initially limited
@@ -642,5 +646,4 @@ expose the generated C file and compiler diagnostics for investigation.
 
 Implementation work must make the following details precise:
 
-- Formal EBNF grammar
 - Minimal runtime built-ins, including output and command-line arguments

@@ -1,0 +1,296 @@
+(* SAO2 v0 grammar
+
+   Notation
+   --------
+   rule       = definition ;     defines a rule
+   "text" or 'text'             matches literal source text
+   a, b                         matches a followed by b
+   a | b                         matches either a or b
+   [ a ]                         matches zero or one a
+   { a }                         matches zero or more a
+   ( a )                         groups terms
+   "A" ... "Z"                 denotes an inclusive character range
+   parenthesized asterisks       enclose a grammar comment
+
+   Lexical analysis removes whitespace and comments before parsing. The lexer
+   uses longest-token matching. Rules described as semantic constraints at the
+   end are intentionally not encoded in the context-free grammar.
+*)
+
+program             = { top-level-declaration }, EOF ;
+
+top-level-declaration
+                    = type-declaration
+                    | function-declaration ;
+
+type-declaration    = "type", identifier, "(", type-declaration-body, ")", ";" ;
+
+type-declaration-body
+                    = named-member-list
+                    | unnamed-member-list ;
+
+named-member-list   = named-member, { ",", named-member } ;
+named-member        = identifier, [ "&" ], type ;
+
+unnamed-member-list = type, { ",", type } ;
+
+function-declaration
+                    = "fn", identifier, "(", [ parameter-list ], ")",
+                      [ type ], block ;
+
+parameter-list      = parameter, { ",", parameter } ;
+parameter           = [ "var" ], identifier, type ;
+
+type                = union-type ;
+union-type          = type-atom, { "|", type-atom } ;
+
+type-atom           = primitive-type
+                    | identifier
+                    | list-type
+                    | map-type
+                    | tagged-alternative
+                    | "(", type, ")" ;
+
+primitive-type      = "int" | "float" | "str" | "bool" | "char" ;
+list-type           = "[", type, "]" ;
+map-type            = "{", type, ":", type, "}" ;
+tagged-alternative  = identifier, "(", type, ")" ;
+
+block               = "{", { statement }, [ expression ], "}" ;
+
+statement           = local-declaration
+                    | assignment-statement
+                    | expression-statement
+                    | return-statement
+                    | break-statement
+                    | continue-statement
+                    | if-statement
+                    | while-statement
+                    | for-statement
+                    | switch-statement
+                    | block ;
+
+local-declaration   = [ "var" ], identifier, ":=", expression, ";" ;
+
+assignment-statement
+                    = assignment-target, assignment-operator, expression, ";" ;
+
+assignment-target   = identifier,
+                      { member-access | index-access } ;
+
+assignment-operator = "=" | "+=" | "-=" | "*=" | "/=" | "%="
+                    | "&=" | "|=" | "^=" | "<<=" | ">>=" ;
+
+expression-statement
+                    = expression, ";" ;
+
+return-statement    = "return", [ expression ], ";" ;
+break-statement     = "break", ";" ;
+continue-statement  = "continue", ";" ;
+
+if-statement        = "if", expression, statement-body,
+                      { "else", "if", expression, statement-body },
+                      [ "else", statement-body ] ;
+
+while-statement     = "while", expression, statement-body ;
+for-statement       = "for", identifier, "in", expression, statement-body ;
+
+statement-body      = block | ":", statement ;
+
+switch-statement    = "switch", expression, "{",
+                      { switch-arm }, [ else-switch-arm ], "}" ;
+
+switch-arm          = switch-label, switch-body ;
+switch-label        = type ;
+switch-body         = block | ":", statement ;
+else-switch-arm     = "else", switch-body ;
+
+expression          = logical-or-expression ;
+
+logical-or-expression
+                    = logical-and-expression,
+                      { "||", logical-and-expression } ;
+
+logical-and-expression
+                    = bitwise-or-expression,
+                      { "&&", bitwise-or-expression } ;
+
+bitwise-or-expression
+                    = bitwise-xor-expression,
+                      { "|", bitwise-xor-expression } ;
+
+bitwise-xor-expression
+                    = bitwise-and-expression,
+                      { "^", bitwise-and-expression } ;
+
+bitwise-and-expression
+                    = equality-expression,
+                      { "&", equality-expression } ;
+
+equality-expression = relational-expression,
+                      { equality-operator, relational-expression } ;
+
+equality-operator   = "==" | "!=" ;
+
+relational-expression
+                    = shift-expression,
+                      { relational-tail } ;
+
+relational-tail     = relational-operator, shift-expression
+                    | "is", type ;
+
+relational-operator = "<" | "<=" | ">" | ">=" | "in" ;
+
+shift-expression    = additive-expression,
+                      { shift-operator, additive-expression } ;
+
+shift-operator      = "<<" | ">>" ;
+
+additive-expression = multiplicative-expression,
+                      { additive-operator, multiplicative-expression } ;
+
+additive-operator   = "+" | "-" ;
+
+multiplicative-expression
+                    = unary-expression,
+                      { multiplicative-operator, unary-expression } ;
+
+multiplicative-operator
+                    = "*" | "/" | "%" ;
+
+unary-expression    = unary-operator, unary-expression
+                    | postfix-expression ;
+
+unary-operator      = "!" | "~" | "+" | "-" ;
+
+postfix-expression  = primary-expression,
+                      { call-suffix
+                      | index-access
+                      | member-access
+                      | "?" } ;
+
+call-suffix         = "(", [ argument-list ], ")" ;
+argument-list       = argument, { ",", argument } ;
+argument            = named-argument | expression ;
+named-argument      = identifier, "=", expression ;
+
+index-access        = "[", expression, "]" ;
+member-access       = ".", ( identifier | decimal-integer ) ;
+
+primary-expression  = identifier
+                    | integer-literal
+                    | float-literal
+                    | string-literal
+                    | character-literal
+                    | boolean-literal
+                    | parenthesized-expression
+                    | list-literal
+                    | map-literal
+                    | typed-empty-list
+                    | typed-empty-map
+                    | block
+                    | if-expression ;
+
+parenthesized-expression
+                    = "(", expression, ")" ;
+
+list-literal        = "[", [ expression-list ], "]" ;
+expression-list     = expression, { ",", expression } ;
+
+map-literal         = "{", [ map-entry-list ], "}" ;
+map-entry-list      = map-entry, { ",", map-entry } ;
+map-entry           = expression, ":", expression ;
+
+typed-empty-list    = "[", "]", ":", list-type ;
+typed-empty-map     = "{", "}", ":", map-type ;
+
+if-expression       = "if", expression, expression-body,
+                      { "else", "if", expression, expression-body },
+                      "else", expression-body ;
+
+expression-body     = block | ":", expression ;
+
+boolean-literal     = "true" | "false" ;
+
+identifier          = identifier-start, { identifier-continue } ;
+identifier-start    = ascii-letter | "_" ;
+identifier-continue = ascii-letter | decimal-digit | "_" ;
+
+integer-literal     = hexadecimal-integer
+                    | binary-integer
+                    | decimal-integer ;
+
+decimal-integer     = decimal-digits ;
+hexadecimal-integer = "0x", hexadecimal-digits ;
+binary-integer      = "0b", binary-digits ;
+
+float-literal       = decimal-digits, ".", decimal-digits, [ exponent ]
+                    | decimal-digits, exponent ;
+
+exponent            = ( "e" | "E" ), [ "+" | "-" ], decimal-digits ;
+
+decimal-digits      = decimal-digit, { [ "_" ], decimal-digit } ;
+hexadecimal-digits  = hexadecimal-digit,
+                      { [ "_" ], hexadecimal-digit } ;
+binary-digits       = binary-digit, { [ "_" ], binary-digit } ;
+
+string-literal      = '"', { string-character }, '"' ;
+character-literal   = "'", character-value, "'" ;
+
+string-character    = unescaped-string-character | escape-sequence ;
+character-value     = unescaped-character | escape-sequence ;
+escape-sequence     = "\\", ( "\\" | '"' | "'" | "n" | "r" | "t" | "0"
+                    | "x", hexadecimal-digit, hexadecimal-digit ) ;
+
+line-comment        = "//", { non-newline-character }, ( newline | EOF ) ;
+block-comment       = "/*", { block-comment-character }, "*/" ;
+whitespace          = " " | tab | newline ;
+
+ascii-letter        = "A" ... "Z" | "a" ... "z" ;
+decimal-digit       = "0" ... "9" ;
+hexadecimal-digit   = decimal-digit | "A" ... "F" | "a" ... "f" ;
+binary-digit        = "0" | "1" ;
+
+(* Character classes such as unescaped-string-character, unescaped-character,
+   non-newline-character, tab, newline, and EOF are supplied by the lexer. An
+   unescaped string character is an ASCII character other than backslash,
+   double quote, carriage return, or newline. An unescaped character is an
+   ASCII character other than backslash, single quote, carriage return, or
+   newline. A block-comment character is any source character that does not
+   begin the terminating */ sequence. Block comments do not nest.
+
+   Context and semantic constraints
+   --------------------------------
+   - Keywords are excluded from identifier.
+   - A type declaration is a struct when all members are named and a tuple when
+     all members are unnamed. The forms cannot be mixed.
+   - A declaration body containing | declares a union. Tagged and untagged
+     alternatives cannot be mixed.
+   - & is permitted only before a struct type used as a member. It selects
+     referenced storage; struct members are inline by default.
+   - Tagged-alternative is permitted only within a union type. Tags must be
+     unique. Untagged alternatives must have distinct types. Error must be the
+     final alternative.
+   - Explicit parentheses preserve nested union structure. An unparenthesized
+     A | B | C contains three alternatives.
+   - Function calls use positional arguments. Struct constructors use named
+     arguments. Tuple constructors use positional arguments. These forms cannot
+     be mixed.
+   - A value-returning function must return on every path.
+   - break and continue are valid only within loops.
+   - Conditions must have type bool.
+   - An if expression requires its final else and compatible branch values.
+   - A switch label is interpreted as a union type or tag using the switched
+     value's type. Every alternative must be covered unless else is present.
+   - Assignment targets must be mutable and assignable. Tuple members are
+     immutable.
+   - The final expression in a block supplies its value. A semicolon discards
+     an expression's value.
+   - In expression context, {} is an empty map. A nonempty braced expression is
+     a map when it contains key:value entries and otherwise a block expression.
+   - typed-empty-list and typed-empty-map take precedence over their untyped
+     literal forms.
+   - The lexer uses longest-token matching. Numeric signs are separate unary
+     operators. Decimal points require digits on both sides, so .5 and 1. are
+     invalid.
+*)
