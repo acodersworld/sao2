@@ -473,7 +473,7 @@ safe. Functions left unresolved after the queue is exhausted are conservatively
 treated as escaping because they are recursive or depend on recursion. Whenever
 safety cannot be proven, allocation uses the GC heap.
 
-The initial collector is non-moving, stop-the-world, and mark-and-sweep. Every
+The collector is non-moving, stop-the-world, and mark-and-sweep. Every
 struct contains a mark timestamp, including a struct embedded within another
 struct. Each root heap allocation records its complete generated layout,
 including the locations and layouts of embedded structs, and participates in
@@ -573,5 +573,4 @@ Implementation work must make the following details precise:
 - Lexer and parser edge cases
 - Exact signed integer division, remainder, and shift behaviour
 - Minimal runtime built-ins, including output and command-line arguments
-- Garbage collector implementation details
 - Diagnostics and source locations
