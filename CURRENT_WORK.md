@@ -93,6 +93,8 @@ Exit criterion: the generated C is deterministic and compiles independently.
 
 ## Phase 4: Host C compiler integration
 
+Status: complete.
+
 - Detect or configure a supported C compiler.
 - Invoke it with an argument list rather than a shell command string.
 - Select platform-appropriate executable names and output paths.

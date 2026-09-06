@@ -26,6 +26,9 @@ cargo run -- build path/to/program.sao2
 cargo run -- run path/to/program.sao2
 ```
 
+Set `SAO2_CC` to a C compiler executable when automatic detection is not
+appropriate. Pass `--show-c` to `build` or `run` to print generated C.
+
 Keep the compiler dependency-free until a dependency has a clear, documented
 benefit. Generated compiler artifacts belong under `build/` and must not be
 committed.
