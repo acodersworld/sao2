@@ -52,6 +52,8 @@ compiler stage.
 
 ## Phase 2: Minimal source reader and parser
 
+Status: complete.
+
 - Load the source as UTF-8 and retain its filename and byte offsets.
 - Recognize only `print`, parentheses, one string literal, a closing semicolon,
   whitespace, and comments.

@@ -2,6 +2,7 @@ mod cli;
 mod compiler;
 mod diagnostic;
 mod source;
+mod temporary_parser;
 
 use std::ffi::OsString;
 use std::process::ExitCode;
