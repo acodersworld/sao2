@@ -31,6 +31,8 @@ collection.
 
 ## Phase 1: Repository and command skeleton
 
+Status: complete.
+
 - Establish directories for compiler source, runtime source, tests, fixtures,
   and generated build artifacts.
 - Create the compiler executable and argument parser.

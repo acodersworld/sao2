@@ -1,0 +1,39 @@
+# SAO2 contributor guidance
+
+SAO2 is a single-file language that compiles to C. Development follows the
+walking-skeleton roadmap: keep the source-to-executable path working while
+replacing temporary stages with permanent compiler components.
+
+## Authoritative documents
+
+- `DESIGN.md` defines the language semantics.
+- `GRAMMAR.ebnf` defines the formal syntax.
+- `ROADMAP.md` defines the implementation milestones.
+- `CURRENT_WORK.md` defines the active milestone and its phase boundaries.
+
+If implementation and documentation disagree, do not silently invent new
+language behavior. Follow the design documents or update them as part of an
+explicit design decision.
+
+## Development commands
+
+The compiler requires Rust 1.90 or newer and uses Rust edition 2024.
+
+```text
+cargo test
+cargo run -- --help
+cargo run -- build path/to/program.sao2
+cargo run -- run path/to/program.sao2
+```
+
+Keep the compiler dependency-free until a dependency has a clear, documented
+benefit. Generated compiler artifacts belong under `build/` and must not be
+committed.
+
+## Walking-skeleton constraints
+
+- Keep temporary syntax and implementation stages visibly marked.
+- Preserve filenames and byte-oriented source information for diagnostics.
+- Invoke child processes with argument lists, never constructed shell commands.
+- Keep source errors distinct from compiler/toolchain and program failures.
+- Add tests when advancing or replacing a compiler stage.
