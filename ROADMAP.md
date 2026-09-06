@@ -9,6 +9,9 @@ code and expands the accepted language subset.
 
 ## 1. First end-to-end executable
 
+The active breakdown for this milestone is in
+[Current Work: First End-to-End Executable](CURRENT_WORK.md).
+
 - Establish the compiler and runtime source layout.
 - Add commands to build and run a single SAO2 source file.
 - Select and invoke a supported C compiler.
