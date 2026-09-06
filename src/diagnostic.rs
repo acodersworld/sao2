@@ -1,8 +1,6 @@
+use crate::source::SourceFile;
 use std::fmt;
 use std::path::Path;
-use std::process::ExitCode;
-
-use crate::source::SourceFile;
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum DiagnosticKind {
@@ -10,6 +8,7 @@ pub enum DiagnosticKind {
     Input,
     Source,
     Compiler,
+    Program,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -31,6 +30,10 @@ impl Diagnostic {
         Self::new(DiagnosticKind::Compiler, message)
     }
 
+    pub fn program(message: impl Into<String>) -> Self {
+        Self::new(DiagnosticKind::Program, message)
+    }
+
     pub fn source(source: &SourceFile, offset: usize, message: impl Into<String>) -> Self {
         let (line, column) = line_and_column(&source.text, offset);
         Self::new(
@@ -50,12 +53,13 @@ impl Diagnostic {
         }
     }
 
-    pub fn exit_code(&self) -> ExitCode {
+    pub fn exit_code(&self) -> i32 {
         match self.kind {
-            DiagnosticKind::Usage => ExitCode::from(2),
-            DiagnosticKind::Input | DiagnosticKind::Source | DiagnosticKind::Compiler => {
-                ExitCode::FAILURE
-            }
+            DiagnosticKind::Usage => 2,
+            DiagnosticKind::Input
+            | DiagnosticKind::Source
+            | DiagnosticKind::Compiler
+            | DiagnosticKind::Program => 1,
         }
     }
 }
@@ -67,6 +71,7 @@ impl fmt::Display for Diagnostic {
             DiagnosticKind::Input => "input error",
             DiagnosticKind::Source => "source error",
             DiagnosticKind::Compiler => "compiler error",
+            DiagnosticKind::Program => "program error",
         };
         write!(formatter, "sao2: {category}: {}", self.message)
     }

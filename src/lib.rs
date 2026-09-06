@@ -3,19 +3,18 @@ mod cli;
 mod compiler;
 mod diagnostic;
 mod host_compiler;
+mod program;
 mod source;
 mod temporary_parser;
 
-use std::ffi::OsString;
-use std::process::ExitCode;
-
 use cli::{Command, HELP};
+use std::ffi::OsString;
 
-pub fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
+pub fn run(args: impl IntoIterator<Item = OsString>) -> i32 {
     match cli::parse(args) {
         Ok(Command::Help) => {
             print!("{HELP}");
-            ExitCode::SUCCESS
+            0
         }
         Ok(Command::Build(options)) => build(options, false),
         Ok(Command::Run(options)) => build(options, true),
@@ -26,7 +25,7 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     }
 }
 
-fn build(options: cli::CompileOptions, requested_run: bool) -> ExitCode {
+fn build(options: cli::CompileOptions, requested_run: bool) -> i32 {
     let result = source::SourceFile::load(&options.source)
         .and_then(|source| compiler::compile(&source))
         .and_then(|generated_c| {
@@ -45,17 +44,16 @@ fn build(options: cli::CompileOptions, requested_run: bool) -> ExitCode {
         });
 
     match result {
-        Ok(executable) if requested_run => {
-            let diagnostic = diagnostic::Diagnostic::compiler(format!(
-                "program execution is not implemented yet (built '{}')",
-                executable.display()
-            ));
-            eprintln!("{diagnostic}");
-            diagnostic.exit_code()
-        }
+        Ok(executable) if requested_run => match program::run(&executable) {
+            Ok(exit_code) => exit_code,
+            Err(diagnostic) => {
+                eprintln!("{diagnostic}");
+                diagnostic.exit_code()
+            }
+        },
         Ok(executable) => {
             println!("built {}", executable.display());
-            ExitCode::SUCCESS
+            0
         }
         Err(diagnostic) => {
             eprintln!("{diagnostic}");

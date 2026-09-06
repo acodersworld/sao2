@@ -108,6 +108,8 @@ example source.
 
 ## Phase 5: Run command
 
+Status: complete.
+
 - Make `sao2 run` perform the same build pipeline.
 - Execute the resulting program without a shell.
 - Forward program stdout and stderr.
