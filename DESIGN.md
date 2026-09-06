@@ -2,6 +2,8 @@
 
 Status: v0 design complete
 
+See [SAO2 v0 Implementation Roadmap](ROADMAP.md) for the high-level build plan.
+
 ## Goals
 
 The language should be simple, brief, and powerful. Programs are statically
