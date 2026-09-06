@@ -1,3 +1,4 @@
+mod c_emitter;
 mod cli;
 mod compiler;
 mod diagnostic;
@@ -16,11 +17,20 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Command::Build(path) | Command::Run(path)) => match source::SourceFile::load(&path) {
-            Ok(source) => {
-                let diagnostic = compiler::compile(&source);
-                eprintln!("{diagnostic}");
-                diagnostic.exit_code()
-            }
+            Ok(source) => match compiler::compile(&source) {
+                Ok(generated_path) => {
+                    let diagnostic = diagnostic::Diagnostic::compiler(format!(
+                        "host C compilation is not implemented yet (generated '{}')",
+                        generated_path.display()
+                    ));
+                    eprintln!("{diagnostic}");
+                    diagnostic.exit_code()
+                }
+                Err(diagnostic) => {
+                    eprintln!("{diagnostic}");
+                    diagnostic.exit_code()
+                }
+            },
             Err(diagnostic) => {
                 eprintln!("{diagnostic}");
                 diagnostic.exit_code()

@@ -69,6 +69,8 @@ malformed variants.
 
 ## Phase 3: Minimal C generation
 
+Status: complete.
+
 - Generate one self-contained C translation unit with `main`.
 - Store the decoded string as explicit bytes and write it with `fwrite`, avoiding
   C format-string interpretation and preserving embedded zero bytes.
