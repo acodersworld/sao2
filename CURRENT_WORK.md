@@ -154,6 +154,9 @@ The stable outer boundaries remain:
 - `host_compiler::compile`: generated C to native executable
 - `program::run`: native executable to process exit status
 
+`AST.md` records the completed parser invariants and the milestone-3 analysis
+handoff.
+
 ## Test requirements
 
 - Exhaustive token, keyword, operator, delimiter, and longest-match tests

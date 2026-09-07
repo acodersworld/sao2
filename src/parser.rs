@@ -1,8 +1,7 @@
-//! Permanent declaration, type, expression, and statement parser through Phase 6.
+//! Permanent parser for the complete SAO2 grammar.
 //!
-//! The remaining parser phase adds multi-error recovery and conformance
-//! fixtures. Entry-point rules are deliberately enforced by `compiler`, not
-//! here.
+//! Syntax errors recover at statement and declaration boundaries and remain
+//! distinct from the entry-point rules enforced by `compiler`.
 
 use std::mem::discriminant;
 
@@ -20,20 +19,19 @@ use crate::source::{SourceFile, Span};
 
 pub fn parse(source: &SourceFile) -> Result<Program, Diagnostics> {
     let tokens = lexer::lex(source)?;
-    match Parser::new(source, tokens).parse_program() {
-        Ok(program) => Ok(program),
-        Err(diagnostic) => {
-            let mut diagnostics = Diagnostics::new();
-            diagnostics.push(diagnostic);
-            Err(diagnostics)
-        }
-    }
+    Parser::new(source, tokens).parse_program()
 }
 
 struct Parser<'source> {
     source: &'source SourceFile,
     tokens: Vec<Token>,
     current: usize,
+    diagnostics: Diagnostics,
+}
+
+enum BlockItem {
+    Statement(Statement),
+    Value(Expression),
 }
 
 impl<'source> Parser<'source> {
@@ -42,25 +40,47 @@ impl<'source> Parser<'source> {
             source,
             tokens,
             current: 0,
+            diagnostics: Diagnostics::new(),
         }
     }
 
-    fn parse_program(mut self) -> Result<Program, Diagnostic> {
+    fn parse_program(mut self) -> Result<Program, Diagnostics> {
         let mut declarations = Vec::new();
-        while !self.at(&TokenKind::Eof) {
-            let declaration = if self.at(&TokenKind::Type) {
-                Declaration::Type(self.parse_type_declaration()?)
+        while !self.at(&TokenKind::Eof) && !self.diagnostics.is_full() {
+            let result = if self.at(&TokenKind::Type) {
+                self.parse_type_declaration().map(Declaration::Type)
             } else if self.at(&TokenKind::Fn) {
-                Declaration::Function(self.parse_function()?)
+                self.parse_function().map(Declaration::Function)
             } else {
-                return Err(self.error_current("expected top-level 'type' or 'fn' declaration"));
+                Err(self.error_current("expected top-level 'type' or 'fn' declaration"))
             };
-            declarations.push(declaration);
+
+            match result {
+                Ok(declaration) => declarations.push(declaration),
+                Err(diagnostic) => {
+                    self.diagnostics.push(diagnostic);
+                    self.synchronize_top_level();
+                }
+            }
         }
-        Ok(Program {
+        let program = Program {
             declarations,
             span: Span::new(0, self.source.text.len()),
-        })
+        };
+        if self.diagnostics.is_empty() {
+            Ok(program)
+        } else {
+            Err(self.diagnostics)
+        }
+    }
+
+    fn synchronize_top_level(&mut self) {
+        while !self.at(&TokenKind::Eof) {
+            if self.at(&TokenKind::Fn) || self.at(&TokenKind::Type) {
+                return;
+            }
+            self.current += 1;
+        }
     }
 
     fn parse_type_declaration(&mut self) -> Result<TypeDeclaration, Diagnostic> {
@@ -326,31 +346,20 @@ impl<'source> Parser<'source> {
             if self.at(&TokenKind::Eof) {
                 return Err(self.error_current("expected '}' to close block"));
             }
-
-            if self.at_non_expression_statement_start()
-                || (self.at(&TokenKind::Identifier) && self.at_next(&TokenKind::Declare))
-            {
-                statements.push(self.parse_statement()?);
-                continue;
+            if self.at(&TokenKind::Fn) || self.at(&TokenKind::Type) {
+                return Err(self.error_current("expected '}' to close block"));
             }
 
-            let expression = self.parse_expression()?;
-            if let Some((operator, operator_span)) = self.take_assignment_operator() {
-                statements.push(self.finish_assignment_statement(
-                    expression,
-                    operator,
-                    operator_span,
-                )?);
-            } else if let Some(semicolon) = self.take(&TokenKind::Semicolon) {
-                statements.push(Statement {
-                    span: Span::new(expression.span.start, semicolon.span.end),
-                    kind: StatementKind::Expression(expression),
-                });
-            } else if self.at(&TokenKind::RightBrace) {
-                value = Some(Box::new(expression));
-                break;
-            } else {
-                return Err(self.error_current("expected ';' or '}' after expression"));
+            match self.parse_block_item() {
+                Ok(BlockItem::Statement(statement)) => statements.push(statement),
+                Ok(BlockItem::Value(expression)) => {
+                    value = Some(Box::new(expression));
+                    break;
+                }
+                Err(diagnostic) => {
+                    self.diagnostics.push(diagnostic);
+                    self.synchronize_statement();
+                }
             }
         }
 
@@ -363,6 +372,46 @@ impl<'source> Parser<'source> {
             value,
             span: Span::new(start, end),
         })
+    }
+
+    fn parse_block_item(&mut self) -> Result<BlockItem, Diagnostic> {
+        if self.at_non_expression_statement_start()
+            || (self.at(&TokenKind::Identifier) && self.at_next(&TokenKind::Declare))
+        {
+            return self.parse_statement().map(BlockItem::Statement);
+        }
+
+        let expression = self.parse_expression()?;
+        if let Some((operator, operator_span)) = self.take_assignment_operator() {
+            return self
+                .finish_assignment_statement(expression, operator, operator_span)
+                .map(BlockItem::Statement);
+        }
+        if let Some(semicolon) = self.take(&TokenKind::Semicolon) {
+            return Ok(BlockItem::Statement(Statement {
+                span: Span::new(expression.span.start, semicolon.span.end),
+                kind: StatementKind::Expression(expression),
+            }));
+        }
+        if self.at(&TokenKind::RightBrace) {
+            return Ok(BlockItem::Value(expression));
+        }
+        Err(self.error_current("expected ';' or '}' after expression"))
+    }
+
+    fn synchronize_statement(&mut self) {
+        while !self.at(&TokenKind::Eof) {
+            if self.take(&TokenKind::Semicolon).is_some() {
+                return;
+            }
+            if self.at(&TokenKind::RightBrace)
+                || self.at(&TokenKind::Fn)
+                || self.at(&TokenKind::Type)
+            {
+                return;
+            }
+            self.current += 1;
+        }
     }
 
     fn parse_statement(&mut self) -> Result<Statement, Diagnostic> {
@@ -1036,6 +1085,7 @@ impl<'source> Parser<'source> {
 
     fn parse_braced_expression(&mut self) -> Result<Expression, Diagnostic> {
         let checkpoint = self.current;
+        let diagnostic_checkpoint = self.diagnostics.len();
         let start = self
             .expect(
                 &TokenKind::LeftBrace,
@@ -1063,6 +1113,7 @@ impl<'source> Parser<'source> {
             Ok(first) => first,
             Err(_) => {
                 self.current = checkpoint;
+                self.diagnostics.truncate(diagnostic_checkpoint);
                 let block = self.parse_block()?;
                 let span = block.span;
                 return Ok(Expression {
@@ -1076,6 +1127,7 @@ impl<'source> Parser<'source> {
         }
 
         self.current = checkpoint;
+        self.diagnostics.truncate(diagnostic_checkpoint);
         let block = self.parse_block()?;
         let span = block.span;
         Ok(Expression {
@@ -1900,5 +1952,75 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(diagnostic.contains("else must be the final switch arm"));
+    }
+
+    #[test]
+    fn parses_the_full_grammar_conformance_fixture() {
+        let text = include_str!("../tests/fixtures/parser_valid.sao2");
+        let program = parse(&source(text)).unwrap();
+        assert_eq!(program.declarations.len(), 7);
+    }
+
+    #[test]
+    fn recovers_across_statements_and_top_level_declarations() {
+        let text = include_str!("../tests/fixtures/parser_malformed.sao2");
+        let diagnostics = parse(&source(text)).unwrap_err();
+        assert_eq!(diagnostics.len(), 7);
+        let rendered = diagnostics.to_string();
+        assert_eq!(rendered.matches("expected expression").count(), 5);
+        assert_eq!(
+            rendered
+                .matches("expected top-level 'type' or 'fn' declaration")
+                .count(),
+            1
+        );
+        for line in [1, 4, 5, 6, 9, 12, 13] {
+            assert!(
+                rendered.contains(&format!("test.sao2:{line}:")),
+                "{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovers_at_a_top_level_boundary_after_a_missing_block_close() {
+        let diagnostics = parse(&source(
+            "fn first() { broken = ;\nfn second() { another = ; }",
+        ))
+        .unwrap_err();
+        assert_eq!(diagnostics.len(), 3);
+        let rendered = diagnostics.to_string();
+        assert_eq!(rendered.matches("expected '}' to close block").count(), 1);
+        assert_eq!(rendered.matches("expected expression").count(), 2);
+    }
+
+    #[test]
+    fn caps_recovered_parser_diagnostics_at_twenty() {
+        let mut text = String::from("fn f() {");
+        for _ in 0..25 {
+            text.push_str("value = ;");
+        }
+        text.push('}');
+        let diagnostics = parse(&source(&text)).unwrap_err();
+        assert_eq!(diagnostics.len(), 20);
+        assert_eq!(
+            diagnostics
+                .to_string()
+                .matches("expected expression")
+                .count(),
+            20
+        );
+    }
+
+    #[test]
+    fn reports_one_error_per_failed_ambiguous_construct() {
+        let text = include_str!("../tests/fixtures/parser_ambiguous_malformed.sao2");
+        let diagnostics = parse(&source(text)).unwrap_err();
+        assert_eq!(diagnostics.len(), 3);
+        let rendered = diagnostics.to_string();
+        assert_eq!(rendered.matches("sao2: source error:").count(), 3);
+        for line in [2, 3, 4] {
+            assert_eq!(rendered.matches(&format!("test.sao2:{line}:")).count(), 1);
+        }
     }
 }

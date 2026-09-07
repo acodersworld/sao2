@@ -1,0 +1,5 @@
+fn ambiguous() {
+    broken_map := {key value};
+    named = call(argument = );
+    if outer: if inner: first() else: second();
+}

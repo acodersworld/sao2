@@ -140,9 +140,11 @@ impl Diagnostics {
     pub fn is_full(&self) -> bool {
         self.entries.len() == MAX_SOURCE_ERRORS
     }
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+    pub fn truncate(&mut self, len: usize) {
+        self.entries.truncate(len);
     }
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()

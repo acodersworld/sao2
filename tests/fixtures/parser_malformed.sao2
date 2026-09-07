@@ -1,0 +1,14 @@
+type Broken(a int,);
+
+fn first() {
+    missing = ;
+    return +;
+    call(;
+}
+
+this is invalid;
+
+fn second() {
+    another = ;
+    final_call(;
+}

@@ -1,0 +1,48 @@
+type Point(x int, y float, shared &Point);
+type Pair(int, float, str, bool, char);
+type Lookup({str: [int]});
+type Outcome(Ok(int) | Error(str));
+type Nested((int | float) | str);
+
+fn exercise(var items [int], lookup {str: int}) int | Error(str) {
+    constant := 1;
+    var changing := 2;
+    changing += constant * 3;
+    items[0] = changing;
+    point.field = Point(x = 1, y = 2.0);
+
+    values := [1, 2];
+    empty_values := [] : [int];
+    table := {"one": 1, "two": 2};
+    empty_table := {} : {str: int};
+    choice := if condition { first } else if other: second else { third };
+    block_value := {
+        inner := 1;
+        inner + 1
+    };
+    result := service(values, named = table)[0].field?;
+    comparison := value is Ok(int) | Error(str);
+
+    if condition {
+        print("yes");
+    } else if other: print("maybe");
+    else {
+        println();
+    }
+    while condition: changing -= 1;
+    for item in items {
+        continue;
+    }
+    switch outcome {
+        Ok(int): handle();
+        Error(str) {
+            return Error("failure");
+        }
+        else: break;
+    }
+    return changing;
+}
+
+fn main() {
+    print("hello");
+}
