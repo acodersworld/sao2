@@ -3,6 +3,7 @@ mod cli;
 mod compiler;
 mod diagnostic;
 mod host_compiler;
+mod lexer;
 mod program;
 mod source;
 mod temporary_parser;
