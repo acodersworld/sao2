@@ -1,16 +1,18 @@
-//! Permanent declaration, type, and expression parser through Phase 5.
+//! Permanent declaration, type, expression, and statement parser through Phase 6.
 //!
-//! Later phases extend these routines with the remaining statement productions
-//! and error recovery. Entry-point rules are deliberately enforced by
-//! `compiler`, not here.
+//! The remaining parser phase adds multi-error recovery and conformance
+//! fixtures. Entry-point rules are deliberately enforced by `compiler`, not
+//! here.
 
 use std::mem::discriminant;
 
 use crate::ast::{
-    Argument, ArgumentKind, BinaryOperator, Block, ConditionalExpressionBranch, Declaration,
-    Expression, ExpressionBody, ExpressionBodyKind, ExpressionKind, FunctionDeclaration,
-    Identifier, MapEntry, Member, Parameter, PrimitiveType, Program, Statement, StatementKind,
-    Type, TypeDeclaration, TypeKind, TypeMember, TypeMemberKind, UnaryOperator,
+    Argument, ArgumentKind, AssignmentOperator, AssignmentTarget, AssignmentTargetSuffix,
+    AssignmentTargetSuffixKind, BinaryOperator, Block, ConditionalExpressionBranch,
+    ConditionalStatementBranch, Declaration, Expression, ExpressionBody, ExpressionBodyKind,
+    ExpressionKind, FunctionDeclaration, Identifier, MapEntry, Member, Parameter, PrimitiveType,
+    Program, Statement, StatementBody, StatementBodyKind, StatementKind, SwitchArm, Type,
+    TypeDeclaration, TypeKind, TypeMember, TypeMemberKind, UnaryOperator,
 };
 use crate::diagnostic::{Diagnostic, Diagnostics};
 use crate::lexer::{self, Token, TokenKind};
@@ -314,10 +316,7 @@ impl<'source> Parser<'source> {
 
     fn parse_block(&mut self) -> Result<Block, Diagnostic> {
         let start = self
-            .expect(
-                &TokenKind::LeftBrace,
-                "expected function body beginning with '{'",
-            )?
+            .expect(&TokenKind::LeftBrace, "expected block beginning with '{'")?
             .span
             .start;
         let mut statements = Vec::new();
@@ -327,18 +326,22 @@ impl<'source> Parser<'source> {
             if self.at(&TokenKind::Eof) {
                 return Err(self.error_current("expected '}' to close block"));
             }
-            if self.at(&TokenKind::LeftBrace) {
-                let block = self.parse_block()?;
-                let span = block.span;
-                statements.push(Statement {
-                    kind: StatementKind::Block(block),
-                    span,
-                });
+
+            if self.at_non_expression_statement_start()
+                || (self.at(&TokenKind::Identifier) && self.at_next(&TokenKind::Declare))
+            {
+                statements.push(self.parse_statement()?);
                 continue;
             }
 
             let expression = self.parse_expression()?;
-            if let Some(semicolon) = self.take(&TokenKind::Semicolon) {
+            if let Some((operator, operator_span)) = self.take_assignment_operator() {
+                statements.push(self.finish_assignment_statement(
+                    expression,
+                    operator,
+                    operator_span,
+                )?);
+            } else if let Some(semicolon) = self.take(&TokenKind::Semicolon) {
                 statements.push(Statement {
                     span: Span::new(expression.span.start, semicolon.span.end),
                     kind: StatementKind::Expression(expression),
@@ -359,6 +362,350 @@ impl<'source> Parser<'source> {
             statements,
             value,
             span: Span::new(start, end),
+        })
+    }
+
+    fn parse_statement(&mut self) -> Result<Statement, Diagnostic> {
+        match self.current_token().kind {
+            TokenKind::Var => self.parse_local_declaration(),
+            TokenKind::Identifier if self.at_next(&TokenKind::Declare) => {
+                self.parse_local_declaration()
+            }
+            TokenKind::Return => self.parse_return_statement(),
+            TokenKind::Break => self.parse_keyword_statement(false),
+            TokenKind::Continue => self.parse_keyword_statement(true),
+            TokenKind::If => self.parse_if_statement(),
+            TokenKind::While => self.parse_while_statement(),
+            TokenKind::For => self.parse_for_statement(),
+            TokenKind::Switch => self.parse_switch_statement(),
+            TokenKind::LeftBrace => {
+                let block = self.parse_block()?;
+                let span = block.span;
+                Ok(Statement {
+                    kind: StatementKind::Block(block),
+                    span,
+                })
+            }
+            _ => {
+                let expression = self.parse_expression()?;
+                if let Some((operator, operator_span)) = self.take_assignment_operator() {
+                    self.finish_assignment_statement(expression, operator, operator_span)
+                } else {
+                    let semicolon = self.expect(
+                        &TokenKind::Semicolon,
+                        "expected ';' after expression statement",
+                    )?;
+                    Ok(Statement {
+                        span: Span::new(expression.span.start, semicolon.span.end),
+                        kind: StatementKind::Expression(expression),
+                    })
+                }
+            }
+        }
+    }
+
+    fn at_non_expression_statement_start(&self) -> bool {
+        self.at(&TokenKind::Var)
+            || self.at(&TokenKind::Return)
+            || self.at(&TokenKind::Break)
+            || self.at(&TokenKind::Continue)
+            || self.at(&TokenKind::If)
+            || self.at(&TokenKind::While)
+            || self.at(&TokenKind::For)
+            || self.at(&TokenKind::Switch)
+            || self.at(&TokenKind::LeftBrace)
+    }
+
+    fn parse_local_declaration(&mut self) -> Result<Statement, Diagnostic> {
+        let mutable_token = self.take(&TokenKind::Var);
+        let name = self.parse_identifier("expected local name")?;
+        let start = mutable_token
+            .as_ref()
+            .map_or(name.span.start, |token| token.span.start);
+        self.expect(&TokenKind::Declare, "expected ':=' after local name")?;
+        let initializer = self.parse_expression()?;
+        let end = self
+            .expect(
+                &TokenKind::Semicolon,
+                "expected ';' after local declaration",
+            )?
+            .span
+            .end;
+        Ok(Statement {
+            kind: StatementKind::Local {
+                mutable: mutable_token.is_some(),
+                name,
+                initializer,
+            },
+            span: Span::new(start, end),
+        })
+    }
+
+    fn take_assignment_operator(&mut self) -> Option<(AssignmentOperator, Span)> {
+        let operator = match self.current_token().kind {
+            TokenKind::Equal => AssignmentOperator::Assign,
+            TokenKind::PlusEqual => AssignmentOperator::Add,
+            TokenKind::MinusEqual => AssignmentOperator::Subtract,
+            TokenKind::StarEqual => AssignmentOperator::Multiply,
+            TokenKind::SlashEqual => AssignmentOperator::Divide,
+            TokenKind::PercentEqual => AssignmentOperator::Remainder,
+            TokenKind::AmpersandEqual => AssignmentOperator::BitwiseAnd,
+            TokenKind::PipeEqual => AssignmentOperator::BitwiseOr,
+            TokenKind::CaretEqual => AssignmentOperator::BitwiseXor,
+            TokenKind::ShiftLeftEqual => AssignmentOperator::ShiftLeft,
+            TokenKind::ShiftRightEqual => AssignmentOperator::ShiftRight,
+            _ => return None,
+        };
+        let span = self.current_token().span;
+        self.current += 1;
+        Some((operator, span))
+    }
+
+    fn finish_assignment_statement(
+        &mut self,
+        expression: Expression,
+        operator: AssignmentOperator,
+        operator_span: Span,
+    ) -> Result<Statement, Diagnostic> {
+        let expression_span = expression.span;
+        let Some(target) = Self::assignment_target_from_expression(expression) else {
+            return Err(Diagnostic::source(
+                self.source,
+                expression_span,
+                "assignment target must begin with an identifier and contain only member or index access",
+            ));
+        };
+        let value = self.parse_expression()?;
+        let end = self
+            .expect(&TokenKind::Semicolon, "expected ';' after assignment")?
+            .span
+            .end;
+        Ok(Statement {
+            span: Span::new(target.span.start, end),
+            kind: StatementKind::Assignment {
+                target,
+                operator,
+                operator_span,
+                value,
+            },
+        })
+    }
+
+    fn assignment_target_from_expression(expression: Expression) -> Option<AssignmentTarget> {
+        let span = expression.span;
+        let mut suffixes = Vec::new();
+        let root = Self::collect_assignment_target(expression, &mut suffixes)?;
+        Some(AssignmentTarget {
+            root,
+            suffixes,
+            span,
+        })
+    }
+
+    fn collect_assignment_target(
+        expression: Expression,
+        suffixes: &mut Vec<AssignmentTargetSuffix>,
+    ) -> Option<Identifier> {
+        let expression_span = expression.span;
+        match expression.kind {
+            ExpressionKind::Identifier(identifier) => Some(identifier),
+            ExpressionKind::Member { value, member } => {
+                let suffix_start = value.span.end;
+                let root = Self::collect_assignment_target(*value, suffixes)?;
+                suffixes.push(AssignmentTargetSuffix {
+                    kind: AssignmentTargetSuffixKind::Member(member),
+                    span: Span::new(suffix_start, expression_span.end),
+                });
+                Some(root)
+            }
+            ExpressionKind::Index { value, index } => {
+                let suffix_start = value.span.end;
+                let root = Self::collect_assignment_target(*value, suffixes)?;
+                suffixes.push(AssignmentTargetSuffix {
+                    kind: AssignmentTargetSuffixKind::Index(*index),
+                    span: Span::new(suffix_start, expression_span.end),
+                });
+                Some(root)
+            }
+            _ => None,
+        }
+    }
+
+    fn parse_return_statement(&mut self) -> Result<Statement, Diagnostic> {
+        let start = self
+            .expect(&TokenKind::Return, "expected 'return'")?
+            .span
+            .start;
+        let value = if self.at(&TokenKind::Semicolon) {
+            None
+        } else {
+            Some(self.parse_expression()?)
+        };
+        let end = self
+            .expect(&TokenKind::Semicolon, "expected ';' after return")?
+            .span
+            .end;
+        Ok(Statement {
+            kind: StatementKind::Return(value),
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_keyword_statement(&mut self, is_continue: bool) -> Result<Statement, Diagnostic> {
+        let (keyword, message, kind) = if is_continue {
+            (
+                TokenKind::Continue,
+                "expected 'continue'",
+                StatementKind::Continue,
+            )
+        } else {
+            (TokenKind::Break, "expected 'break'", StatementKind::Break)
+        };
+        let start = self.expect(&keyword, message)?.span.start;
+        let end = self
+            .expect(
+                &TokenKind::Semicolon,
+                "expected ';' after loop control statement",
+            )?
+            .span
+            .end;
+        Ok(Statement {
+            kind,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_if_statement(&mut self) -> Result<Statement, Diagnostic> {
+        let start = self.expect(&TokenKind::If, "expected 'if'")?.span.start;
+        let condition = self.parse_expression()?;
+        let body = self.parse_statement_body()?;
+        let first_span = Span::new(start, body.span.end);
+        let mut branches = vec![ConditionalStatementBranch {
+            condition,
+            body,
+            span: first_span,
+        }];
+
+        let mut else_body = None;
+        while let Some(else_token) = self.take(&TokenKind::Else) {
+            if self.take(&TokenKind::If).is_some() {
+                let condition = self.parse_expression()?;
+                let body = self.parse_statement_body()?;
+                let span = Span::new(else_token.span.start, body.span.end);
+                branches.push(ConditionalStatementBranch {
+                    condition,
+                    body,
+                    span,
+                });
+            } else {
+                else_body = Some(self.parse_statement_body()?);
+                break;
+            }
+        }
+
+        let end = else_body
+            .as_ref()
+            .map_or_else(|| branches.last().unwrap().span.end, |body| body.span.end);
+        Ok(Statement {
+            kind: StatementKind::If {
+                branches,
+                else_body,
+            },
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_while_statement(&mut self) -> Result<Statement, Diagnostic> {
+        let start = self
+            .expect(&TokenKind::While, "expected 'while'")?
+            .span
+            .start;
+        let condition = self.parse_expression()?;
+        let body = self.parse_statement_body()?;
+        let span = Span::new(start, body.span.end);
+        Ok(Statement {
+            kind: StatementKind::While { condition, body },
+            span,
+        })
+    }
+
+    fn parse_for_statement(&mut self) -> Result<Statement, Diagnostic> {
+        let start = self.expect(&TokenKind::For, "expected 'for'")?.span.start;
+        let binding = self.parse_identifier("expected iteration binding after 'for'")?;
+        self.expect(&TokenKind::In, "expected 'in' after iteration binding")?;
+        let iterable = self.parse_expression()?;
+        let body = self.parse_statement_body()?;
+        let span = Span::new(start, body.span.end);
+        Ok(Statement {
+            kind: StatementKind::For {
+                binding,
+                iterable,
+                body,
+            },
+            span,
+        })
+    }
+
+    fn parse_switch_statement(&mut self) -> Result<Statement, Diagnostic> {
+        let start = self
+            .expect(&TokenKind::Switch, "expected 'switch'")?
+            .span
+            .start;
+        let value = self.parse_expression()?;
+        self.expect(
+            &TokenKind::LeftBrace,
+            "expected '{' after switched expression",
+        )?;
+        let mut arms = Vec::new();
+        let mut else_body = None;
+
+        while !self.at(&TokenKind::RightBrace) {
+            if self.at(&TokenKind::Eof) {
+                return Err(self.error_current("expected '}' to close switch"));
+            }
+            if self.take(&TokenKind::Else).is_some() {
+                else_body = Some(self.parse_statement_body()?);
+                if !self.at(&TokenKind::RightBrace) {
+                    return Err(self.error_current("else must be the final switch arm"));
+                }
+                break;
+            }
+
+            let label = self.parse_type()?;
+            let body = self.parse_statement_body()?;
+            let span = Span::new(label.span.start, body.span.end);
+            arms.push(SwitchArm { label, body, span });
+        }
+
+        let end = self
+            .expect(&TokenKind::RightBrace, "expected '}' to close switch")?
+            .span
+            .end;
+        Ok(Statement {
+            kind: StatementKind::Switch {
+                value,
+                arms,
+                else_body,
+            },
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_statement_body(&mut self) -> Result<StatementBody, Diagnostic> {
+        if self.at(&TokenKind::LeftBrace) {
+            let block = self.parse_block()?;
+            let span = block.span;
+            return Ok(StatementBody {
+                kind: StatementBodyKind::Block(block),
+                span,
+            });
+        }
+
+        let colon = self.expect(&TokenKind::Colon, "expected block or ':' statement body")?;
+        let statement = self.parse_statement()?;
+        Ok(StatementBody {
+            span: Span::new(colon.span.start, statement.span.end),
+            kind: StatementBodyKind::Statement(Box::new(statement)),
         })
     }
 
@@ -712,7 +1059,18 @@ impl<'source> Parser<'source> {
             });
         }
 
-        let first = self.parse_expression()?;
+        let first = match self.parse_expression() {
+            Ok(first) => first,
+            Err(_) => {
+                self.current = checkpoint;
+                let block = self.parse_block()?;
+                let span = block.span;
+                return Ok(Expression {
+                    kind: ExpressionKind::Block(block),
+                    span,
+                });
+            }
+        };
         if self.take(&TokenKind::Colon).is_some() {
             return self.parse_map_expression(start, first);
         }
@@ -903,6 +1261,15 @@ mod tests {
             panic!("expected function declaration");
         };
         *function.body.value.unwrap()
+    }
+
+    fn function_declaration(text: &str) -> FunctionDeclaration {
+        let program = parse(&source(text)).unwrap();
+        let Declaration::Function(function) = program.declarations.into_iter().next().unwrap()
+        else {
+            panic!("expected function declaration");
+        };
+        function
     }
 
     fn binary_parts(
@@ -1275,7 +1642,10 @@ mod tests {
 
     #[test]
     fn parses_if_expressions_with_colon_and_block_bodies() {
-        let expression = value_expression("if first: one else if second { two } else: three");
+        let expression = value_expression("(if first: one else if second { two } else: three)");
+        let ExpressionKind::Parenthesized(expression) = expression.kind else {
+            panic!("expected parentheses");
+        };
         let ExpressionKind::If {
             branches,
             else_branch,
@@ -1310,5 +1680,225 @@ mod tests {
         assert!(diagnostic.to_string().contains("expected ')'"));
         let diagnostic = parse(&source("fn f() { value.0x1 }")).unwrap_err();
         assert!(diagnostic.to_string().contains("decimal tuple index"));
+    }
+
+    #[test]
+    fn parses_local_declarations_and_every_assignment_operator() {
+        let function = function_declaration(
+            "fn f() { value := initial; var mutable := other; target.field[index].0 += amount; }",
+        );
+        assert_eq!(function.body.statements.len(), 3);
+        assert!(matches!(
+            function.body.statements[0].kind,
+            StatementKind::Local { mutable: false, .. }
+        ));
+        assert!(matches!(
+            function.body.statements[1].kind,
+            StatementKind::Local { mutable: true, .. }
+        ));
+        let StatementKind::Assignment {
+            target, operator, ..
+        } = &function.body.statements[2].kind
+        else {
+            panic!("expected assignment");
+        };
+        assert_eq!(*operator, AssignmentOperator::Add);
+        assert_eq!(target.suffixes.len(), 3);
+        assert!(matches!(
+            target.suffixes[0].kind,
+            AssignmentTargetSuffixKind::Member(Member::Named(_))
+        ));
+        assert!(matches!(
+            target.suffixes[1].kind,
+            AssignmentTargetSuffixKind::Index(_)
+        ));
+        assert!(matches!(
+            target.suffixes[2].kind,
+            AssignmentTargetSuffixKind::Member(Member::TupleIndex(_))
+        ));
+
+        for (symbol, expected) in [
+            ("=", AssignmentOperator::Assign),
+            ("+=", AssignmentOperator::Add),
+            ("-=", AssignmentOperator::Subtract),
+            ("*=", AssignmentOperator::Multiply),
+            ("/=", AssignmentOperator::Divide),
+            ("%=", AssignmentOperator::Remainder),
+            ("&=", AssignmentOperator::BitwiseAnd),
+            ("|=", AssignmentOperator::BitwiseOr),
+            ("^=", AssignmentOperator::BitwiseXor),
+            ("<<=", AssignmentOperator::ShiftLeft),
+            (">>=", AssignmentOperator::ShiftRight),
+        ] {
+            let function = function_declaration(&format!("fn f() {{ target {symbol} value; }}"));
+            assert!(matches!(
+                function.body.statements[0].kind,
+                StatementKind::Assignment {
+                    operator,
+                    ..
+                } if operator == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn parses_expression_return_and_loop_control_statements() {
+        let function = function_declaration(
+            "fn f() { call(); return; return value; break; continue; final_value }",
+        );
+        assert_eq!(function.body.statements.len(), 5);
+        assert!(matches!(
+            function.body.statements[0].kind,
+            StatementKind::Expression(_)
+        ));
+        assert!(matches!(
+            function.body.statements[1].kind,
+            StatementKind::Return(None)
+        ));
+        assert!(matches!(
+            function.body.statements[2].kind,
+            StatementKind::Return(Some(_))
+        ));
+        assert!(matches!(
+            function.body.statements[3].kind,
+            StatementKind::Break
+        ));
+        assert!(matches!(
+            function.body.statements[4].kind,
+            StatementKind::Continue
+        ));
+        assert!(function.body.value.is_some());
+    }
+
+    #[test]
+    fn parses_if_statements_and_binds_else_to_the_nearest_if() {
+        let function = function_declaration(
+            "fn f() { if first { one(); } else if second: two(); else { three(); } if outer: if inner: one(); else: two(); }",
+        );
+        let StatementKind::If {
+            branches,
+            else_body,
+        } = &function.body.statements[0].kind
+        else {
+            panic!("expected if statement");
+        };
+        assert_eq!(branches.len(), 2);
+        assert!(matches!(branches[0].body.kind, StatementBodyKind::Block(_)));
+        assert!(matches!(
+            branches[1].body.kind,
+            StatementBodyKind::Statement(_)
+        ));
+        assert!(matches!(
+            else_body.as_ref().unwrap().kind,
+            StatementBodyKind::Block(_)
+        ));
+
+        let StatementKind::If {
+            branches,
+            else_body,
+        } = &function.body.statements[1].kind
+        else {
+            panic!("expected outer if statement");
+        };
+        assert!(else_body.is_none());
+        let StatementBodyKind::Statement(inner) = &branches[0].body.kind else {
+            panic!("expected colon-form inner statement");
+        };
+        assert!(matches!(
+            inner.kind,
+            StatementKind::If {
+                else_body: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_while_and_for_with_both_body_forms() {
+        let function = function_declaration(
+            "fn f() { while condition: continue; for item in items { break; } }",
+        );
+        let StatementKind::While { body, .. } = &function.body.statements[0].kind else {
+            panic!("expected while statement");
+        };
+        assert!(matches!(body.kind, StatementBodyKind::Statement(_)));
+        let StatementKind::For { body, .. } = &function.body.statements[1].kind else {
+            panic!("expected for statement");
+        };
+        assert!(matches!(body.kind, StatementBodyKind::Block(_)));
+    }
+
+    #[test]
+    fn parses_switch_arms_and_final_else_arm() {
+        let function = function_declaration(
+            "fn f() { switch value { int: first(); Ok(str) { second(); } else: fallback(); } }",
+        );
+        let StatementKind::Switch {
+            arms, else_body, ..
+        } = &function.body.statements[0].kind
+        else {
+            panic!("expected switch statement");
+        };
+        assert_eq!(arms.len(), 2);
+        assert!(matches!(
+            arms[0].label.kind,
+            TypeKind::Primitive(PrimitiveType::Int)
+        ));
+        assert!(matches!(arms[1].label.kind, TypeKind::Tagged { .. }));
+        assert!(matches!(arms[0].body.kind, StatementBodyKind::Statement(_)));
+        assert!(matches!(arms[1].body.kind, StatementBodyKind::Block(_)));
+        assert!(else_body.is_some());
+    }
+
+    #[test]
+    fn keeps_final_block_values_separate_from_discarded_expressions() {
+        let function = function_declaration("fn f() { discarded; value }");
+        assert_eq!(function.body.statements.len(), 1);
+        assert!(function.body.value.is_some());
+
+        let function = function_declaration("fn f() { value; }");
+        assert_eq!(function.body.statements.len(), 1);
+        assert!(function.body.value.is_none());
+
+        let function = function_declaration(
+            "fn f() { result := { var value := initial; if condition: value = other; value }; }",
+        );
+        let StatementKind::Local { initializer, .. } = &function.body.statements[0].kind else {
+            panic!("expected outer local declaration");
+        };
+        let ExpressionKind::Block(block) = &initializer.kind else {
+            panic!("expected block expression initializer");
+        };
+        assert_eq!(block.statements.len(), 2);
+        assert!(block.value.is_some());
+    }
+
+    #[test]
+    fn parses_if_expressions_in_expression_context() {
+        let function = function_declaration("fn f() { result := if condition: yes else: no; }");
+        let StatementKind::Local { initializer, .. } = &function.body.statements[0].kind else {
+            panic!("expected local declaration");
+        };
+        assert!(matches!(initializer.kind, ExpressionKind::If { .. }));
+    }
+
+    #[test]
+    fn rejects_non_grammar_assignment_targets_and_nonfinal_switch_else() {
+        for target in ["call()", "(value)", "value?"] {
+            let diagnostic = parse(&source(&format!("fn f() {{ {target} = other; }}")))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                diagnostic.contains("assignment target"),
+                "{target}: {diagnostic}"
+            );
+        }
+
+        let diagnostic = parse(&source(
+            "fn f() { switch value { else: fallback(); int: unreachable(); } }",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(diagnostic.contains("else must be the final switch arm"));
     }
 }

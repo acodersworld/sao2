@@ -102,8 +102,100 @@ pub struct Statement {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatementKind {
+    Local {
+        mutable: bool,
+        name: Identifier,
+        initializer: Expression,
+    },
+    Assignment {
+        target: AssignmentTarget,
+        operator: AssignmentOperator,
+        operator_span: Span,
+        value: Expression,
+    },
     Expression(Expression),
+    Return(Option<Expression>),
+    Break,
+    Continue,
+    If {
+        branches: Vec<ConditionalStatementBranch>,
+        else_body: Option<StatementBody>,
+    },
+    While {
+        condition: Expression,
+        body: StatementBody,
+    },
+    For {
+        binding: Identifier,
+        iterable: Expression,
+        body: StatementBody,
+    },
+    Switch {
+        value: Expression,
+        arms: Vec<SwitchArm>,
+        else_body: Option<StatementBody>,
+    },
     Block(Block),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatementBody {
+    pub kind: StatementBodyKind,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StatementBodyKind {
+    Block(Block),
+    Statement(Box<Statement>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConditionalStatementBranch {
+    pub condition: Expression,
+    pub body: StatementBody,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwitchArm {
+    pub label: Type,
+    pub body: StatementBody,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssignmentTarget {
+    pub root: Identifier,
+    pub suffixes: Vec<AssignmentTargetSuffix>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssignmentTargetSuffix {
+    pub kind: AssignmentTargetSuffixKind,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AssignmentTargetSuffixKind {
+    Member(Member),
+    Index(Expression),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssignmentOperator {
+    Assign,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Remainder,
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
+    ShiftLeft,
+    ShiftRight,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
