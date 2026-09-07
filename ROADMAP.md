@@ -11,8 +11,7 @@ code and expands the accepted language subset.
 
 Status: complete.
 
-The active breakdown for this milestone is in
-[Current Work: First End-to-End Executable](CURRENT_WORK.md).
+This milestone is complete.
 
 - Establish the compiler and runtime source layout.
 - Add commands to build and run a single SAO2 source file.
@@ -36,6 +35,9 @@ generation, host compilation, executable creation, and successful execution.
 ## 2. Lexer and parser
 
 Status: next.
+
+The active breakdown for this milestone is in
+[Current Work: Lexer and Parser](CURRENT_WORK.md).
 
 - Replace the temporary parser incrementally while preserving the end-to-end
   print test.

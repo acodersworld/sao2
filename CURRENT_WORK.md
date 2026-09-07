@@ -1,200 +1,179 @@
-# Current Work: First End-to-End Executable
+# Current Work: Lexer and Parser
 
-Milestone status: complete.
+This document expands milestone 2 of `ROADMAP.md`. The objective is to replace
+the walking-skeleton parser with the permanent lexer, semantic syntax tree, and
+parser defined by `GRAMMAR.ebnf` while keeping source-to-executable compilation
+working.
 
-This document expands milestone 1 of `ROADMAP.md`. The immediate objective is
-to compile and run the smallest possible SAO2 program through the complete
-source-to-C pipeline:
+The executable regression program becomes valid SAO2 immediately:
 
-```text
-print("hello");
-```
-
-Top-level `print` is temporary walking-skeleton syntax. It must remain isolated
-from the permanent language grammar and will be removed when real `fn main()`
-support reaches the backend.
-
-## Scope
-
-The milestone includes:
-
-- Reading one SAO2 source file
-- Recognizing one top-level `print` statement containing one string literal
-- Decoding the defined ASCII string escapes
-- Producing a minimal C source file
-- Invoking an installed C compiler
-- Producing an executable
-- Running the executable and forwarding its exit status
-- Verifying the entire path with automated tests
-
-The milestone does not include functions, static typing, general expressions,
-the permanent parser, objects, containers, escape analysis, or garbage
-collection.
-
-## Phase 1: Repository and command skeleton
-
-Status: complete.
-
-- Establish directories for compiler source, runtime source, tests, fixtures,
-  and generated build artifacts.
-- Create the compiler executable and argument parser.
-- Provide these initial commands:
-
-  ```text
-  sao2 build program.sao2
-  sao2 run program.sao2
-  ```
-
-- Validate input paths and report missing or unreadable files cleanly.
-- Keep subprocess invocation independent of shell command construction so paths
-  containing spaces are safe.
-
-Exit criterion: both commands accept a path and reach a controlled placeholder
-compiler stage.
-
-## Phase 2: Minimal source reader and parser
-
-Status: complete.
-
-- Load the source as UTF-8 and retain its filename and byte offsets.
-- Recognize only `print`, parentheses, one string literal, a closing semicolon,
-  whitespace, and comments.
-- Decode `\\`, `\"`, `\'`, `\n`, `\r`, `\t`, `\0`, and `\xNN`.
-- Reject non-ASCII decoded string contents.
-- Reject trailing tokens and all unsupported constructs with a source-based
-  diagnostic.
-- Represent the accepted input with a tiny temporary node containing the
-  decoded bytes and source span.
-
-Exit criterion: the compiler accepts the example program and precisely rejects
-malformed variants.
-
-## Phase 3: Minimal C generation
-
-Status: complete.
-
-- Generate one self-contained C translation unit with `main`.
-- Store the decoded string as explicit bytes and write it with `fwrite`, avoiding
-  C format-string interpretation and preserving embedded zero bytes.
-- Return zero after successful output and a nonzero code if output fails.
-- Keep generated names independent of user-controlled identifiers.
-- Write generated C beneath a dedicated build directory.
-
-Representative output:
-
-```c
-#include <stdio.h>
-#ifdef _WIN32
-#include <fcntl.h>
-#include <io.h>
-#endif
-
-int main(void) {
-#ifdef _WIN32
-    if (_setmode(_fileno(stdout), _O_BINARY) == -1) return 1;
-#endif
-    static const unsigned char sao2_text[] = {104, 101, 108, 108, 111};
-    return fwrite(sao2_text, 1, 5, stdout) == 5 ? 0 : 1;
+```sao2
+fn main() {
+    print("hello");
 }
 ```
 
-Exit criterion: the generated C is deterministic and compiles independently.
+The parser recognizes the formal grammar only. The compiler pipeline, rather
+than the parser, requires an executable program to contain a valid `main`.
 
-## Phase 4: Host C compiler integration
+## Scope
 
-Status: complete.
+This milestone includes:
 
-- Detect or configure a supported C compiler.
-- Invoke it with an argument list rather than a shell command string.
-- Select platform-appropriate executable names and output paths.
-- Capture its stdout, stderr, and exit status.
-- Report compiler absence and failure as toolchain/compiler errors rather than
-  SAO2 source errors.
-- Provide an option to retain or display generated C for debugging.
+- Reusable source byte spans and line indexing
+- Structured, multi-error source diagnostics
+- The complete longest-match lexer
+- A semantic AST without comments or whitespace
+- Recursive-descent declaration, type, and statement parsing
+- Pratt expression parsing
+- Syntax error recovery and parser conformance tests
+- Early removal of temporary top-level `print` syntax
 
-Exit criterion: `sao2 build` creates a runnable native executable from the
-example source.
+Name resolution, static type checking, control-flow validation, and contextual
+type constraints remain later milestones unless needed to parse unambiguously.
 
-## Phase 5: Run command
+## Phase 1: Source and diagnostic foundations
 
-Status: complete.
+- Add a reusable half-open `Span { start, end }` using UTF-8 byte offsets.
+- Precompute line-start offsets when loading a source file.
+- Store structured source diagnostics with primary spans rather than embedding
+  locations into message strings.
+- Render the filename, one-based line and column, relevant source line, and a
+  caret. Tabs expand to four columns.
+- Collect diagnostics in source order and stop after 20 errors.
+- Preserve the existing usage, input, compiler, and program error categories.
 
-- Make `sao2 run` perform the same build pipeline.
-- Execute the resulting program without a shell.
-- Forward program stdout and stderr.
-- Return the program's exit status from the command.
-- Keep build failures distinct from program failures.
+Exit criterion: source locations and multiple diagnostics are represented and
+rendered consistently without changing the CLI pipeline.
 
-Exit criterion: `sao2 run` prints `hello` with no added newline and exits with
-status zero.
+## Phase 2: Complete lexer
 
-## Phase 6: Automated verification
+- Define tokens for every keyword, operator, delimiter, identifier, and literal
+  in `GRAMMAR.ebnf`, including an explicit EOF token.
+- Apply longest-token matching to overlapping operators.
+- Discard whitespace and nonnested line and block comments.
+- Recognize keywords only as complete tokens.
+- Decode string and character escapes into ASCII bytes and reject invalid or
+  non-ASCII contents.
+- Enforce lexical numeric forms and underscore placement while retaining
+  numeric lexemes for later range and type validation.
+- Keep signs as separate operator tokens.
 
-Status: complete.
+Exit criterion: every valid lexical form produces the expected token stream,
+and malformed lexical input produces precise source diagnostics.
 
-- Add unit tests for string decoding and minimal syntax errors.
-- Add snapshot tests for generated C and diagnostics.
-- Add end-to-end tests that compile and execute fixtures.
-- Cover empty strings, every escape, embedded zero bytes, comments, malformed
-  input, output failure where practical, and paths containing spaces.
-- Run the generated executable more than once to confirm deterministic output.
+## Phase 3: Early permanent-parser slice
 
-Exit criterion: one command runs all milestone tests reliably on the primary
-development platform.
+- Introduce semantic AST foundations with a span on every node.
+- Parse functions, blocks, expression statements, calls, identifiers, and
+  string literals.
+- At the compiler boundary, require exactly one of the four designed `main`
+  signatures.
+- Keep the temporary backend limited to a no-argument, no-return `main`
+  containing one `print` call with one string literal.
+- Update `tests/fixtures/hello.sao2` to use `fn main()`.
+- Delete `temporary_parser` and reject top-level statements permanently.
 
-## Phase 7: Walking-skeleton handoff
+Exit criterion: the permanent lexer and parser drive the existing native
+`hello` regression from valid SAO2 source.
 
-Status: complete.
+## Phase 4: Declarations and types
 
-- Document how later lexer, parser, IR, and backend stages replace each
-  temporary component.
-- Keep the end-to-end fixture as a permanent regression test.
-- Mark temporary top-level `print` parsing clearly so it cannot accidentally
-  become part of the public grammar.
-- Confirm that the next roadmap milestone can replace the source reader and
-  parser without changing C compiler or process-running interfaces.
+- Parse function declarations, parameters, optional return types, and type
+  declarations.
+- Parse primitive, named, list, map, referenced-member, union, tagged, and
+  parenthesized types.
+- Preserve explicit union parentheses in the AST so nested unions remain
+  distinct.
+- Represent named and unnamed type members without resolving their meaning.
+- Leave uniqueness, mixed-form, `Error` ordering, and storage validity checks
+  to name and type analysis.
 
-Exit criterion: milestone 1 is complete and milestone 2 can begin without
-breaking the source-to-executable path.
+Exit criterion: all declaration and type productions build complete spanned AST
+nodes.
 
-### Replacement map
+## Phase 5: Expressions
 
-- `SourceFile` remains the input boundary. Milestone 2 may add line indexes and
-  richer span helpers without changing CLI file loading.
-- `temporary_parser` and `PrintStatement` are walking-skeleton-only. The
-  permanent lexer and parser replace them with tokens and the syntax tree from
-  `GRAMMAR.ebnf`.
-- `c_emitter` is walking-skeleton-only. It stays connected until later
-  milestones introduce typed IR and replace it with the complete C backend.
-- `compiler::compile` remains the source-to-generated-C orchestration boundary.
-  Its internal frontend and backend stages may be replaced independently.
-- `host_compiler::compile` remains the generated-C-to-executable boundary. It
-  does not depend on the parser, syntax tree, or type system.
-- `program::run` remains the executable-to-exit-status boundary. It does not
-  depend on any compiler representation.
+- Implement Pratt parsing using the precedence and associativity defined by the
+  grammar and design.
+- Parse primitive literals, identifiers, unary and binary operators.
+- Parse chained calls, indexing, member access, and postfix `?`.
+- Parse positional and named arguments without treating named constructor
+  arguments as assignment expressions.
+- Parse lists, maps, typed empty collections, parenthesized expressions, block
+  expressions, and `if` expressions.
+- Resolve map-versus-block braces using expression context and colon structure.
 
-### Permanent regression contract
+Exit criterion: every expression production builds the intended tree and
+operator precedence is captured structurally.
 
-The fixture `tests/fixtures/hello.sao2` and its end-to-end test permanently
-verify source loading, compilation, C generation, native linking, exact output,
-and execution. While the temporary parser is active the fixture uses top-level
-`print`. Once real functions reach the backend, update the fixture to a valid
-`fn main()` program and delete `temporary_parser`; top-level `print` must not be
-accepted by the permanent grammar.
+## Phase 6: Statements and control flow
 
-Milestone 2 must keep `cargo test` passing while it replaces the temporary
-frontend incrementally. Host compiler discovery, `--show-c`, executable naming,
-process execution, and diagnostic categories require no frontend changes.
+- Parse local declarations, assignment and compound-assignment statements,
+  expression statements, return, break, and continue.
+- Parse blocks, `if`, `while`, `for`, and `switch`.
+- Support both braced and colon-form control-flow bodies.
+- Bind `else` to the nearest unmatched `if`.
+- Represent a final block value separately from semicolon-terminated discarded
+  expressions.
+- Keep assignment restricted to statement position.
+
+Exit criterion: every statement and control-flow production produces a
+complete spanned AST.
+
+## Phase 7: Recovery and conformance
+
+- Recover at semicolons, closing braces, and top-level `fn` or `type`
+  boundaries.
+- Avoid duplicate diagnostics for the same failed construct.
+- Sort diagnostics by primary source position and cap output at 20 errors.
+- Add valid fixtures covering every grammar family.
+- Add malformed fixtures covering ambiguous constructs and recovery paths.
+- Document the AST invariants and the milestone-3 name-resolution handoff.
+
+Exit criterion: all formal grammar productions are covered, invalid programs
+produce useful bounded diagnostics, and the full regression suite passes.
+
+## Core interfaces
+
+```text
+Span { start: usize, end: usize }
+Token { kind: TokenKind, span: Span }
+Program { declarations: Vec<Declaration>, span: Span }
+parse(source: &SourceFile) -> ParseResult<Program>
+```
+
+Tokens store decoded payloads only where required, notably strings and
+characters. Numeric tokens retain source spans and are converted and
+range-checked during later analysis. Every AST node carries the span of the
+source construct that produced it.
+
+The stable outer boundaries remain:
+
+- `compiler::compile`: loaded source to generated C
+- `host_compiler::compile`: generated C to native executable
+- `program::run`: native executable to process exit status
+
+## Test requirements
+
+- Exhaustive token, keyword, operator, delimiter, and longest-match tests
+- Literal, escape, comment, numeric-separator, and unterminated-input tests
+- AST snapshots for each declaration, type, expression, and statement family
+- Precedence, postfix chaining, dangling-else, nested-union, and brace tests
+- Multiple-error recovery, ordering, and 20-error-limit tests
+- Missing, duplicate, and invalid `main` compiler-validation tests
+- Permanent `fn main()` source-to-native-executable regression
 
 ## Definition of done
 
-Milestone 1 is complete when all of the following are true:
+Milestone 2 is complete when:
 
-- `sao2 build hello.sao2` creates a native executable.
-- The executable writes exactly the decoded string bytes.
-- `sao2 run hello.sao2` builds and runs it successfully.
-- Invalid input produces a SAO2 source diagnostic.
-- Missing or failing C toolchains produce a distinct toolchain diagnostic.
-- Generated C is inspectable for debugging.
-- Automated end-to-end tests pass.
-- Temporary syntax and components are clearly identified for later removal.
+- `temporary_parser` and top-level `print` support are removed.
+- The lexer covers every token and lexical edge case in the design.
+- The parser covers every production in `GRAMMAR.ebnf`.
+- Every token and AST node has an accurate half-open byte span.
+- Diagnostics render source lines and carets and recover up to 20 errors.
+- The compiler requires a designed `main` signature without making it a parser
+  grammar rule.
+- The existing build, host compiler, and run interfaces remain intact.
+- The complete unit and end-to-end suite passes.
