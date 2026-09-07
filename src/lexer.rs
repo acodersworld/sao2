@@ -1,7 +1,6 @@
 //! The permanent SAO2 lexer.
 //!
-//! Phase 2 keeps this separate from the milestone-one compiler path. Phase 3
-//! will replace `temporary_parser` and make these tokens the compiler input.
+//! Phase 3 makes these tokens the input to the permanent parser.
 
 use crate::diagnostic::{Diagnostic, Diagnostics};
 use crate::source::{SourceFile, Span};

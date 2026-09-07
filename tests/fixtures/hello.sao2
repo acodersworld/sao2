@@ -1,1 +1,3 @@
-print("hello");
+fn main() {
+    print("hello");
+}

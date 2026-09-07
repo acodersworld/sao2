@@ -60,14 +60,14 @@ fn malformed_source_has_stable_diagnostic() {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("bad.sao2:1:7: expected string literal"));
+    assert!(stderr.contains("bad.sao2:1:1: expected function declaration"));
     assert!(!directory.0.join("build/program.c").exists());
 }
 
 #[test]
 fn missing_configured_compiler_is_a_toolchain_error() {
     let directory = TestDirectory::new("missing compiler");
-    let source_path = directory.write_source("hello.sao2", b"print(\"hello\");");
+    let source_path = directory.write_source("hello.sao2", b"fn main() { print(\"hello\"); }");
     let output = Command::new(env!("CARGO_BIN_EXE_sao2"))
         .args([OsStr::new("build"), source_path.as_os_str()])
         .current_dir(&directory.0)
@@ -82,7 +82,7 @@ fn missing_configured_compiler_is_a_toolchain_error() {
 #[test]
 fn failing_compiler_reports_captured_failure() {
     let directory = TestDirectory::new("failing compiler");
-    let source_path = directory.write_source("hello.sao2", b"print(\"hello\");");
+    let source_path = directory.write_source("hello.sao2", b"fn main() { print(\"hello\"); }");
     let output = Command::new(env!("CARGO_BIN_EXE_sao2"))
         .args([OsStr::new("build"), source_path.as_os_str()])
         .current_dir(&directory.0)
@@ -100,8 +100,8 @@ fn failing_compiler_reports_captured_failure() {
 #[test]
 fn compiles_and_runs_exact_bytes_twice_when_a_compiler_is_available() {
     let directory = TestDirectory::new("exact output");
-    let source = br#"/* before */ print // between
-        ("\\\"\'\n\r\t\0\x41") /* after */ ;"#;
+    let source = br#"/* before */ fn main() { print // between
+        ("\\\"\'\n\r\t\0\x41") /* after */ ; }"#;
     let expected = b"\\\"'\n\r\t\0A";
 
     let first = run_source(&directory, source);
@@ -128,7 +128,7 @@ fn compiles_and_runs_exact_bytes_twice_when_a_compiler_is_available() {
 #[test]
 fn runs_an_empty_string_when_a_compiler_is_available() {
     let directory = TestDirectory::new("empty output");
-    let output = run_source(&directory, br#"print("");"#);
+    let output = run_source(&directory, br#"fn main() { print(""); }"#);
     if compiler_is_missing(&output) {
         eprintln!("skipping native end-to-end assertions: no C compiler available");
         return;

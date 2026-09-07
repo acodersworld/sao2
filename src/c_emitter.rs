@@ -1,4 +1,4 @@
-//! Minimal C emitter for the milestone-one walking skeleton.
+//! Temporary C emitter for the early permanent-parser walking skeleton.
 
 use std::fmt::Write;
 
