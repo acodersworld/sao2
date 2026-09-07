@@ -19,6 +19,8 @@ explicit design decision.
 
 The compiler requires Rust 1.90 or newer and uses Rust edition 2024.
 
+Do not compile the project, run tests, or format files.
+
 ```text
 cargo test
 cargo run -- --help

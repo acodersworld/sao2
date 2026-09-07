@@ -48,10 +48,7 @@ mod tests {
 
     #[test]
     fn valid_source_writes_program_c() {
-        let source = SourceFile {
-            path: PathBuf::from("hello.sao2"),
-            text: "print(\"hello\");".to_owned(),
-        };
+        let source = SourceFile::new(PathBuf::from("hello.sao2"), "print(\"hello\");".to_owned());
         let build_directory = temporary_directory("c-output");
 
         let output_path = compile_into(&source, &build_directory).unwrap();
@@ -66,10 +63,7 @@ mod tests {
 
     #[test]
     fn malformed_source_returns_source_diagnostic() {
-        let source = SourceFile {
-            path: PathBuf::from("bad.sao2"),
-            text: "print(123);".to_owned(),
-        };
+        let source = SourceFile::new(PathBuf::from("bad.sao2"), "print(123);".to_owned());
 
         let build_directory = temporary_directory("malformed");
         let diagnostic = compile_into(&source, &build_directory)
@@ -82,17 +76,11 @@ mod tests {
 
     #[test]
     fn repeated_compilation_overwrites_deterministically() {
-        let source = SourceFile {
-            path: PathBuf::from("hello.sao2"),
-            text: "print(\"first\");".to_owned(),
-        };
+        let source = SourceFile::new(PathBuf::from("hello.sao2"), "print(\"first\");".to_owned());
         let build_directory = temporary_directory("overwrite");
         compile_into(&source, &build_directory).unwrap();
 
-        let source = SourceFile {
-            path: PathBuf::from("hello.sao2"),
-            text: "print(\"second\");".to_owned(),
-        };
+        let source = SourceFile::new(PathBuf::from("hello.sao2"), "print(\"second\");".to_owned());
         let output_path = compile_into(&source, &build_directory).unwrap();
         assert_eq!(
             fs::read_to_string(output_path).unwrap(),

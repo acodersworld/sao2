@@ -3,15 +3,13 @@
 //! This syntax is deliberately separate from the permanent grammar and accepts
 //! only one top-level `print("...");` statement.
 
-use std::ops::Range;
-
 use crate::diagnostic::Diagnostic;
-use crate::source::SourceFile;
+use crate::source::{SourceFile, Span};
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct PrintStatement {
     pub bytes: Vec<u8>,
-    pub span: Range<usize>,
+    pub span: Span,
 }
 
 pub fn parse(source: &SourceFile) -> Result<PrintStatement, Diagnostic> {
@@ -51,7 +49,7 @@ impl Parser<'_> {
 
         Ok(PrintStatement {
             bytes,
-            span: start..end,
+            span: Span::new(start, end),
         })
     }
 
@@ -187,7 +185,7 @@ impl Parser<'_> {
     }
 
     fn error_at(&self, offset: usize, message: &str) -> Diagnostic {
-        Diagnostic::source(self.source, offset, message)
+        Diagnostic::source(self.source, Span::empty(offset), message)
     }
 }
 
@@ -201,17 +199,14 @@ mod tests {
     use std::path::PathBuf;
 
     fn source(text: &str) -> SourceFile {
-        SourceFile {
-            path: PathBuf::from("test.sao2"),
-            text: text.to_owned(),
-        }
+        SourceFile::new(PathBuf::from("test.sao2"), text.to_owned())
     }
 
     #[test]
     fn parses_print_and_records_statement_span() {
         let parsed = parse(&source("  print(\"hello\");  ")).unwrap();
         assert_eq!(parsed.bytes, b"hello");
-        assert_eq!(parsed.span, 2..17);
+        assert_eq!(parsed.span, Span::new(2, 17));
     }
 
     #[test]
