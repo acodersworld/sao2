@@ -1,5 +1,7 @@
 # Current Work: First End-to-End Executable
 
+Milestone status: complete.
+
 This document expands milestone 1 of `ROADMAP.md`. The immediate objective is
 to compile and run the smallest possible SAO2 program through the complete
 source-to-C pipeline:
@@ -82,10 +84,17 @@ Representative output:
 
 ```c
 #include <stdio.h>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 int main(void) {
-    static const unsigned char text[] = {104, 101, 108, 108, 111};
-    return fwrite(text, 1, sizeof(text), stdout) == sizeof(text) ? 0 : 1;
+#ifdef _WIN32
+    if (_setmode(_fileno(stdout), _O_BINARY) == -1) return 1;
+#endif
+    static const unsigned char sao2_text[] = {104, 101, 108, 108, 111};
+    return fwrite(sao2_text, 1, 5, stdout) == 5 ? 0 : 1;
 }
 ```
 
@@ -135,6 +144,8 @@ development platform.
 
 ## Phase 7: Walking-skeleton handoff
 
+Status: complete.
+
 - Document how later lexer, parser, IR, and backend stages replace each
   temporary component.
 - Keep the end-to-end fixture as a permanent regression test.
@@ -145,6 +156,35 @@ development platform.
 
 Exit criterion: milestone 1 is complete and milestone 2 can begin without
 breaking the source-to-executable path.
+
+### Replacement map
+
+- `SourceFile` remains the input boundary. Milestone 2 may add line indexes and
+  richer span helpers without changing CLI file loading.
+- `temporary_parser` and `PrintStatement` are walking-skeleton-only. The
+  permanent lexer and parser replace them with tokens and the syntax tree from
+  `GRAMMAR.ebnf`.
+- `c_emitter` is walking-skeleton-only. It stays connected until later
+  milestones introduce typed IR and replace it with the complete C backend.
+- `compiler::compile` remains the source-to-generated-C orchestration boundary.
+  Its internal frontend and backend stages may be replaced independently.
+- `host_compiler::compile` remains the generated-C-to-executable boundary. It
+  does not depend on the parser, syntax tree, or type system.
+- `program::run` remains the executable-to-exit-status boundary. It does not
+  depend on any compiler representation.
+
+### Permanent regression contract
+
+The fixture `tests/fixtures/hello.sao2` and its end-to-end test permanently
+verify source loading, compilation, C generation, native linking, exact output,
+and execution. While the temporary parser is active the fixture uses top-level
+`print`. Once real functions reach the backend, update the fixture to a valid
+`fn main()` program and delete `temporary_parser`; top-level `print` must not be
+accepted by the permanent grammar.
+
+Milestone 2 must keep `cargo test` passing while it replaces the temporary
+frontend incrementally. Host compiler discovery, `--show-c`, executable naming,
+process execution, and diagnostic categories require no frontend changes.
 
 ## Definition of done
 

@@ -6,6 +6,8 @@ use crate::diagnostic::Diagnostic;
 use crate::source::SourceFile;
 use crate::temporary_parser;
 
+/// Stable orchestration boundary from loaded SAO2 source to generated C.
+/// Frontend and backend implementations behind this function are temporary.
 pub fn compile(source: &SourceFile) -> Result<PathBuf, Diagnostic> {
     compile_into(source, Path::new("build"))
 }

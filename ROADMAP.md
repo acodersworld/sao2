@@ -9,6 +9,8 @@ code and expands the accepted language subset.
 
 ## 1. First end-to-end executable
 
+Status: complete.
+
 The active breakdown for this milestone is in
 [Current Work: First End-to-End Executable](CURRENT_WORK.md).
 
@@ -32,6 +34,8 @@ Outcome: the smallest possible SAO2 source file travels through parsing, C
 generation, host compilation, executable creation, and successful execution.
 
 ## 2. Lexer and parser
+
+Status: next.
 
 - Replace the temporary parser incrementally while preserving the end-to-end
   print test.
