@@ -58,9 +58,10 @@ On failure it returns source-ordered diagnostics rather than a partial AST.
 Recovery occurs at semicolons, closing braces, and top-level `fn` or `type`
 boundaries, and diagnostics are capped at 20.
 
-Milestone 3 may rely on the structural invariants above, but must perform all
-contextual and semantic validation. In particular, analysis remains
-responsible for:
+Milestone 3 may rely on the structural invariants above. Name and type analysis
+in milestone 3 and semantic analysis in milestone 5 together own contextual
+validation; CURRENT_WORK.md defines the current phase boundaries. Analysis
+remains responsible for:
 
 - declaration and member uniqueness, name lookup, and type-name resolution;
 - struct-versus-tuple member consistency and union alternative validity;

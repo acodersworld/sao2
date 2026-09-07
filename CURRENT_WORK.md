@@ -1,11 +1,11 @@
-# Current Work: Lexer and Parser
+# Current Work: Names and Types
 
-This document expands milestone 2 of `ROADMAP.md`. The objective is to replace
-the walking-skeleton parser with the permanent lexer, semantic syntax tree, and
-parser defined by `GRAMMAR.ebnf` while keeping source-to-executable compilation
-working.
+This document expands milestone 3 of `ROADMAP.md`. The objective is to resolve
+the syntax tree into named declarations, bindings, and static types that later
+compiler stages can consume without repeating name lookup or type inference.
 
-The executable regression program becomes valid SAO2 immediately:
+Milestone 2 supplies the complete parser and the spanned AST documented in
+`AST.md`. The existing hello program must continue to compile and run:
 
 ```sao2
 fn main() {
@@ -13,170 +13,224 @@ fn main() {
 }
 ```
 
-The parser recognizes the formal grammar only. The compiler pipeline, rather
-than the parser, requires an executable program to contain a valid `main`.
+Milestone 4 begins the early primitive C backend. This milestone supplies its
+analysis inputs; it does not expand the current emitter's executable subset.
 
-## Scope
+## Scope and analysis boundary
 
-This milestone includes:
+This milestone owns:
 
-- Reusable source byte spans and line indexing
-- Structured, multi-error source diagnostics
-- The complete longest-match lexer
-- A semantic AST without comments or whitespace
-- Recursive-descent declaration, type, and statement parsing
-- Pratt expression parsing
-- Syntax error recovery and parser conformance tests
-- Early removal of temporary top-level `print` syntax
+- top-level function and nominal-type tables;
+- primitive, container, struct, tuple, union, and error type resolution;
+- declaration, constructor, member, and storage validation;
+- lexical scopes, parameters, locals, and unrestricted local shadowing;
+- identification of calls to functions, constructors, and intrinsics;
+- literal conversion and expression type inference; and
+- expected-type propagation for unions and empty collections.
 
-Name resolution, static type checking, control-flow validation, and contextual
-type constraints remain later milestones unless needed to parse unambiguously.
+Type inference necessarily checks the operands and arguments needed to
+establish a result type. Reuse those checks in later analysis. Milestone 5 owns
+the complete semantic validation pass, including mutability, return paths,
+loop context, exhaustive switches, and flow-sensitive union narrowing.
 
-## Phase 1: Source and diagnostic foundations
+Distinguish a resolved expression type from a fully validated program.
+Flow-dependent expressions whose types require milestone-5 narrowing may
+retain explicit deferred analysis records. They must never masquerade as
+successfully typed values or reach C generation with unresolved types.
 
-- Add a reusable half-open `Span { start, end }` using UTF-8 byte offsets.
-- Precompute line-start offsets when loading a source file.
-- Store structured source diagnostics with primary spans rather than embedding
-  locations into message strings.
-- Render the filename, one-based line and column, relevant source line, and a
-  caret. Tabs expand to four columns.
-- Collect diagnostics in source order and stop after 20 errors.
-- Preserve the existing usage, input, compiler, and program error categories.
+## Phase 1: Analysis representation and diagnostics
 
-Exit criterion: source locations and multiple diagnostics are represented and
-rendered consistently without changing the CLI pipeline.
+- Introduce a name-and-type analysis entry point over `SourceFile` and `Program`.
+- Add stable identities for declarations, bindings, and resolved types.
+- Represent primitive and container types alongside nominal declaration
+  identities; distinguish no-value results and non-returning expressions from
+  language value types.
+- Retain source spans and connections to AST nodes in analysis results.
+- Keep analysis annotations separate from parser syntax invariants.
+- Reuse bounded, source-ordered diagnostics. Use an internal error state to
+  suppress cascading failures without treating an error as a valid type.
+- Keep the representation dependency-free and small; a full typed IR belongs
+  to milestone 6.
 
-## Phase 2: Complete lexer
+Exit criterion: analysis results can record identities, types, errors, and
+deferred work without changing parsing or the existing executable path.
 
-- Define tokens for every keyword, operator, delimiter, identifier, and literal
-  in `GRAMMAR.ebnf`, including an explicit EOF token.
-- Apply longest-token matching to overlapping operators.
-- Discard whitespace and nonnested line and block comments.
-- Recognize keywords only as complete tokens.
-- Decode string and character escapes into ASCII bytes and reject invalid or
-  non-ASCII contents.
-- Enforce lexical numeric forms and underscore placement while retaining
-  numeric lexemes for later range and type validation.
-- Keep signs as separate operator tokens.
+## Phase 2: Top-level declarations and signatures
 
-Exit criterion: every valid lexical form produces the expected token stream,
-and malformed lexical input produces precise source diagnostics.
+- Collect all type and function names before resolving declaration bodies.
+- Use separate type and value namespaces.
+- Diagnose duplicate declarations within their respective namespaces and
+  duplicate function parameter names.
+- Resolve function parameter and return annotations independently of function
+  body order, supporting forward calls and direct or mutual recursion.
+- Register compiler intrinsics with explicit identities and signature rules.
+- Distinguish ordinary function calls from constructors and built-in calls;
+  do not introduce first-class function values or overloads.
+- Preserve the compiler boundary's exactly-one-main and four-signature checks;
+  reuse resolved signatures when integrating the new analysis.
 
-## Phase 3: Early permanent-parser slice
+Exit criterion: every declared function and type has a stable identity and
+resolved signature, or a precise declaration diagnostic.
 
-- Introduce semantic AST foundations with a span on every node.
-- Parse functions, blocks, expression statements, calls, identifiers, and
-  string literals.
-- At the compiler boundary, require exactly one of the four designed `main`
-  signatures.
-- Keep the temporary backend limited to a no-argument, no-return `main`
-  containing one `print` call with one string literal.
-- Update `tests/fixtures/hello.sao2` to use `fn main()`.
-- Delete `temporary_parser` and reject top-level statements permanently.
+## Phase 3: Type definitions, unions, and storage
 
-Exit criterion: the permanent lexer and parser drive the existing native
-`hello` regression from valid SAO2 source.
+- Resolve primitive, named, list, map, and parenthesized type syntax.
+- Classify declarations as structs, tuples, or unions according to the design
+  and grammar; reject mixed named and unnamed members.
+- Give each named type nominal identity even when another declaration has the
+  same structure.
+- Validate member uniqueness, union alternative uniqueness, tag uniqueness,
+  and the special final-position rule for `Error`.
+- Respect the designed distinction between tagged alternatives and the special
+  error alternative; reject invalid tagged/untagged combinations.
+- Ignore alternative order for union type identity while retaining source
+  order for diagnostics and preserving explicitly nested union structure.
+- Keep `&` as member storage metadata, permitted only for struct-valued
+  members; do not construct a first-class reference type.
+- Detect recursive inline layouts, including dependencies through tuples and
+  union payloads. Referenced struct members and container references break
+  inline layout cycles.
+- Validate map key types, including recursively composed immutable tuples.
 
-## Phase 4: Declarations and types
+Exit criterion: type definitions resolve independently of source order, valid
+referenced recursion terminates, and invalid or infinitely sized types receive
+bounded diagnostics.
 
-- Parse function declarations, parameters, optional return types, and type
-  declarations.
-- Parse primitive, named, list, map, referenced-member, union, tagged, and
-  parenthesized types.
-- Preserve explicit union parentheses in the AST so nested unions remain
-  distinct.
-- Represent named and unnamed type members without resolving their meaning.
-- Leave uniqueness, mixed-form, `Error` ordering, and storage validity checks
-  to name and type analysis.
+## Phase 4: Lexical scopes and binding resolution
 
-Exit criterion: all declaration and type productions build complete spanned AST
-nodes.
+- Resolve parameters and local references with explicit binding identities.
+- Resolve each initializer before introducing its local binding.
+- Permit shadowing in nested scopes and within the same scope.
+- Traverse braced and colon-form bodies using the scopes defined by the
+  language; resolve loop bindings only where they are visible.
+- Resolve assignment roots, call targets, and member receivers.
+- Preserve declaration mutability and access information for milestone 5.
+- Diagnose unknown names without falling through to a different namespace or
+  silently substituting an intrinsic.
 
-## Phase 5: Expressions
+Exit criterion: each name use resolves to the correct declaration or binding.
+For `x := 1; x := x + 1;`, the second initializer refers to the first binding
+and subsequent uses refer to the second.
 
-- Implement Pratt parsing using the precedence and associativity defined by the
-  grammar and design.
-- Parse primitive literals, identifiers, unary and binary operators.
-- Parse chained calls, indexing, member access, and postfix `?`.
-- Parse positional and named arguments without treating named constructor
-  arguments as assignment expressions.
-- Parse lists, maps, typed empty collections, parenthesized expressions, block
-  expressions, and `if` expressions.
-- Resolve map-versus-block braces using expression context and colon structure.
+## Phase 5: Literals and expression type inference
 
-Exit criterion: every expression production builds the intended tree and
-operator precedence is captured structurally.
+- Convert numeric lexemes once, respecting decimal, hexadecimal, binary, and
+  separator syntax; retain decoded values for downstream consumers.
+- Check literal representability, including the signed minimum integer under
+  unary minus and finite binary64 values. Keep runtime arithmetic checks for
+  the later lowering milestone.
+- Type primitive literals, identifier references, parentheses, and unary and
+  binary expressions according to the design's operand rules.
+- Record result types for comparisons, boolean operations, indexing, and
+  member access; do not import C's implicit conversions or truthiness.
+- Resolve struct fields, tuple positions, and built-in container methods.
+- Use declared function signatures to infer call results, including recursive
+  calls, without inferring a signature from its body.
+- Represent intrinsic argument rules and no-value/non-returning results.
+- Infer local types and ordinary block and if-expression result types where
+  context suffices; keep statements distinct from value-producing expressions.
+- Record type-dependent union tests, switch labels, and postfix `?` analysis
+  needs for milestone 5 rather than guessing narrowed types.
 
-## Phase 6: Statements and control flow
+Exit criterion: ordinary expressions and local declarations have concrete
+static types and converted literal payloads. Invalid type combinations receive
+source diagnostics; flow-dependent obligations remain explicitly identified.
 
-- Parse local declarations, assignment and compound-assignment statements,
-  expression statements, return, break, and continue.
-- Parse blocks, `if`, `while`, `for`, and `switch`.
-- Support both braced and colon-form control-flow bodies.
-- Bind `else` to the nearest unmatched `if`.
-- Represent a final block value separately from semicolon-terminated discarded
-  expressions.
-- Keep assignment restricted to statement position.
+## Phase 6: Constructors and expected types
 
-Exit criterion: every statement and control-flow production produces a
-complete spanned AST.
+- Validate named struct arguments for missing, duplicate, and unknown members.
+- Validate positional tuple arguments and declared member types.
+- Preserve source argument evaluation order independently of declaration order.
+- Resolve untagged union constructors, qualified tagged constructors, and
+  `Error(value)`.
+- Propagate expected types from parameter signatures, constructor members,
+  assignment targets, return annotations, and enclosing collection contexts.
+- Record implicit injection into an expected union alternative explicitly.
+- Infer nonempty collection types using the design's compatibility rules.
+- Require a suitable expected type or explicit ascription for empty lists and
+  maps; propagate that context through nested collections.
+- Reject incompatible or ambiguous construction without inventing implicit
+  numeric conversions, union flattening, or new inference rules.
 
-## Phase 7: Recovery and conformance
+Exit criterion: constructors and context-dependent expressions resolve with
+explicit types and selected union alternatives, or report useful diagnostics.
 
-- Recover at semicolons, closing braces, and top-level `fn` or `type`
-  boundaries.
-- Avoid duplicate diagnostics for the same failed construct.
-- Sort diagnostics by primary source position and cap output at 20 errors.
-- Add valid fixtures covering every grammar family.
-- Add malformed fixtures covering ambiguous constructs and recovery paths.
-- Document the AST invariants and the milestone-3 name-resolution handoff.
+## Phase 7: Pipeline integration and handoff
 
-Exit criterion: all formal grammar productions are covered, invalid programs
-produce useful bounded diagnostics, and the full regression suite passes.
+- Run name-and-type analysis after parsing and before temporary backend checks.
+- Analyze all declarations, including functions the temporary backend cannot
+  yet execute.
+- Keep the current print-only executable regression working; distinguish name
+  and type errors from valid programs outside the backend's supported subset.
+- Supply resolved identities, types, literal values, and intrinsic targets to
+  milestone 4. Prevent emission of expressions with error or deferred states.
+- Document the obligations retained for milestone 5 in the analysis interface.
+- Add focused valid and invalid fixtures for each phase; parser conformance
+  fixtures are not automatically semantically valid programs.
+- Preserve the CLI, output paths, source/tool/program error categories, and
+  existing 20-diagnostic limit.
+- Update `AST.md` with the concrete analysis handoff once implemented.
 
-## Core interfaces
+Exit criterion: the compiler has a stable name-and-type analysis boundary,
+the hello regression remains executable, and later stages can consume resolved
+facts without repeating lookup or literal conversion.
 
-```text
-Span { start: usize, end: usize }
-Token { kind: TokenKind, span: Span }
-Program { declarations: Vec<Declaration>, span: Span }
-parse(source: &SourceFile) -> ParseResult<Program>
-```
+## Design questions encountered during implementation
 
-Tokens store decoded payloads only where required, notably strings and
-characters. Numeric tokens retain source spans and are converted and
-range-checked during later analysis. Every AST node carries the span of the
-source construct that produced it.
+Use `DESIGN.md` and `GRAMMAR.ebnf` as the authorities. Where they leave a
+decision unresolved or disagree, record an explicit design decision before
+implementing the affected behavior. Known examples to check include:
 
-The stable outer boundaries remain:
+- primitive conversion calls such as `int(value)`, which the design describes
+  but the current primary-expression grammar does not admit;
+- collisions between intrinsic names, user declarations, and constructor
+  names in call position; and
+- any ambiguous declaration classification or union/error construction case
+  not determined by the documented rules.
 
-- `compiler::compile`: loaded source to generated C
-- `host_compiler::compile`: generated C to native executable
-- `program::run`: native executable to process exit status
+These questions do not authorize unrelated syntax changes or block independent
+analysis work.
 
-`AST.md` records the completed parser invariants and the milestone-3 analysis
-handoff.
+## Non-goals
+
+- Expanded C emission or native arithmetic execution (milestone 4)
+- Complete mutability, control-flow, narrowing, and return-path validation
+  (milestone 5)
+- Typed IR, evaluation-order lowering, or runtime arithmetic checks (milestone 6)
+- Runtime layouts, allocation, escape analysis, garbage collection, or containers
+- New language syntax or undocumented implicit conversions
+
+The early backend's temporary unchecked arithmetic does not change this
+milestone's static type rules or literal range validation.
 
 ## Test requirements
 
-- Exhaustive token, keyword, operator, delimiter, and longest-match tests
-- Literal, escape, comment, numeric-separator, and unterminated-input tests
-- AST snapshots for each declaration, type, expression, and statement family
-- Precedence, postfix chaining, dangling-else, nested-union, and brace tests
-- Multiple-error recovery, ordering, and 20-error-limit tests
-- Missing, duplicate, and invalid `main` compiler-validation tests
-- Permanent `fn main()` source-to-native-executable regression
+- Forward declarations, recursive calls, duplicate names, and separate namespaces
+- Nominal identity, container identity, union ordering, and preserved nesting
+- Valid referenced recursion and rejected inline layout cycles
+- Invalid member forms, referenced storage, tags, error ordering, and map keys
+- Parameter/local lookup, initializer visibility, and same-scope shadowing
+- Literal boundaries and operator, call, index, and member result types
+- Struct, tuple, union, and error constructors
+- Empty collections with and without expected types, including nested contexts
+- Explicit deferred states for flow-dependent analysis
+- Multiple errors, source ordering, diagnostic caps, and cascade suppression
+- Analysis-to-backend handoff and the existing hello end-to-end regression
+
+Add tests alongside each phase. Execute verification only when repository
+instructions permit it; record any verification that remains outstanding.
 
 ## Definition of done
 
-Milestone 2 is complete when:
+Milestone 3 is complete when:
 
-- `temporary_parser` and top-level `print` support are removed.
-- The lexer covers every token and lexical edge case in the design.
-- The parser covers every production in `GRAMMAR.ebnf`.
-- Every token and AST node has an accurate half-open byte span.
-- Diagnostics render source lines and carets and recover up to 20 errors.
-- The compiler requires a designed `main` signature without making it a parser
-  grammar rule.
-- The existing build, host compiler, and run interfaces remain intact.
-- The complete unit and end-to-end suite passes.
+- top-level declarations, signatures, and lexical bindings resolve independently
+  of source order where the language permits it;
+- all documented type forms, member storage rules, and constructors are covered;
+- ordinary expressions carry resolved types and converted literal values;
+- expected types resolve union injection and empty collections;
+- remaining flow-sensitive work is explicit and reserved for milestone 5;
+- milestone 4 can consume resolved primitive programs without redoing analysis;
+- source diagnostics remain precise and bounded; and
+- the existing executable path is preserved, with test coverage added and
+  verification status recorded.

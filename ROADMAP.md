@@ -34,10 +34,7 @@ generation, host compilation, executable creation, and successful execution.
 
 ## 2. Lexer and parser
 
-Status: next.
-
-The active breakdown for this milestone is in
-[Current Work: Lexer and Parser](CURRENT_WORK.md).
+Status: complete.
 
 - Replace the temporary parser incrementally while preserving the end-to-end
   print test.
@@ -53,15 +50,41 @@ source-based diagnostics.
 
 ## 3. Names and types
 
+Status: next.
+
+The phase breakdown for this milestone is in
+[Current Work: Names and Types](CURRENT_WORK.md).
+
 - Build the top-level function and nominal-type tables.
 - Resolve primitive, container, struct, tuple, union, and error types.
 - Resolve lexical scopes and unrestricted local shadowing.
+- Resolve compiler-provided intrinsic names independently of user functions.
 - Validate declarations, constructors, inline members, and referenced members.
 - Implement expected-type propagation for unions and empty collections.
 
 Outcome: declarations and expressions have resolved, statically known types.
 
-## 4. Semantic analysis
+## 4. Early primitive C backend
+
+- Replace the print-only lowering with a deliberately limited direct emitter
+  over the resolved syntax tree.
+- Emit a no-argument `main`, integer literals, primitive local variables,
+  assignments, basic arithmetic and comparisons, and an integer return value.
+- Preserve the existing string-literal `print` path and add only the primitive
+  output needed by executable arithmetic tests.
+- Emit straightforward signed C arithmetic without runtime checks. During this
+  temporary stage, overflow, division by zero, and invalid shifts may inherit
+  host C undefined behavior; conformance tests must avoid those cases.
+- Keep unsupported valid SAO2 programs as clear source diagnostics rather than
+  silently miscompiling them.
+- Add end-to-end tests that compile and execute in-range arithmetic programs.
+- Keep this resolved-AST emitter visibly temporary so typed-IR generation can
+  replace it without preserving its structure.
+
+Outcome: a small, well-defined primitive subset performs useful arithmetic and
+runs through generated C immediately after name and type resolution.
+
+## 5. Semantic analysis
 
 - Type-check expressions, calls, assignments, and returns.
 - Enforce constant, `var`, transitive mutability, and tuple immutability rules.
@@ -71,7 +94,7 @@ Outcome: declarations and expressions have resolved, statically known types.
 
 Outcome: every accepted program is type-correct and ready for lowering.
 
-## 5. Typed intermediate representation
+## 6. Typed intermediate representation
 
 - Lower the syntax tree into a small typed IR.
 - Make evaluation order, temporary values, and control-flow edges explicit.
@@ -82,7 +105,7 @@ Outcome: every accepted program is type-correct and ready for lowering.
 Outcome: language semantics no longer depend on source-level syntax or C
 evaluation details.
 
-## 6. Complete core C backend
+## 7. Complete core C backend
 
 - Replace the temporary direct C emitter with typed-IR-based generation.
 - Emit C declarations for primitive, tuple, union, and function types.
@@ -93,7 +116,7 @@ evaluation details.
 
 Outcome: primitive-only SAO2 programs compile and run end to end.
 
-## 7. Runtime value foundations
+## 8. Runtime value foundations
 
 - Implement immutable ASCII string interning.
 - Implement tuple construction, copying, equality, and hashing.
@@ -102,7 +125,7 @@ Outcome: primitive-only SAO2 programs compile and run end to end.
 Outcome: primitive, string, and tuple programs have complete runtime behavior
 and observable output.
 
-## 8. Struct layout and escape analysis
+## 9. Struct layout and escape analysis
 
 - Generate layouts for inline and referenced struct members.
 - Add stable GC timestamps to every struct and inline subobject.
@@ -114,7 +137,7 @@ and observable output.
 Outcome: safe stack allocation works where locally proven, including programs
 that pass or return references to inline structs.
 
-## 9. Garbage collector
+## 10. Garbage collector
 
 - Implement a non-moving, stop-the-world mark-and-sweep heap.
 - Register generated type and allocation-layout descriptors.
@@ -129,7 +152,7 @@ safely without exposing allocation placement to programs.
 The subobject-marking and allocation-sweeping mechanism should also receive an
 early isolated prototype before the full runtime depends on it.
 
-## 10. Containers
+## 11. Containers
 
 - Implement lists, maps, indexing, membership, iteration, and mutation.
 - Preserve insertion order in maps.
@@ -140,7 +163,7 @@ early isolated prototype before the full runtime depends on it.
 Outcome: programs can perform useful computation with unbounded containers and
 the abstract language is Turing-complete.
 
-## 11. Diagnostics and hardening
+## 12. Diagnostics and hardening
 
 - Render compile-time diagnostics with primary and related source spans.
 - Map every runtime panic to its SAO2 operation and function.
@@ -154,8 +177,9 @@ Outcome: the v0 compiler is predictable, testable, and ready for real programs.
 
 ## Suggested release gates
 
-1. **Frontend complete:** parsing, diagnostics, name resolution, and typing.
-2. **First execution:** primitive arithmetic and control flow run through C.
-3. **Memory complete:** escape analysis, inline structs, and GC pass stress tests.
-4. **Language complete:** all v0 values, containers, unions, and errors work.
-5. **v0 release:** conformance suite passes with no known correctness defects.
+1. **Syntax complete:** lexing, parsing, source diagnostics, and recovery work.
+2. **First arithmetic execution:** resolved primitive arithmetic runs through C.
+3. **Frontend complete:** name resolution, typing, and semantic analysis work.
+4. **Memory complete:** escape analysis, inline structs, and GC pass stress tests.
+5. **Language complete:** all v0 values, containers, unions, and errors work.
+6. **v0 release:** conformance suite passes with no known correctness defects.
