@@ -115,11 +115,128 @@ pub struct Expression {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExpressionKind {
     Identifier(Identifier),
+    Integer,
+    Float,
     String(Vec<u8>),
+    Character(u8),
+    Boolean(bool),
+    Parenthesized(Box<Expression>),
+    List(Vec<Expression>),
+    Map(Vec<MapEntry>),
+    TypedEmptyList(Type),
+    TypedEmptyMap(Type),
+    Block(Block),
+    If {
+        branches: Vec<ConditionalExpressionBranch>,
+        else_branch: ExpressionBody,
+    },
+    Unary {
+        operator: UnaryOperator,
+        operator_span: Span,
+        operand: Box<Expression>,
+    },
+    Binary {
+        left: Box<Expression>,
+        operator: BinaryOperator,
+        operator_span: Span,
+        right: Box<Expression>,
+    },
+    Is {
+        value: Box<Expression>,
+        operator_span: Span,
+        ty: Type,
+    },
     Call {
         callee: Box<Expression>,
-        arguments: Vec<Expression>,
+        arguments: Vec<Argument>,
     },
+    Index {
+        value: Box<Expression>,
+        index: Box<Expression>,
+    },
+    Member {
+        value: Box<Expression>,
+        member: Member,
+    },
+    Try {
+        value: Box<Expression>,
+        operator_span: Span,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Argument {
+    pub kind: ArgumentKind,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ArgumentKind {
+    Positional(Expression),
+    Named { name: Identifier, value: Expression },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MapEntry {
+    pub key: Expression,
+    pub value: Expression,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConditionalExpressionBranch {
+    pub condition: Expression,
+    pub body: ExpressionBody,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpressionBody {
+    pub kind: ExpressionBodyKind,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExpressionBodyKind {
+    Block(Block),
+    Expression(Box<Expression>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Member {
+    Named(Identifier),
+    TupleIndex(Span),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnaryOperator {
+    LogicalNot,
+    BitwiseNot,
+    Plus,
+    Minus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BinaryOperator {
+    LogicalOr,
+    LogicalAnd,
+    BitwiseOr,
+    BitwiseXor,
+    BitwiseAnd,
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    In,
+    ShiftLeft,
+    ShiftRight,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Remainder,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

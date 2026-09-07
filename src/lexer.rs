@@ -1,6 +1,6 @@
 //! The permanent SAO2 lexer.
 //!
-//! Phase 3 makes these tokens the input to the permanent parser.
+//! These tokens are the input to the permanent parser.
 
 use crate::diagnostic::{Diagnostic, Diagnostics};
 use crate::source::{SourceFile, Span};
@@ -234,22 +234,38 @@ impl<'source> Lexer<'source> {
             self.lex_based_integer(start, 2, "binary");
             return;
         }
+        if self
+            .tokens
+            .last()
+            .is_some_and(|token| matches!(token.kind, TokenKind::Dot))
+        {
+            let valid = self.consume_digits(10);
+            if valid {
+                self.push(TokenKind::Integer, start);
+            } else {
+                self.error(
+                    Span::new(start, self.position),
+                    "numeric separators must appear between digits",
+                );
+            }
+            return;
+        }
 
         let integer_valid = self.consume_digits(10);
         let mut is_float = false;
         let mut valid = integer_valid;
 
-        if self.current() == Some(b'.') {
+        if self.current() == Some(b'.') && self.peek(1).is_some_and(|byte| byte.is_ascii_digit()) {
             is_float = true;
             self.position += 1;
-            if !self.current().is_some_and(|byte| byte.is_ascii_digit()) {
-                self.error(
-                    Span::new(start, self.position),
-                    "floating-point literal requires digits after '.'",
-                );
-                return;
-            }
             valid &= self.consume_digits(10);
+        } else if self.current() == Some(b'.') && !self.peek(1).is_some_and(is_identifier_start) {
+            self.position += 1;
+            self.error(
+                Span::new(start, self.position),
+                "floating-point literal requires digits after '.'",
+            );
+            return;
         }
 
         if self
@@ -499,7 +515,10 @@ impl<'source> Lexer<'source> {
         let start = self.position;
         self.position += 1;
         let Some(byte) = self.current() else {
-            self.error(Span::new(start, self.position), "unterminated escape sequence");
+            self.error(
+                Span::new(start, self.position),
+                "unterminated escape sequence",
+            );
             return None;
         };
         self.position += 1;
@@ -715,14 +734,33 @@ mod tests {
     #[test]
     fn recognizes_every_keyword_only_as_a_complete_token() {
         assert_eq!(
-            kinds("type fn var return break continue if else while for in switch is true false int float str bool char typeName inner"),
+            kinds(
+                "type fn var return break continue if else while for in switch is true false int float str bool char typeName inner"
+            ),
             vec![
-                TokenKind::Type, TokenKind::Fn, TokenKind::Var, TokenKind::Return,
-                TokenKind::Break, TokenKind::Continue, TokenKind::If, TokenKind::Else,
-                TokenKind::While, TokenKind::For, TokenKind::In, TokenKind::Switch,
-                TokenKind::Is, TokenKind::True, TokenKind::False, TokenKind::Int,
-                TokenKind::FloatType, TokenKind::Str, TokenKind::Bool, TokenKind::Char,
-                TokenKind::Identifier, TokenKind::Identifier, TokenKind::Eof,
+                TokenKind::Type,
+                TokenKind::Fn,
+                TokenKind::Var,
+                TokenKind::Return,
+                TokenKind::Break,
+                TokenKind::Continue,
+                TokenKind::If,
+                TokenKind::Else,
+                TokenKind::While,
+                TokenKind::For,
+                TokenKind::In,
+                TokenKind::Switch,
+                TokenKind::Is,
+                TokenKind::True,
+                TokenKind::False,
+                TokenKind::Int,
+                TokenKind::FloatType,
+                TokenKind::Str,
+                TokenKind::Bool,
+                TokenKind::Char,
+                TokenKind::Identifier,
+                TokenKind::Identifier,
+                TokenKind::Eof,
             ]
         );
     }
@@ -730,22 +768,54 @@ mod tests {
     #[test]
     fn recognizes_every_operator_and_delimiter_with_longest_match() {
         assert_eq!(
-            kinds("( ) { } [ ] , ; : . = + - * / % & | ^ ! ~ < > ? := == != <= >= || && << >> += -= *= /= %= &= |= ^= <<= >>="),
+            kinds(
+                "( ) { } [ ] , ; : . = + - * / % & | ^ ! ~ < > ? := == != <= >= || && << >> += -= *= /= %= &= |= ^= <<= >>="
+            ),
             vec![
-                TokenKind::LeftParen, TokenKind::RightParen, TokenKind::LeftBrace,
-                TokenKind::RightBrace, TokenKind::LeftBracket, TokenKind::RightBracket,
-                TokenKind::Comma, TokenKind::Semicolon, TokenKind::Colon, TokenKind::Dot,
-                TokenKind::Equal, TokenKind::Plus, TokenKind::Minus, TokenKind::Star,
-                TokenKind::Slash, TokenKind::Percent, TokenKind::Ampersand, TokenKind::Pipe,
-                TokenKind::Caret, TokenKind::Bang, TokenKind::Tilde, TokenKind::Less,
-                TokenKind::Greater, TokenKind::Question, TokenKind::Declare,
-                TokenKind::EqualEqual, TokenKind::BangEqual, TokenKind::LessEqual,
-                TokenKind::GreaterEqual, TokenKind::LogicalOr, TokenKind::LogicalAnd,
-                TokenKind::ShiftLeft, TokenKind::ShiftRight, TokenKind::PlusEqual,
-                TokenKind::MinusEqual, TokenKind::StarEqual, TokenKind::SlashEqual,
-                TokenKind::PercentEqual, TokenKind::AmpersandEqual, TokenKind::PipeEqual,
-                TokenKind::CaretEqual, TokenKind::ShiftLeftEqual,
-                TokenKind::ShiftRightEqual, TokenKind::Eof,
+                TokenKind::LeftParen,
+                TokenKind::RightParen,
+                TokenKind::LeftBrace,
+                TokenKind::RightBrace,
+                TokenKind::LeftBracket,
+                TokenKind::RightBracket,
+                TokenKind::Comma,
+                TokenKind::Semicolon,
+                TokenKind::Colon,
+                TokenKind::Dot,
+                TokenKind::Equal,
+                TokenKind::Plus,
+                TokenKind::Minus,
+                TokenKind::Star,
+                TokenKind::Slash,
+                TokenKind::Percent,
+                TokenKind::Ampersand,
+                TokenKind::Pipe,
+                TokenKind::Caret,
+                TokenKind::Bang,
+                TokenKind::Tilde,
+                TokenKind::Less,
+                TokenKind::Greater,
+                TokenKind::Question,
+                TokenKind::Declare,
+                TokenKind::EqualEqual,
+                TokenKind::BangEqual,
+                TokenKind::LessEqual,
+                TokenKind::GreaterEqual,
+                TokenKind::LogicalOr,
+                TokenKind::LogicalAnd,
+                TokenKind::ShiftLeft,
+                TokenKind::ShiftRight,
+                TokenKind::PlusEqual,
+                TokenKind::MinusEqual,
+                TokenKind::StarEqual,
+                TokenKind::SlashEqual,
+                TokenKind::PercentEqual,
+                TokenKind::AmpersandEqual,
+                TokenKind::PipeEqual,
+                TokenKind::CaretEqual,
+                TokenKind::ShiftLeftEqual,
+                TokenKind::ShiftRightEqual,
+                TokenKind::Eof,
             ]
         );
     }
@@ -865,11 +935,19 @@ mod tests {
     #[test]
     fn distinguishes_tuple_member_access_from_a_leading_dot_float() {
         assert_eq!(
-            kinds("value.0"),
+            kinds("value.0.1 1.member 1.0.member"),
             vec![
                 TokenKind::Identifier,
                 TokenKind::Dot,
                 TokenKind::Integer,
+                TokenKind::Dot,
+                TokenKind::Integer,
+                TokenKind::Integer,
+                TokenKind::Dot,
+                TokenKind::Identifier,
+                TokenKind::Float,
+                TokenKind::Dot,
+                TokenKind::Identifier,
                 TokenKind::Eof,
             ]
         );

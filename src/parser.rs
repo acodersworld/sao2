@@ -1,15 +1,16 @@
-//! Permanent declaration and type parser through Phase 4.
+//! Permanent declaration, type, and expression parser through Phase 5.
 //!
-//! Later phases extend these routines with the remaining expression and
-//! statement productions. Entry-point rules are deliberately enforced by
+//! Later phases extend these routines with the remaining statement productions
+//! and error recovery. Entry-point rules are deliberately enforced by
 //! `compiler`, not here.
 
 use std::mem::discriminant;
 
 use crate::ast::{
-    Block, Declaration, Expression, ExpressionKind, FunctionDeclaration, Identifier, Parameter,
-    PrimitiveType, Program, Statement, StatementKind, Type, TypeDeclaration, TypeKind, TypeMember,
-    TypeMemberKind,
+    Argument, ArgumentKind, BinaryOperator, Block, ConditionalExpressionBranch, Declaration,
+    Expression, ExpressionBody, ExpressionBodyKind, ExpressionKind, FunctionDeclaration,
+    Identifier, MapEntry, Member, Parameter, PrimitiveType, Program, Statement, StatementKind,
+    Type, TypeDeclaration, TypeKind, TypeMember, TypeMemberKind, UnaryOperator,
 };
 use crate::diagnostic::{Diagnostic, Diagnostics};
 use crate::lexer::{self, Token, TokenKind};
@@ -245,36 +246,10 @@ impl<'source> Parser<'source> {
                 });
             }
             TokenKind::LeftBracket => {
-                self.current += 1;
-                let element = self.parse_type()?;
-                let end = self
-                    .expect(&TokenKind::RightBracket, "expected ']' after list type")?
-                    .span
-                    .end;
-                return Ok(Type {
-                    kind: TypeKind::List(Box::new(element)),
-                    span: Span::new(token.span.start, end),
-                });
+                return self.parse_list_type();
             }
             TokenKind::LeftBrace => {
-                self.current += 1;
-                let key = self.parse_type()?;
-                self.expect(
-                    &TokenKind::Colon,
-                    "expected ':' between map key and value types",
-                )?;
-                let value = self.parse_type()?;
-                let end = self
-                    .expect(&TokenKind::RightBrace, "expected '}' after map type")?
-                    .span
-                    .end;
-                return Ok(Type {
-                    kind: TypeKind::Map {
-                        key: Box::new(key),
-                        value: Box::new(value),
-                    },
-                    span: Span::new(token.span.start, end),
-                });
+                return self.parse_map_type();
             }
             TokenKind::LeftParen => {
                 self.current += 1;
@@ -295,6 +270,46 @@ impl<'source> Parser<'source> {
         };
         self.current += 1;
         Ok(Type { kind, span })
+    }
+
+    fn parse_list_type(&mut self) -> Result<Type, Diagnostic> {
+        let start = self
+            .expect(&TokenKind::LeftBracket, "expected '[' to begin list type")?
+            .span
+            .start;
+        let element = self.parse_type()?;
+        let end = self
+            .expect(&TokenKind::RightBracket, "expected ']' after list type")?
+            .span
+            .end;
+        Ok(Type {
+            kind: TypeKind::List(Box::new(element)),
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_map_type(&mut self) -> Result<Type, Diagnostic> {
+        let start = self
+            .expect(&TokenKind::LeftBrace, "expected '{' to begin map type")?
+            .span
+            .start;
+        let key = self.parse_type()?;
+        self.expect(
+            &TokenKind::Colon,
+            "expected ':' between map key and value types",
+        )?;
+        let value = self.parse_type()?;
+        let end = self
+            .expect(&TokenKind::RightBrace, "expected '}' after map type")?
+            .span
+            .end;
+        Ok(Type {
+            kind: TypeKind::Map {
+                key: Box::new(key),
+                value: Box::new(value),
+            },
+            span: Span::new(start, end),
+        })
     }
 
     fn parse_block(&mut self) -> Result<Block, Diagnostic> {
@@ -348,31 +363,212 @@ impl<'source> Parser<'source> {
     }
 
     fn parse_expression(&mut self) -> Result<Expression, Diagnostic> {
-        let mut expression = self.parse_primary()?;
-        while self.take(&TokenKind::LeftParen).is_some() {
-            let mut arguments = Vec::new();
-            if !self.at(&TokenKind::RightParen) {
-                loop {
-                    arguments.push(self.parse_expression()?);
-                    if self.take(&TokenKind::Comma).is_none() {
-                        break;
-                    }
+        self.parse_binary_expression(1)
+    }
+
+    fn parse_binary_expression(
+        &mut self,
+        minimum_precedence: u8,
+    ) -> Result<Expression, Diagnostic> {
+        let mut left = self.parse_unary_expression()?;
+
+        loop {
+            if self.at(&TokenKind::Is) {
+                const IS_PRECEDENCE: u8 = 7;
+                if IS_PRECEDENCE < minimum_precedence {
+                    break;
                 }
+                let operator_span = self.current_token().span;
+                self.current += 1;
+                let ty = self.parse_type()?;
+                let span = Span::new(left.span.start, ty.span.end);
+                left = Expression {
+                    kind: ExpressionKind::Is {
+                        value: Box::new(left),
+                        operator_span,
+                        ty,
+                    },
+                    span,
+                };
+                continue;
             }
-            let end = self
-                .expect(&TokenKind::RightParen, "expected ')' after call arguments")?
-                .span
-                .end;
-            let start = expression.span.start;
-            expression = Expression {
-                kind: ExpressionKind::Call {
-                    callee: Box::new(expression),
-                    arguments,
+
+            let Some((operator, precedence)) = self.current_binary_operator() else {
+                break;
+            };
+            if precedence < minimum_precedence {
+                break;
+            }
+            let operator_span = self.current_token().span;
+            self.current += 1;
+            let right = self.parse_binary_expression(precedence + 1)?;
+            let span = Span::new(left.span.start, right.span.end);
+            left = Expression {
+                kind: ExpressionKind::Binary {
+                    left: Box::new(left),
+                    operator,
+                    operator_span,
+                    right: Box::new(right),
                 },
-                span: Span::new(start, end),
+                span,
             };
         }
+
+        Ok(left)
+    }
+
+    fn current_binary_operator(&self) -> Option<(BinaryOperator, u8)> {
+        let operator = match self.current_token().kind {
+            TokenKind::LogicalOr => (BinaryOperator::LogicalOr, 1),
+            TokenKind::LogicalAnd => (BinaryOperator::LogicalAnd, 2),
+            TokenKind::Pipe => (BinaryOperator::BitwiseOr, 3),
+            TokenKind::Caret => (BinaryOperator::BitwiseXor, 4),
+            TokenKind::Ampersand => (BinaryOperator::BitwiseAnd, 5),
+            TokenKind::EqualEqual => (BinaryOperator::Equal, 6),
+            TokenKind::BangEqual => (BinaryOperator::NotEqual, 6),
+            TokenKind::Less => (BinaryOperator::Less, 7),
+            TokenKind::LessEqual => (BinaryOperator::LessEqual, 7),
+            TokenKind::Greater => (BinaryOperator::Greater, 7),
+            TokenKind::GreaterEqual => (BinaryOperator::GreaterEqual, 7),
+            TokenKind::In => (BinaryOperator::In, 7),
+            TokenKind::ShiftLeft => (BinaryOperator::ShiftLeft, 8),
+            TokenKind::ShiftRight => (BinaryOperator::ShiftRight, 8),
+            TokenKind::Plus => (BinaryOperator::Add, 9),
+            TokenKind::Minus => (BinaryOperator::Subtract, 9),
+            TokenKind::Star => (BinaryOperator::Multiply, 10),
+            TokenKind::Slash => (BinaryOperator::Divide, 10),
+            TokenKind::Percent => (BinaryOperator::Remainder, 10),
+            _ => return None,
+        };
+        Some(operator)
+    }
+
+    fn parse_unary_expression(&mut self) -> Result<Expression, Diagnostic> {
+        let operator = match self.current_token().kind {
+            TokenKind::Bang => UnaryOperator::LogicalNot,
+            TokenKind::Tilde => UnaryOperator::BitwiseNot,
+            TokenKind::Plus => UnaryOperator::Plus,
+            TokenKind::Minus => UnaryOperator::Minus,
+            _ => return self.parse_postfix_expression(),
+        };
+        let operator_span = self.current_token().span;
+        self.current += 1;
+        let operand = self.parse_unary_expression()?;
+        let span = Span::new(operator_span.start, operand.span.end);
+        Ok(Expression {
+            kind: ExpressionKind::Unary {
+                operator,
+                operator_span,
+                operand: Box::new(operand),
+            },
+            span,
+        })
+    }
+
+    fn parse_postfix_expression(&mut self) -> Result<Expression, Diagnostic> {
+        let mut expression = self.parse_primary()?;
+        loop {
+            if self.at(&TokenKind::LeftParen) {
+                expression = self.parse_call_suffix(expression)?;
+            } else if self.take(&TokenKind::LeftBracket).is_some() {
+                let index = self.parse_expression()?;
+                let end = self
+                    .expect(
+                        &TokenKind::RightBracket,
+                        "expected ']' after index expression",
+                    )?
+                    .span
+                    .end;
+                let start = expression.span.start;
+                expression = Expression {
+                    kind: ExpressionKind::Index {
+                        value: Box::new(expression),
+                        index: Box::new(index),
+                    },
+                    span: Span::new(start, end),
+                };
+            } else if self.take(&TokenKind::Dot).is_some() {
+                let token = self.current_token().clone();
+                let member = match token.kind {
+                    TokenKind::Identifier => {
+                        self.current += 1;
+                        Member::Named(Identifier { span: token.span })
+                    }
+                    TokenKind::Integer if self.integer_token_is_decimal(&token) => {
+                        self.current += 1;
+                        Member::TupleIndex(token.span)
+                    }
+                    _ => {
+                        return Err(self.error_current(
+                            "expected member name or decimal tuple index after '.'",
+                        ));
+                    }
+                };
+                let start = expression.span.start;
+                expression = Expression {
+                    kind: ExpressionKind::Member {
+                        value: Box::new(expression),
+                        member,
+                    },
+                    span: Span::new(start, token.span.end),
+                };
+            } else if let Some(question) = self.take(&TokenKind::Question) {
+                let start = expression.span.start;
+                expression = Expression {
+                    kind: ExpressionKind::Try {
+                        value: Box::new(expression),
+                        operator_span: question.span,
+                    },
+                    span: Span::new(start, question.span.end),
+                };
+            } else {
+                break;
+            }
+        }
         Ok(expression)
+    }
+
+    fn parse_call_suffix(&mut self, callee: Expression) -> Result<Expression, Diagnostic> {
+        self.expect(&TokenKind::LeftParen, "expected '(' to begin arguments")?;
+        let mut arguments = Vec::new();
+        if !self.at(&TokenKind::RightParen) {
+            loop {
+                arguments.push(self.parse_argument()?);
+                if self.take(&TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+        }
+        let end = self
+            .expect(&TokenKind::RightParen, "expected ')' after call arguments")?
+            .span
+            .end;
+        let start = callee.span.start;
+        Ok(Expression {
+            kind: ExpressionKind::Call {
+                callee: Box::new(callee),
+                arguments,
+            },
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_argument(&mut self) -> Result<Argument, Diagnostic> {
+        if self.at(&TokenKind::Identifier) && self.at_next(&TokenKind::Equal) {
+            let name = self.parse_identifier("expected named argument name")?;
+            self.expect(&TokenKind::Equal, "expected '=' after named argument name")?;
+            let value = self.parse_expression()?;
+            return Ok(Argument {
+                span: Span::new(name.span.start, value.span.end),
+                kind: ArgumentKind::Named { name, value },
+            });
+        }
+
+        let expression = self.parse_expression()?;
+        Ok(Argument {
+            span: expression.span,
+            kind: ArgumentKind::Positional(expression),
+        })
     }
 
     fn parse_primary(&mut self) -> Result<Expression, Diagnostic> {
@@ -386,6 +582,20 @@ impl<'source> Parser<'source> {
                     span: token.span,
                 })
             }
+            TokenKind::Integer => {
+                self.current += 1;
+                Ok(Expression {
+                    kind: ExpressionKind::Integer,
+                    span: token.span,
+                })
+            }
+            TokenKind::Float => {
+                self.current += 1;
+                Ok(Expression {
+                    kind: ExpressionKind::Float,
+                    span: token.span,
+                })
+            }
             TokenKind::String(bytes) => {
                 self.current += 1;
                 Ok(Expression {
@@ -393,8 +603,219 @@ impl<'source> Parser<'source> {
                     span: token.span,
                 })
             }
-            _ => Err(self.error_current("expected identifier or string literal")),
+            TokenKind::Character(value) => {
+                self.current += 1;
+                Ok(Expression {
+                    kind: ExpressionKind::Character(value),
+                    span: token.span,
+                })
+            }
+            TokenKind::True | TokenKind::False => {
+                self.current += 1;
+                Ok(Expression {
+                    kind: ExpressionKind::Boolean(matches!(token.kind, TokenKind::True)),
+                    span: token.span,
+                })
+            }
+            TokenKind::LeftParen => self.parse_parenthesized_expression(),
+            TokenKind::LeftBracket => self.parse_list_expression(),
+            TokenKind::LeftBrace => self.parse_braced_expression(),
+            TokenKind::If => self.parse_if_expression(),
+            _ => Err(self.error_current("expected expression")),
         }
+    }
+
+    fn parse_parenthesized_expression(&mut self) -> Result<Expression, Diagnostic> {
+        let start = self
+            .expect(
+                &TokenKind::LeftParen,
+                "expected '(' to begin parenthesized expression",
+            )?
+            .span
+            .start;
+        let inner = self.parse_expression()?;
+        let end = self
+            .expect(
+                &TokenKind::RightParen,
+                "expected ')' after parenthesized expression",
+            )?
+            .span
+            .end;
+        Ok(Expression {
+            kind: ExpressionKind::Parenthesized(Box::new(inner)),
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_list_expression(&mut self) -> Result<Expression, Diagnostic> {
+        let start = self
+            .expect(
+                &TokenKind::LeftBracket,
+                "expected '[' to begin list literal",
+            )?
+            .span
+            .start;
+        if let Some(close) = self.take(&TokenKind::RightBracket) {
+            if self.take(&TokenKind::Colon).is_some() {
+                let ty = self.parse_list_type()?;
+                let span = Span::new(start, ty.span.end);
+                return Ok(Expression {
+                    kind: ExpressionKind::TypedEmptyList(ty),
+                    span,
+                });
+            }
+            return Ok(Expression {
+                kind: ExpressionKind::List(Vec::new()),
+                span: Span::new(start, close.span.end),
+            });
+        }
+
+        let mut elements = Vec::new();
+        loop {
+            elements.push(self.parse_expression()?);
+            if self.take(&TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+        let end = self
+            .expect(&TokenKind::RightBracket, "expected ']' after list elements")?
+            .span
+            .end;
+        Ok(Expression {
+            kind: ExpressionKind::List(elements),
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_braced_expression(&mut self) -> Result<Expression, Diagnostic> {
+        let checkpoint = self.current;
+        let start = self
+            .expect(
+                &TokenKind::LeftBrace,
+                "expected '{' to begin braced expression",
+            )?
+            .span
+            .start;
+
+        if let Some(close) = self.take(&TokenKind::RightBrace) {
+            if self.take(&TokenKind::Colon).is_some() {
+                let ty = self.parse_map_type()?;
+                let span = Span::new(start, ty.span.end);
+                return Ok(Expression {
+                    kind: ExpressionKind::TypedEmptyMap(ty),
+                    span,
+                });
+            }
+            return Ok(Expression {
+                kind: ExpressionKind::Map(Vec::new()),
+                span: Span::new(start, close.span.end),
+            });
+        }
+
+        let first = self.parse_expression()?;
+        if self.take(&TokenKind::Colon).is_some() {
+            return self.parse_map_expression(start, first);
+        }
+
+        self.current = checkpoint;
+        let block = self.parse_block()?;
+        let span = block.span;
+        Ok(Expression {
+            kind: ExpressionKind::Block(block),
+            span,
+        })
+    }
+
+    fn parse_map_expression(
+        &mut self,
+        start: usize,
+        first_key: Expression,
+    ) -> Result<Expression, Diagnostic> {
+        let first_value = self.parse_expression()?;
+        let first_span = Span::new(first_key.span.start, first_value.span.end);
+        let mut entries = vec![MapEntry {
+            key: first_key,
+            value: first_value,
+            span: first_span,
+        }];
+
+        while self.take(&TokenKind::Comma).is_some() {
+            let key = self.parse_expression()?;
+            self.expect(&TokenKind::Colon, "expected ':' between map key and value")?;
+            let value = self.parse_expression()?;
+            let span = Span::new(key.span.start, value.span.end);
+            entries.push(MapEntry { key, value, span });
+        }
+        let end = self
+            .expect(&TokenKind::RightBrace, "expected '}' after map entries")?
+            .span
+            .end;
+        Ok(Expression {
+            kind: ExpressionKind::Map(entries),
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_if_expression(&mut self) -> Result<Expression, Diagnostic> {
+        let start = self.expect(&TokenKind::If, "expected 'if'")?.span.start;
+        let condition = self.parse_expression()?;
+        let body = self.parse_expression_body()?;
+        let first_span = Span::new(start, body.span.end);
+        let mut branches = vec![ConditionalExpressionBranch {
+            condition,
+            body,
+            span: first_span,
+        }];
+
+        loop {
+            let else_token = self.expect(
+                &TokenKind::Else,
+                "if expression requires a final 'else' branch",
+            )?;
+            if self.take(&TokenKind::If).is_some() {
+                let condition = self.parse_expression()?;
+                let body = self.parse_expression_body()?;
+                let span = Span::new(else_token.span.start, body.span.end);
+                branches.push(ConditionalExpressionBranch {
+                    condition,
+                    body,
+                    span,
+                });
+            } else {
+                let else_branch = self.parse_expression_body()?;
+                let span = Span::new(start, else_branch.span.end);
+                return Ok(Expression {
+                    kind: ExpressionKind::If {
+                        branches,
+                        else_branch,
+                    },
+                    span,
+                });
+            }
+        }
+    }
+
+    fn parse_expression_body(&mut self) -> Result<ExpressionBody, Diagnostic> {
+        if self.at(&TokenKind::LeftBrace) {
+            let block = self.parse_block()?;
+            let span = block.span;
+            return Ok(ExpressionBody {
+                kind: ExpressionBodyKind::Block(block),
+                span,
+            });
+        }
+
+        let colon = self.expect(&TokenKind::Colon, "expected block or ':' expression body")?;
+        let expression = self.parse_expression()?;
+        Ok(ExpressionBody {
+            span: Span::new(colon.span.start, expression.span.end),
+            kind: ExpressionBodyKind::Expression(Box::new(expression)),
+        })
+    }
+
+    fn integer_token_is_decimal(&self, token: &Token) -> bool {
+        let text = &self.source.text[token.span.start..token.span.end];
+        !text.starts_with("0x") && !text.starts_with("0b")
     }
 
     fn parse_identifier(&mut self, message: &str) -> Result<Identifier, Diagnostic> {
@@ -473,6 +894,32 @@ mod tests {
 
     fn span_text(text: &str, span: Span) -> &str {
         &text[span.start..span.end]
+    }
+
+    fn value_expression(text: &str) -> Expression {
+        let program = parse(&source(&format!("fn f() {{ {text} }}"))).unwrap();
+        let Declaration::Function(function) = program.declarations.into_iter().next().unwrap()
+        else {
+            panic!("expected function declaration");
+        };
+        *function.body.value.unwrap()
+    }
+
+    fn binary_parts(
+        expression: &Expression,
+        expected: BinaryOperator,
+    ) -> (&Expression, &Expression) {
+        let ExpressionKind::Binary {
+            left,
+            operator,
+            right,
+            ..
+        } = &expression.kind
+        else {
+            panic!("expected {expected:?}, got {expression:?}");
+        };
+        assert_eq!(*operator, expected);
+        (left, right)
     }
 
     #[test]
@@ -653,5 +1100,215 @@ mod tests {
         ] {
             assert!(parse(&source(text)).is_ok(), "{text}");
         }
+    }
+
+    #[test]
+    fn parses_every_primitive_expression_literal() {
+        for (text, expected) in [
+            ("42", ExpressionKind::Integer),
+            ("1.5", ExpressionKind::Float),
+            ("\"value\"", ExpressionKind::String(b"value".to_vec())),
+            ("'x'", ExpressionKind::Character(b'x')),
+            ("true", ExpressionKind::Boolean(true)),
+            ("false", ExpressionKind::Boolean(false)),
+        ] {
+            assert_eq!(value_expression(text).kind, expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn applies_all_binary_precedence_levels() {
+        let expression = value_expression("a || b && c | d ^ e & f == g < h << i + j * k");
+        let (_, right) = binary_parts(&expression, BinaryOperator::LogicalOr);
+        let (_, right) = binary_parts(right, BinaryOperator::LogicalAnd);
+        let (_, right) = binary_parts(right, BinaryOperator::BitwiseOr);
+        let (_, right) = binary_parts(right, BinaryOperator::BitwiseXor);
+        let (_, right) = binary_parts(right, BinaryOperator::BitwiseAnd);
+        let (_, right) = binary_parts(right, BinaryOperator::Equal);
+        let (_, right) = binary_parts(right, BinaryOperator::Less);
+        let (_, right) = binary_parts(right, BinaryOperator::ShiftLeft);
+        let (_, right) = binary_parts(right, BinaryOperator::Add);
+        binary_parts(right, BinaryOperator::Multiply);
+    }
+
+    #[test]
+    fn parses_every_binary_operator_and_left_associativity() {
+        for (source, expected) in [
+            ("a || b", BinaryOperator::LogicalOr),
+            ("a && b", BinaryOperator::LogicalAnd),
+            ("a | b", BinaryOperator::BitwiseOr),
+            ("a ^ b", BinaryOperator::BitwiseXor),
+            ("a & b", BinaryOperator::BitwiseAnd),
+            ("a == b", BinaryOperator::Equal),
+            ("a != b", BinaryOperator::NotEqual),
+            ("a < b", BinaryOperator::Less),
+            ("a <= b", BinaryOperator::LessEqual),
+            ("a > b", BinaryOperator::Greater),
+            ("a >= b", BinaryOperator::GreaterEqual),
+            ("a in b", BinaryOperator::In),
+            ("a << b", BinaryOperator::ShiftLeft),
+            ("a >> b", BinaryOperator::ShiftRight),
+            ("a + b", BinaryOperator::Add),
+            ("a - b", BinaryOperator::Subtract),
+            ("a * b", BinaryOperator::Multiply),
+            ("a / b", BinaryOperator::Divide),
+            ("a % b", BinaryOperator::Remainder),
+        ] {
+            binary_parts(&value_expression(source), expected);
+        }
+
+        let expression = value_expression("a - b - c");
+        let (left, _) = binary_parts(&expression, BinaryOperator::Subtract);
+        binary_parts(left, BinaryOperator::Subtract);
+    }
+
+    #[test]
+    fn parses_recursive_unary_operators() {
+        let expression = value_expression("!~-+value");
+        let mut current = &expression;
+        for expected in [
+            UnaryOperator::LogicalNot,
+            UnaryOperator::BitwiseNot,
+            UnaryOperator::Minus,
+            UnaryOperator::Plus,
+        ] {
+            let ExpressionKind::Unary {
+                operator, operand, ..
+            } = &current.kind
+            else {
+                panic!("expected unary expression");
+            };
+            assert_eq!(*operator, expected);
+            current = operand;
+        }
+        assert!(matches!(current.kind, ExpressionKind::Identifier(_)));
+    }
+
+    #[test]
+    fn parses_chained_postfix_operations_and_named_arguments() {
+        let expression = value_expression("make(a, named = b)(c)[i].field.0??");
+        let ExpressionKind::Try { value, .. } = &expression.kind else {
+            panic!("expected postfix try");
+        };
+        let ExpressionKind::Try { value, .. } = &value.kind else {
+            panic!("expected second postfix try");
+        };
+        let ExpressionKind::Member { value, member } = &value.kind else {
+            panic!("expected tuple member");
+        };
+        assert!(matches!(member, Member::TupleIndex(_)));
+        let ExpressionKind::Member { value, member } = &value.kind else {
+            panic!("expected named member");
+        };
+        assert!(matches!(member, Member::Named(_)));
+        let ExpressionKind::Index { value, .. } = &value.kind else {
+            panic!("expected index expression");
+        };
+        let ExpressionKind::Call { callee, arguments } = &value.kind else {
+            panic!("expected chained call");
+        };
+        assert_eq!(arguments.len(), 1);
+        let ExpressionKind::Call { arguments, .. } = &callee.kind else {
+            panic!("expected initial call");
+        };
+        assert_eq!(arguments.len(), 2);
+        assert!(matches!(arguments[0].kind, ArgumentKind::Positional(_)));
+        assert!(matches!(arguments[1].kind, ArgumentKind::Named { .. }));
+    }
+
+    #[test]
+    fn parses_collection_literals_and_typed_empty_collections() {
+        let expression = value_expression("[1, true, 'x']");
+        assert!(matches!(expression.kind, ExpressionKind::List(ref values) if values.len() == 3));
+
+        let expression = value_expression("({a: 1, b: 2})");
+        let ExpressionKind::Parenthesized(inner) = expression.kind else {
+            panic!("expected parentheses");
+        };
+        assert!(matches!(inner.kind, ExpressionKind::Map(ref entries) if entries.len() == 2));
+
+        let expression = value_expression("[] : [int]");
+        assert!(matches!(
+            expression.kind,
+            ExpressionKind::TypedEmptyList(Type {
+                kind: TypeKind::List(_),
+                ..
+            })
+        ));
+
+        let expression = value_expression("({} : {str: int})");
+        let ExpressionKind::Parenthesized(inner) = expression.kind else {
+            panic!("expected parentheses");
+        };
+        assert!(matches!(
+            inner.kind,
+            ExpressionKind::TypedEmptyMap(Type {
+                kind: TypeKind::Map { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn distinguishes_map_and_block_expressions_by_colon_structure() {
+        let map = value_expression("({key: value})");
+        let ExpressionKind::Parenthesized(map) = map.kind else {
+            panic!("expected parentheses");
+        };
+        assert!(matches!(map.kind, ExpressionKind::Map(_)));
+
+        let block = value_expression("({value})");
+        let ExpressionKind::Parenthesized(block) = block.kind else {
+            panic!("expected parentheses");
+        };
+        let ExpressionKind::Block(block) = block.kind else {
+            panic!("expected block expression");
+        };
+        assert!(block.value.is_some());
+
+        let empty_map = value_expression("({})");
+        let ExpressionKind::Parenthesized(empty_map) = empty_map.kind else {
+            panic!("expected parentheses");
+        };
+        assert!(matches!(empty_map.kind, ExpressionKind::Map(ref entries) if entries.is_empty()));
+    }
+
+    #[test]
+    fn parses_if_expressions_with_colon_and_block_bodies() {
+        let expression = value_expression("if first: one else if second { two } else: three");
+        let ExpressionKind::If {
+            branches,
+            else_branch,
+        } = expression.kind
+        else {
+            panic!("expected if expression");
+        };
+        assert_eq!(branches.len(), 2);
+        assert!(matches!(
+            branches[0].body.kind,
+            ExpressionBodyKind::Expression(_)
+        ));
+        assert!(matches!(
+            branches[1].body.kind,
+            ExpressionBodyKind::Block(_)
+        ));
+        assert!(matches!(
+            else_branch.kind,
+            ExpressionBodyKind::Expression(_)
+        ));
+    }
+
+    #[test]
+    fn parses_is_with_a_type_and_rejects_assignment_expressions() {
+        let expression = value_expression("value is Success(int) | Error(str)");
+        let ExpressionKind::Is { ty, .. } = expression.kind else {
+            panic!("expected type test");
+        };
+        assert!(matches!(ty.kind, TypeKind::Union(ref types) if types.len() == 2));
+
+        let diagnostic = parse(&source("fn f() { (value = other) }")).unwrap_err();
+        assert!(diagnostic.to_string().contains("expected ')'"));
+        let diagnostic = parse(&source("fn f() { value.0x1 }")).unwrap_err();
+        assert!(diagnostic.to_string().contains("decimal tuple index"));
     }
 }

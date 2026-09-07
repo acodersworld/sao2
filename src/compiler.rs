@@ -3,8 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::ast::{
-    Declaration, ExpressionKind, FunctionDeclaration, PrimitiveType, Program, StatementKind,
-    TypeKind,
+    ArgumentKind, Declaration, ExpressionKind, FunctionDeclaration, PrimitiveType, Program,
+    StatementKind, TypeKind,
 };
 use crate::c_emitter;
 use crate::diagnostic::{Diagnostic, Diagnostics};
@@ -92,7 +92,7 @@ fn validate_main<'program>(
                 source,
                 Span::empty(source.text.len()),
                 "executable program requires one 'main' function",
-            ))
+            ));
         }
         [main] => *main,
         [_, duplicate, ..] => {
@@ -100,7 +100,7 @@ fn validate_main<'program>(
                 source,
                 duplicate.name.span,
                 "duplicate 'main' function",
-            ))
+            ));
         }
     };
 
@@ -146,20 +146,39 @@ fn lower_temporary_print_main<'program>(
     if !main.parameters.is_empty() || main.return_type.is_some() || main.body.value.is_some() {
         return Err(temporary_backend_error(source, main));
     }
-    let [statement] = main.body.statements.as_slice() else { return Err(temporary_backend_error(source, main)); };
-    let StatementKind::Expression(expression) = &statement.kind else { return Err(temporary_backend_error(source, main)); };
-    let ExpressionKind::Call { callee, arguments } = &expression.kind else { return Err(temporary_backend_error(source, main)); };
-    let ExpressionKind::Identifier(identifier) = &callee.kind else { return Err(temporary_backend_error(source, main)); };
+    let [statement] = main.body.statements.as_slice() else {
+        return Err(temporary_backend_error(source, main));
+    };
+    let StatementKind::Expression(expression) = &statement.kind else {
+        return Err(temporary_backend_error(source, main));
+    };
+    let ExpressionKind::Call { callee, arguments } = &expression.kind else {
+        return Err(temporary_backend_error(source, main));
+    };
+    let ExpressionKind::Identifier(identifier) = &callee.kind else {
+        return Err(temporary_backend_error(source, main));
+    };
     if identifier_text(source, identifier.span) != "print" {
         return Err(temporary_backend_error(source, main));
     }
-    let [argument] = arguments.as_slice() else { return Err(temporary_backend_error(source, main)); };
-    let ExpressionKind::String(bytes) = &argument.kind else { return Err(temporary_backend_error(source, main)); };
+    let [argument] = arguments.as_slice() else {
+        return Err(temporary_backend_error(source, main));
+    };
+    let ArgumentKind::Positional(argument) = &argument.kind else {
+        return Err(temporary_backend_error(source, main));
+    };
+    let ExpressionKind::String(bytes) = &argument.kind else {
+        return Err(temporary_backend_error(source, main));
+    };
     Ok(bytes)
 }
 
 fn temporary_backend_error(source: &SourceFile, main: &FunctionDeclaration) -> Diagnostic {
-    Diagnostic::source(source, main.body.span, "temporary backend supports only fn main() containing one print call with one string literal")
+    Diagnostic::source(
+        source,
+        main.body.span,
+        "temporary backend supports only fn main() containing one print call with one string literal",
+    )
 }
 
 fn identifier_text(source: &SourceFile, span: Span) -> &str {
@@ -201,7 +220,7 @@ mod tests {
         let diagnostic = compile_into(&source, &build_directory)
             .unwrap_err()
             .to_string();
-        assert!(diagnostic.contains("expected identifier or string literal"));
+        assert!(diagnostic.contains("temporary backend"));
         assert!(!build_directory.exists());
     }
 
