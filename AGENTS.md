@@ -28,6 +28,9 @@ cargo run -- run path/to/program.sao2
 
 Set `SAO2_CC` to a C compiler executable when automatic detection is not
 appropriate. Pass `--show-c` to `build` or `run` to print generated C.
+Native end-to-end tests run automatically when a supported compiler is on
+`PATH` or selected through `SAO2_CC`; only those native assertions are skipped
+when no compiler is available.
 
 Keep the compiler dependency-free until a dependency has a clear, documented
 benefit. Generated compiler artifacts belong under `build/` and must not be

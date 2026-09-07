@@ -121,6 +121,8 @@ status zero.
 
 ## Phase 6: Automated verification
 
+Status: complete.
+
 - Add unit tests for string decoding and minimal syntax errors.
 - Add snapshot tests for generated C and diagnostics.
 - Add end-to-end tests that compile and execute fixtures.

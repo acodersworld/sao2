@@ -3,9 +3,18 @@
 use std::fmt::Write;
 
 pub fn emit_print_program(bytes: &[u8]) -> String {
-    let mut output = String::from(
-        "#include <stdio.h>\n\nint main(void) {\n    static const unsigned char sao2_text[] = {",
-    );
+    let mut output = String::from(concat!(
+        "#include <stdio.h>\n\n",
+        "#ifdef _WIN32\n",
+        "#include <fcntl.h>\n",
+        "#include <io.h>\n",
+        "#endif\n\n",
+        "int main(void) {\n",
+        "#ifdef _WIN32\n",
+        "    if (_setmode(_fileno(stdout), _O_BINARY) == -1) return 1;\n",
+        "#endif\n",
+        "    static const unsigned char sao2_text[] = {",
+    ));
 
     if bytes.is_empty() {
         output.push('0');
@@ -38,7 +47,14 @@ mod tests {
             emit_print_program(b"hello"),
             concat!(
                 "#include <stdio.h>\n\n",
+                "#ifdef _WIN32\n",
+                "#include <fcntl.h>\n",
+                "#include <io.h>\n",
+                "#endif\n\n",
                 "int main(void) {\n",
+                "#ifdef _WIN32\n",
+                "    if (_setmode(_fileno(stdout), _O_BINARY) == -1) return 1;\n",
+                "#endif\n",
                 "    static const unsigned char sao2_text[] = ",
                 "{104, 101, 108, 108, 111};\n",
                 "    return fwrite(sao2_text, 1, 5, stdout) == 5 ? 0 : 1;\n",
