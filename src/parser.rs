@@ -1,14 +1,15 @@
-//! Early permanent-parser slice for Phase 3.
+//! Permanent declaration and type parser through Phase 4.
 //!
-//! Later phases extend these routines with the remaining declaration, type,
-//! expression, and statement productions. Entry-point rules are deliberately
-//! enforced by `compiler`, not here.
+//! Later phases extend these routines with the remaining expression and
+//! statement productions. Entry-point rules are deliberately enforced by
+//! `compiler`, not here.
 
 use std::mem::discriminant;
 
 use crate::ast::{
     Block, Declaration, Expression, ExpressionKind, FunctionDeclaration, Identifier, Parameter,
-    PrimitiveType, Program, Statement, StatementKind, Type, TypeKind,
+    PrimitiveType, Program, Statement, StatementKind, Type, TypeDeclaration, TypeKind, TypeMember,
+    TypeMemberKind,
 };
 use crate::diagnostic::{Diagnostic, Diagnostics};
 use crate::lexer::{self, Token, TokenKind};
@@ -44,11 +45,79 @@ impl<'source> Parser<'source> {
     fn parse_program(mut self) -> Result<Program, Diagnostic> {
         let mut declarations = Vec::new();
         while !self.at(&TokenKind::Eof) {
-            declarations.push(Declaration::Function(self.parse_function()?));
+            let declaration = if self.at(&TokenKind::Type) {
+                Declaration::Type(self.parse_type_declaration()?)
+            } else if self.at(&TokenKind::Fn) {
+                Declaration::Function(self.parse_function()?)
+            } else {
+                return Err(self.error_current("expected top-level 'type' or 'fn' declaration"));
+            };
+            declarations.push(declaration);
         }
         Ok(Program {
             declarations,
             span: Span::new(0, self.source.text.len()),
+        })
+    }
+
+    fn parse_type_declaration(&mut self) -> Result<TypeDeclaration, Diagnostic> {
+        let start = self
+            .expect(
+                &TokenKind::Type,
+                "expected type declaration beginning with 'type'",
+            )?
+            .span
+            .start;
+        let name = self.parse_identifier("expected type name after 'type'")?;
+        self.expect(&TokenKind::LeftParen, "expected '(' after type name")?;
+
+        let mut members = Vec::new();
+        if self.at(&TokenKind::RightParen) {
+            return Err(self.error_current("expected at least one type member"));
+        }
+        loop {
+            members.push(self.parse_type_member()?);
+            if self.take(&TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+
+        self.expect(
+            &TokenKind::RightParen,
+            "expected ')' after type declaration members",
+        )?;
+        let end = self
+            .expect(&TokenKind::Semicolon, "expected ';' after type declaration")?
+            .span
+            .end;
+        Ok(TypeDeclaration {
+            name,
+            members,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_type_member(&mut self) -> Result<TypeMember, Diagnostic> {
+        if self.at(&TokenKind::Identifier)
+            && (self.at_next(&TokenKind::Ampersand) || self.at_next_unambiguous_type_start())
+        {
+            let name = self.parse_identifier("expected member name")?;
+            let referenced = self.take(&TokenKind::Ampersand).is_some();
+            let ty = self.parse_type()?;
+            return Ok(TypeMember {
+                span: Span::new(name.span.start, ty.span.end),
+                kind: TypeMemberKind::Named {
+                    name,
+                    referenced,
+                    ty,
+                },
+            });
+        }
+
+        let ty = self.parse_type()?;
+        Ok(TypeMember {
+            span: ty.span,
+            kind: TypeMemberKind::Unnamed(ty),
         })
     }
 
@@ -77,7 +146,9 @@ impl<'source> Parser<'source> {
             "expected ')' after function parameters",
         )?;
 
-        let return_type = if self.at_type_start() {
+        let return_type = if self.at(&TokenKind::LeftBrace) {
+            self.try_parse_map_return_type()?
+        } else if self.at_type_start() {
             Some(self.parse_type()?)
         } else {
             None
@@ -107,7 +178,40 @@ impl<'source> Parser<'source> {
         })
     }
 
+    fn try_parse_map_return_type(&mut self) -> Result<Option<Type>, Diagnostic> {
+        let checkpoint = self.current;
+        let parsed = self.parse_type();
+        if let Ok(ty) = parsed
+            && self.at(&TokenKind::LeftBrace)
+        {
+            return Ok(Some(ty));
+        }
+        self.current = checkpoint;
+        Ok(None)
+    }
+
     fn parse_type(&mut self) -> Result<Type, Diagnostic> {
+        let first = self.parse_type_atom()?;
+        if self.take(&TokenKind::Pipe).is_none() {
+            return Ok(first);
+        }
+
+        let start = first.span.start;
+        let mut alternatives = vec![first];
+        loop {
+            alternatives.push(self.parse_type_atom()?);
+            if self.take(&TokenKind::Pipe).is_none() {
+                break;
+            }
+        }
+        let end = alternatives.last().unwrap().span.end;
+        Ok(Type {
+            kind: TypeKind::Union(alternatives.into_boxed_slice()),
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_type_atom(&mut self) -> Result<Type, Diagnostic> {
         let token = self.current_token().clone();
         let (kind, span) = match token.kind {
             TokenKind::Int => (TypeKind::Primitive(PrimitiveType::Int), token.span),
@@ -116,8 +220,29 @@ impl<'source> Parser<'source> {
             TokenKind::Bool => (TypeKind::Primitive(PrimitiveType::Bool), token.span),
             TokenKind::Char => (TypeKind::Primitive(PrimitiveType::Char), token.span),
             TokenKind::Identifier => {
+                self.current += 1;
                 let identifier = Identifier { span: token.span };
-                (TypeKind::Named(identifier), token.span)
+                if self.take(&TokenKind::LeftParen).is_some() {
+                    let payload = self.parse_type()?;
+                    let end = self
+                        .expect(
+                            &TokenKind::RightParen,
+                            "expected ')' after tagged alternative payload",
+                        )?
+                        .span
+                        .end;
+                    return Ok(Type {
+                        kind: TypeKind::Tagged {
+                            tag: identifier,
+                            payload: Box::new(payload),
+                        },
+                        span: Span::new(token.span.start, end),
+                    });
+                }
+                return Ok(Type {
+                    kind: TypeKind::Named(identifier),
+                    span: token.span,
+                });
             }
             TokenKind::LeftBracket => {
                 self.current += 1;
@@ -128,6 +253,41 @@ impl<'source> Parser<'source> {
                     .end;
                 return Ok(Type {
                     kind: TypeKind::List(Box::new(element)),
+                    span: Span::new(token.span.start, end),
+                });
+            }
+            TokenKind::LeftBrace => {
+                self.current += 1;
+                let key = self.parse_type()?;
+                self.expect(
+                    &TokenKind::Colon,
+                    "expected ':' between map key and value types",
+                )?;
+                let value = self.parse_type()?;
+                let end = self
+                    .expect(&TokenKind::RightBrace, "expected '}' after map type")?
+                    .span
+                    .end;
+                return Ok(Type {
+                    kind: TypeKind::Map {
+                        key: Box::new(key),
+                        value: Box::new(value),
+                    },
+                    span: Span::new(token.span.start, end),
+                });
+            }
+            TokenKind::LeftParen => {
+                self.current += 1;
+                let inner = self.parse_type()?;
+                let end = self
+                    .expect(
+                        &TokenKind::RightParen,
+                        "expected ')' after parenthesized type",
+                    )?
+                    .span
+                    .end;
+                return Ok(Type {
+                    kind: TypeKind::Parenthesized(Box::new(inner)),
                     span: Span::new(token.span.start, end),
                 });
             }
@@ -250,6 +410,29 @@ impl<'source> Parser<'source> {
             || self.at(&TokenKind::Char)
             || self.at(&TokenKind::Identifier)
             || self.at(&TokenKind::LeftBracket)
+            || self.at(&TokenKind::LeftBrace)
+            || self.at(&TokenKind::LeftParen)
+    }
+
+    fn at_next_unambiguous_type_start(&self) -> bool {
+        self.at_offset(1, &TokenKind::Int)
+            || self.at_offset(1, &TokenKind::FloatType)
+            || self.at_offset(1, &TokenKind::Str)
+            || self.at_offset(1, &TokenKind::Bool)
+            || self.at_offset(1, &TokenKind::Char)
+            || self.at_offset(1, &TokenKind::Identifier)
+            || self.at_offset(1, &TokenKind::LeftBracket)
+            || self.at_offset(1, &TokenKind::LeftBrace)
+    }
+
+    fn at_next(&self, kind: &TokenKind) -> bool {
+        self.at_offset(1, kind)
+    }
+
+    fn at_offset(&self, offset: usize, kind: &TokenKind) -> bool {
+        self.tokens
+            .get(self.current + offset)
+            .is_some_and(|token| discriminant(&token.kind) == discriminant(kind))
     }
 
     fn at(&self, kind: &TokenKind) -> bool {
@@ -288,12 +471,18 @@ mod tests {
         SourceFile::new(PathBuf::from("test.sao2"), text.to_owned())
     }
 
+    fn span_text(text: &str, span: Span) -> &str {
+        &text[span.start..span.end]
+    }
+
     #[test]
     fn parses_spanned_functions_blocks_calls_and_literals() {
         let text = "fn helper(value str) str { print(value); value }";
         let program = parse(&source(text)).unwrap();
         assert_eq!(program.span, Span::new(0, text.len()));
-        let Declaration::Function(function) = &program.declarations[0];
+        let Declaration::Function(function) = &program.declarations[0] else {
+            panic!("expected function declaration");
+        };
         assert_eq!(function.span, Span::new(0, text.len()));
         assert_eq!(function.name.span, Span::new(3, 9));
         assert_eq!(function.parameters[0].span, Span::new(10, 19));
@@ -316,7 +505,9 @@ mod tests {
     #[test]
     fn parses_chained_calls_and_nested_blocks() {
         let program = parse(&source("fn f() { { print(make(\"x\")); } }")).unwrap();
-        let Declaration::Function(function) = &program.declarations[0];
+        let Declaration::Function(function) = &program.declarations[0] else {
+            panic!("expected function declaration");
+        };
         assert!(matches!(
             function.body.statements[0].kind,
             StatementKind::Block(_)
@@ -326,8 +517,141 @@ mod tests {
     #[test]
     fn rejects_temporary_top_level_statements() {
         let diagnostics = parse(&source("print(\"old syntax\");")).unwrap_err();
-        assert!(diagnostics
-            .to_string()
-            .contains("expected function declaration"));
+        assert!(
+            diagnostics
+                .to_string()
+                .contains("expected top-level 'type' or 'fn' declaration")
+        );
+    }
+
+    #[test]
+    fn parses_named_unnamed_and_referenced_type_members() {
+        let text =
+            "type Point(x int, y float, target Target, shared &Target); type Pair(int, [str]);";
+        let program = parse(&source(text)).unwrap();
+        assert_eq!(program.declarations.len(), 2);
+
+        let Declaration::Type(point) = &program.declarations[0] else {
+            panic!("expected type declaration");
+        };
+        assert_eq!(
+            span_text(text, point.span),
+            "type Point(x int, y float, target Target, shared &Target);"
+        );
+        assert_eq!(span_text(text, point.name.span), "Point");
+        assert_eq!(point.members.len(), 4);
+        let TypeMemberKind::Named {
+            name,
+            referenced,
+            ty,
+        } = &point.members[3].kind
+        else {
+            panic!("expected named member");
+        };
+        assert_eq!(span_text(text, name.span), "shared");
+        assert!(*referenced);
+        assert_eq!(span_text(text, ty.span), "Target");
+        assert_eq!(span_text(text, point.members[3].span), "shared &Target");
+
+        let Declaration::Type(pair) = &program.declarations[1] else {
+            panic!("expected type declaration");
+        };
+        assert!(
+            pair.members
+                .iter()
+                .all(|member| matches!(member.kind, TypeMemberKind::Unnamed(_)))
+        );
+    }
+
+    #[test]
+    fn parses_every_type_atom_and_union_in_function_signatures() {
+        let text = "fn types(a int, b float, c str, d bool, e char, f Name, g [Name], h {str: [int]}, i (A | B), j Ok(int) | Error(str)) (A | B) | C {}";
+        let program = parse(&source(text)).unwrap();
+        let Declaration::Function(function) = &program.declarations[0] else {
+            panic!("expected function declaration");
+        };
+
+        assert_eq!(function.parameters.len(), 10);
+        assert!(matches!(
+            function.parameters[0].ty.kind,
+            TypeKind::Primitive(PrimitiveType::Int)
+        ));
+        assert!(matches!(function.parameters[5].ty.kind, TypeKind::Named(_)));
+        assert!(matches!(function.parameters[6].ty.kind, TypeKind::List(_)));
+        assert!(matches!(
+            function.parameters[7].ty.kind,
+            TypeKind::Map { .. }
+        ));
+        assert!(matches!(
+            function.parameters[8].ty.kind,
+            TypeKind::Parenthesized(_)
+        ));
+        let TypeKind::Union(tagged) = &function.parameters[9].ty.kind else {
+            panic!("expected tagged union");
+        };
+        assert_eq!(tagged.len(), 2);
+        assert!(
+            tagged
+                .iter()
+                .all(|alternative| matches!(alternative.kind, TypeKind::Tagged { .. }))
+        );
+        assert!(matches!(
+            function.return_type.as_ref().unwrap().kind,
+            TypeKind::Union(_)
+        ));
+    }
+
+    #[test]
+    fn preserves_parenthesized_nested_unions() {
+        let text = "type Nested((int | float) | str);";
+        let program = parse(&source(text)).unwrap();
+        let Declaration::Type(declaration) = &program.declarations[0] else {
+            panic!("expected type declaration");
+        };
+        let TypeMemberKind::Unnamed(ty) = &declaration.members[0].kind else {
+            panic!("expected unnamed member");
+        };
+        let TypeKind::Union(outer) = &ty.kind else {
+            panic!("expected outer union");
+        };
+        assert_eq!(outer.len(), 2);
+        let TypeKind::Parenthesized(inner) = &outer[0].kind else {
+            panic!("expected preserved parentheses");
+        };
+        assert!(matches!(inner.kind, TypeKind::Union(ref types) if types.len() == 2));
+        assert_eq!(span_text(text, outer[0].span), "(int | float)");
+        assert_eq!(span_text(text, inner.span), "int | float");
+    }
+
+    #[test]
+    fn distinguishes_map_return_types_from_function_bodies() {
+        let map_source = source("fn lookup() {str: [int]} {}");
+        let program = parse(&map_source).unwrap();
+        let Declaration::Function(function) = &program.declarations[0] else {
+            panic!("expected function declaration");
+        };
+        assert!(matches!(
+            function.return_type.as_ref().unwrap().kind,
+            TypeKind::Map { .. }
+        ));
+
+        let body_source = source("fn no_return() {}");
+        let program = parse(&body_source).unwrap();
+        let Declaration::Function(function) = &program.declarations[0] else {
+            panic!("expected function declaration");
+        };
+        assert!(function.return_type.is_none());
+    }
+
+    #[test]
+    fn defers_contextual_type_member_validation() {
+        for text in [
+            "type Mixed(a int, float);",
+            "type ReferencedPrimitive(value &int);",
+            "type SingleAlternative(int);",
+            "type TaggedOutsideUnion(Only(int));",
+        ] {
+            assert!(parse(&source(text)).is_ok(), "{text}");
+        }
     }
 }

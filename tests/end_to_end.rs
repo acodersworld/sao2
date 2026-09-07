@@ -60,7 +60,7 @@ fn malformed_source_has_stable_diagnostic() {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("bad.sao2:1:1: expected function declaration"));
+    assert!(stderr.contains("bad.sao2:1:1: expected top-level 'type' or 'fn' declaration"));
     assert!(!directory.0.join("build/program.c").exists());
 }
 

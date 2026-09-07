@@ -140,12 +140,14 @@ impl Diagnostics {
     pub fn is_full(&self) -> bool {
         self.entries.len() == MAX_SOURCE_ERRORS
     }
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+    #[cfg(test)]
     pub fn into_sorted(mut self) -> Vec<Diagnostic> {
         self.entries
             .sort_by_key(|diagnostic| diagnostic.primary_span().map(|span| span.start));
@@ -180,7 +182,10 @@ mod tests {
         let source = source("first\n\tbad input");
         let diagnostic = Diagnostic::source(&source, Span::new(7, 10), "expected expression");
         assert_eq!(diagnostic.primary_span(), Some(Span::new(7, 10)));
-        assert_eq!(diagnostic.to_string(), "sao2: source error: test.sao2:2:5: expected expression\n  |\n2 |     bad input\n  |     ^^^");
+        assert_eq!(
+            diagnostic.to_string(),
+            "sao2: source error: test.sao2:2:5: expected expression\n  |\n2 |     bad input\n  |     ^^^"
+        );
     }
 
     #[test]
@@ -197,10 +202,12 @@ mod tests {
         assert!(diagnostics.is_full());
         assert_eq!(diagnostics.len(), MAX_SOURCE_ERRORS);
         let diagnostics = diagnostics.into_sorted();
-        assert!(diagnostics
-            .windows(2)
-            .all(|pair| pair[0].primary_span().unwrap().start
-                <= pair[1].primary_span().unwrap().start));
+        assert!(
+            diagnostics
+                .windows(2)
+                .all(|pair| pair[0].primary_span().unwrap().start
+                    <= pair[1].primary_span().unwrap().start)
+        );
     }
 
     #[test]

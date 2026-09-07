@@ -8,15 +8,40 @@ pub struct Program {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Declaration {
+    Type(TypeDeclaration),
     Function(FunctionDeclaration),
 }
 
 impl Declaration {
     pub fn span(&self) -> Span {
         match self {
+            Self::Type(type_declaration) => type_declaration.span,
             Self::Function(function) => function.span,
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypeDeclaration {
+    pub name: Identifier,
+    pub members: Vec<TypeMember>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypeMember {
+    pub kind: TypeMemberKind,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TypeMemberKind {
+    Named {
+        name: Identifier,
+        referenced: bool,
+        ty: Type,
+    },
+    Unnamed(Type),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,6 +72,10 @@ pub enum TypeKind {
     Primitive(PrimitiveType),
     Named(Identifier),
     List(Box<Type>),
+    Map { key: Box<Type>, value: Box<Type> },
+    Union(Box<[Type]>),
+    Tagged { tag: Identifier, payload: Box<Type> },
+    Parenthesized(Box<Type>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
