@@ -1,14 +1,15 @@
 //! Name-and-type analysis representation.
 //!
 //! This module establishes the analysis boundary and stable identities without
-//! adding semantic data to the parser AST. It collects top-level names and
-//! resolves function signatures before later phases analyze declaration bodies.
+//! adding semantic data to the parser AST. It collects top-level names, resolves
+//! type definitions, and resolves function signatures before later phases
+//! analyze declaration bodies.
 
 use crate::ast::{
     AssignmentTarget, AssignmentTargetSuffixKind, Block, Declaration, Expression,
     ExpressionBody, ExpressionBodyKind, ExpressionKind, FunctionDeclaration, Parameter,
     PrimitiveType, Program, Statement, StatementBody, StatementBodyKind, StatementKind, Type,
-    TypeDeclaration, TypeKind,
+    TypeDeclaration, TypeKind, TypeMember, TypeMemberKind,
 };
 use crate::diagnostic::{Diagnostic, Diagnostics};
 use crate::source::{SourceFile, Span};
@@ -203,6 +204,57 @@ pub(crate) struct FunctionSignature<'ast> {
     pub(crate) result: TypeState,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MemberStorage {
+    Inline,
+    Referenced,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StructMember<'ast> {
+    pub(crate) node: &'ast TypeMember,
+    pub(crate) name: &'ast crate::ast::Identifier,
+    pub(crate) storage: MemberStorage,
+    pub(crate) ty: TypeState,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TupleMember<'ast> {
+    pub(crate) node: &'ast TypeMember,
+    pub(crate) position: usize,
+    pub(crate) ty: TypeState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UnionStyle {
+    Untagged,
+    Tagged,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum TypeDefinitionKind<'ast> {
+    Struct(Box<[StructMember<'ast>]>),
+    Tuple(Box<[TupleMember<'ast>]>),
+    Union {
+        style: UnionStyle,
+        alternatives: Box<[UnionAlternative]>,
+    },
+    Invalid,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TypeDefinition<'ast> {
+    pub(crate) id: TypeDeclarationId,
+    pub(crate) node: &'ast TypeDeclaration,
+    pub(crate) kind: TypeDefinitionKind<'ast>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingMapKey<'ast> {
+    node: &'ast Type,
+    key: TypeId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TypeName {
     pub(crate) name: Box<str>,
@@ -302,11 +354,13 @@ pub(crate) struct Analysis<'source, 'ast> {
     pub(crate) expression_annotations: Vec<ExpressionAnnotation<'ast>>,
     pub(crate) type_names: Vec<TypeName>,
     pub(crate) function_names: Vec<FunctionName>,
+    pub(crate) type_definitions: Vec<TypeDefinition<'ast>>,
     pub(crate) function_signatures: Vec<FunctionSignature<'ast>>,
     pub(crate) intrinsic_signatures: Vec<IntrinsicSignature>,
     pub(crate) entry_point: EntryPoint,
     pub(crate) deferred: Vec<DeferredAnalysis<'ast>>,
     pub(crate) diagnostics: Diagnostics,
+    pending_map_keys: Vec<PendingMapKey<'ast>>,
 }
 
 impl<'source, 'ast> Analysis<'source, 'ast> {
@@ -357,6 +411,12 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
         let signature = &self.function_signatures[id.0];
         debug_assert_eq!(signature.id, id);
         signature
+    }
+
+    pub(crate) fn type_definition(&self, id: TypeDeclarationId) -> &TypeDefinition<'ast> {
+        let definition = &self.type_definitions[id.0];
+        debug_assert_eq!(definition.id, id);
+        definition
     }
 
     pub(crate) fn intrinsic_signature(&self, id: IntrinsicId) -> &IntrinsicSignature {
@@ -449,6 +509,149 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
         }
     }
 
+    fn resolve_type_definitions(&mut self) {
+        for index in 0..self.declarations.len() {
+            let record = self.declarations[index];
+            let (DeclarationId::Type(id), DeclarationNode::Type(declaration)) =
+                (record.id, record.node)
+            else {
+                continue;
+            };
+            let kind = self.resolve_type_definition(declaration);
+            self.type_definitions.push(TypeDefinition {
+                id,
+                node: declaration,
+                kind,
+            });
+        }
+    }
+
+    fn resolve_type_definition(
+        &mut self,
+        declaration: &'ast TypeDeclaration,
+    ) -> TypeDefinitionKind<'ast> {
+        let has_named = declaration
+            .members
+            .iter()
+            .any(|member| matches!(&member.kind, TypeMemberKind::Named { .. }));
+        let has_unnamed = declaration
+            .members
+            .iter()
+            .any(|member| matches!(&member.kind, TypeMemberKind::Unnamed(_)));
+        let has_top_level_union = declaration.members.iter().any(|member| {
+            let ty = match &member.kind {
+                TypeMemberKind::Named { ty, .. } | TypeMemberKind::Unnamed(ty) => ty,
+            };
+            matches!(&ty.kind, TypeKind::Union(_))
+        });
+
+        if has_named && has_unnamed {
+            self.error(
+                declaration.span,
+                "type declaration cannot mix named and unnamed members",
+            );
+            for member in &declaration.members {
+                let ty = match &member.kind {
+                    TypeMemberKind::Named { ty, .. } | TypeMemberKind::Unnamed(ty) => ty,
+                };
+                self.resolve_type(ty);
+            }
+            return TypeDefinitionKind::Invalid;
+        }
+
+        if has_top_level_union {
+            let [member] = declaration.members.as_slice() else {
+                self.error(
+                    declaration.span,
+                    "union declaration must contain one unnamed union type",
+                );
+                for member in &declaration.members {
+                    let ty = match &member.kind {
+                        TypeMemberKind::Named { ty, .. } | TypeMemberKind::Unnamed(ty) => ty,
+                    };
+                    self.resolve_type(ty);
+                }
+                return TypeDefinitionKind::Invalid;
+            };
+            let TypeMemberKind::Unnamed(ty) = &member.kind else {
+                self.resolve_type(match &member.kind {
+                    TypeMemberKind::Named { ty, .. } => ty,
+                    TypeMemberKind::Unnamed(_) => unreachable!(),
+                });
+                self.error(
+                    member.span,
+                    "union declaration alternatives must be unnamed",
+                );
+                return TypeDefinitionKind::Invalid;
+            };
+            let state = self.resolve_type(ty);
+            return match state {
+                TypeState::Resolved(id) => match self.types.get(id) {
+                    ResolvedType::Union(alternatives) => {
+                        let alternatives = alternatives.clone();
+                        let style = union_style(&alternatives);
+                        TypeDefinitionKind::Union {
+                            style,
+                            alternatives,
+                        }
+                    }
+                    _ => unreachable!("top-level union syntax must resolve to a union type"),
+                },
+                _ => TypeDefinitionKind::Invalid,
+            };
+        }
+
+        if has_named {
+            let mut names: Vec<Box<str>> = Vec::new();
+            let mut members = Vec::with_capacity(declaration.members.len());
+            for member in &declaration.members {
+                let TypeMemberKind::Named {
+                    name,
+                    referenced,
+                    ty,
+                } = &member.kind
+                else {
+                    unreachable!("mixed member forms were rejected above")
+                };
+                let spelling = self.identifier_text(name.span).to_owned();
+                if names
+                    .iter()
+                    .any(|existing| existing.as_ref() == spelling.as_str())
+                {
+                    self.error(name.span, format!("duplicate struct member '{spelling}'"));
+                } else {
+                    names.push(spelling.into_boxed_str());
+                }
+                let resolved = self.resolve_type(ty);
+                let storage = if *referenced {
+                    MemberStorage::Referenced
+                } else {
+                    MemberStorage::Inline
+                };
+                members.push(StructMember {
+                    node: member,
+                    name,
+                    storage,
+                    ty: resolved,
+                });
+            }
+            TypeDefinitionKind::Struct(members.into_boxed_slice())
+        } else {
+            let mut members = Vec::with_capacity(declaration.members.len());
+            for (position, member) in declaration.members.iter().enumerate() {
+                let TypeMemberKind::Unnamed(ty) = &member.kind else {
+                    unreachable!("mixed member forms were rejected above")
+                };
+                members.push(TupleMember {
+                    node: member,
+                    position,
+                    ty: self.resolve_type(ty),
+                });
+            }
+            TypeDefinitionKind::Tuple(members.into_boxed_slice())
+        }
+    }
+
     fn resolve_function_signatures(&mut self) {
         for index in 0..self.declarations.len() {
             let record = self.declarations[index];
@@ -481,7 +684,6 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
     }
 
     fn resolve_type(&mut self, node: &'ast Type) -> TypeState {
-        let mut tagged_nodes = Vec::new();
         let state = match &node.kind {
             TypeKind::Primitive(primitive) => {
                 TypeState::Resolved(self.types.primitive(*primitive))
@@ -502,24 +704,57 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
                 _ => TypeState::Error,
             },
             TypeKind::Map { key, value } => {
-                let key = self.resolve_type(key);
-                let value = self.resolve_type(value);
-                match (key, value) {
-                    (TypeState::Resolved(key), TypeState::Resolved(value)) => TypeState::Resolved(
-                        self.types.intern(ResolvedType::Map { key, value }),
-                    ),
+                let key_node = key.as_ref();
+                let key_state = self.resolve_type(key);
+                let value_state = self.resolve_type(value);
+                match (key_state, value_state) {
+                    (TypeState::Resolved(key), TypeState::Resolved(value)) => {
+                        self.pending_map_keys.push(PendingMapKey {
+                            node: key_node,
+                            key,
+                        });
+                        TypeState::Resolved(self.types.intern(ResolvedType::Map { key, value }))
+                    }
                     _ => TypeState::Error,
                 }
             }
             TypeKind::Union(alternatives) => {
                 let mut resolved = Vec::with_capacity(alternatives.len());
                 let mut failed = false;
+                let mut style = None;
+                let mut untagged = Vec::new();
+                let mut tags: Vec<Box<str>> = Vec::new();
+                let mut saw_error = false;
                 for alternative in alternatives {
                     match &alternative.kind {
                         TypeKind::Tagged { tag, payload } => {
-                            tagged_nodes.push(alternative);
+                            let tag_span = tag.span;
                             let tag = self.identifier_text(tag.span).to_owned();
-                            match self.resolve_type(payload) {
+                            let payload_state = self.resolve_type(payload);
+                            if tag == "Error" {
+                                if saw_error {
+                                    self.error(tag_span, "duplicate Error alternative");
+                                    failed = true;
+                                }
+                                saw_error = true;
+                                if !std::ptr::eq(alternative, alternatives.last().unwrap()) {
+                                    self.error(alternative.span, "Error must be the final union alternative");
+                                    failed = true;
+                                }
+                            } else {
+                                if style == Some(UnionStyle::Untagged) {
+                                    self.error(alternative.span, "tagged and untagged union alternatives cannot be mixed");
+                                    failed = true;
+                                }
+                                style = Some(UnionStyle::Tagged);
+                                if tags.iter().any(|existing| existing.as_ref() == tag.as_str()) {
+                                    self.error(tag_span, format!("duplicate union tag '{tag}'"));
+                                    failed = true;
+                                } else {
+                                    tags.push(tag.clone().into_boxed_str());
+                                }
+                            }
+                            match payload_state {
                                 TypeState::Resolved(payload) if tag == "Error" => {
                                     resolved.push(UnionAlternative::Error(payload));
                                 }
@@ -532,12 +767,25 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
                                 _ => failed = true,
                             }
                         }
-                        _ => match self.resolve_type(alternative) {
-                            TypeState::Resolved(ty) => {
-                                resolved.push(UnionAlternative::Untagged(ty));
+                        _ => {
+                            if style == Some(UnionStyle::Tagged) {
+                                self.error(alternative.span, "tagged and untagged union alternatives cannot be mixed");
+                                failed = true;
                             }
-                            _ => failed = true,
-                        },
+                            style = Some(UnionStyle::Untagged);
+                            match self.resolve_type(alternative) {
+                                TypeState::Resolved(ty) => {
+                                    if untagged.contains(&ty) {
+                                        self.error(alternative.span, "duplicate untagged union alternative");
+                                        failed = true;
+                                    } else {
+                                        untagged.push(ty);
+                                    }
+                                    resolved.push(UnionAlternative::Untagged(ty));
+                                }
+                                _ => failed = true,
+                            }
+                        }
                     }
                 }
                 if failed {
@@ -556,11 +804,180 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
             }
             TypeKind::Parenthesized(inner) => self.resolve_type(inner),
         };
-        for tagged in tagged_nodes {
-            self.annotate_type(tagged, state);
+        if let TypeKind::Union(alternatives) = &node.kind {
+            for alternative in alternatives {
+                if matches!(&alternative.kind, TypeKind::Tagged { .. }) {
+                    self.annotate_type(alternative, state);
+                }
+            }
         }
         self.annotate_type(node, state);
         state
+    }
+
+    fn validate_referenced_storage(&mut self) {
+        let mut invalid = Vec::new();
+        for definition in &self.type_definitions {
+            let TypeDefinitionKind::Struct(members) = &definition.kind else {
+                continue;
+            };
+            for member in members {
+                if member.storage == MemberStorage::Referenced {
+                    if let TypeState::Resolved(ty) = member.ty
+                        && !self.is_struct_type(ty)
+                    {
+                        invalid.push(member.node.span);
+                    }
+                }
+            }
+        }
+        for span in invalid {
+            self.error(span, "referenced storage '&' is permitted only for struct-valued members");
+        }
+    }
+
+    fn is_struct_type(&self, ty: TypeId) -> bool {
+        matches!(
+            self.types.get(ty),
+            ResolvedType::Nominal(id)
+                if matches!(&self.type_definition(*id).kind, TypeDefinitionKind::Struct(_))
+        )
+    }
+
+    fn validate_map_keys(&mut self) {
+        let invalid = self
+            .pending_map_keys
+            .iter()
+            .copied()
+            .filter(|pending| !self.is_valid_map_key(pending.key, &mut Vec::new()))
+            .map(|pending| pending.node.span)
+            .collect::<Vec<_>>();
+        for span in invalid {
+            self.error(
+                span,
+                "map key type must be int, str, bool, or an immutable tuple of valid map keys",
+            );
+        }
+    }
+
+    fn is_valid_map_key(&self, ty: TypeId, visiting: &mut Vec<TypeDeclarationId>) -> bool {
+        match self.types.get(ty) {
+            ResolvedType::Primitive(
+                PrimitiveType::Int | PrimitiveType::Str | PrimitiveType::Bool,
+            ) => true,
+            ResolvedType::Primitive(PrimitiveType::Float | PrimitiveType::Char) => false,
+            ResolvedType::Nominal(id) => {
+                if visiting.contains(id) {
+                    return false;
+                }
+                let TypeDefinitionKind::Tuple(members) = &self.type_definition(*id).kind else {
+                    return false;
+                };
+                visiting.push(*id);
+                let valid = members.iter().all(|member| {
+                    matches!(
+                        member.ty,
+                        TypeState::Resolved(member_ty)
+                            if self.is_valid_map_key(member_ty, visiting)
+                    )
+                });
+                visiting.pop();
+                valid
+            }
+            ResolvedType::List(_) | ResolvedType::Map { .. } | ResolvedType::Union(_) => false,
+        }
+    }
+
+    fn validate_inline_layouts(&mut self) {
+        let recursive = self
+            .type_definitions
+            .iter()
+            .filter_map(|definition| {
+                self.layout_reaches(definition.id, definition.id, &mut Vec::new())
+                    .then_some(definition.node.name.span)
+            })
+            .collect::<Vec<_>>();
+        for span in recursive {
+            let name = self.identifier_text(span).to_owned();
+            self.error(
+                span,
+                format!("type '{name}' has an infinitely recursive inline layout"),
+            );
+        }
+    }
+
+    fn layout_reaches(
+        &self,
+        target: TypeDeclarationId,
+        current: TypeDeclarationId,
+        visited: &mut Vec<TypeDeclarationId>,
+    ) -> bool {
+        if visited.contains(&current) {
+            return false;
+        }
+        visited.push(current);
+        let mut dependencies = Vec::new();
+        self.inline_dependencies(current, &mut dependencies);
+        dependencies.into_iter().any(|dependency| {
+            dependency == target || self.layout_reaches(target, dependency, visited)
+        })
+    }
+
+    fn inline_dependencies(
+        &self,
+        id: TypeDeclarationId,
+        dependencies: &mut Vec<TypeDeclarationId>,
+    ) {
+        match &self.type_definition(id).kind {
+            TypeDefinitionKind::Struct(members) => {
+                for member in members {
+                    if member.storage == MemberStorage::Inline {
+                        if let TypeState::Resolved(ty) = member.ty {
+                            self.collect_inline_type_dependencies(ty, dependencies);
+                        }
+                    }
+                }
+            }
+            TypeDefinitionKind::Tuple(members) => {
+                for member in members {
+                    if let TypeState::Resolved(ty) = member.ty {
+                        self.collect_inline_type_dependencies(ty, dependencies);
+                    }
+                }
+            }
+            TypeDefinitionKind::Union { alternatives, .. } => {
+                for alternative in alternatives {
+                    let ty = match alternative {
+                        UnionAlternative::Untagged(ty)
+                        | UnionAlternative::Tagged { payload: ty, .. }
+                        | UnionAlternative::Error(ty) => *ty,
+                    };
+                    self.collect_inline_type_dependencies(ty, dependencies);
+                }
+            }
+            TypeDefinitionKind::Invalid => {}
+        }
+    }
+
+    fn collect_inline_type_dependencies(
+        &self,
+        ty: TypeId,
+        dependencies: &mut Vec<TypeDeclarationId>,
+    ) {
+        match self.types.get(ty) {
+            ResolvedType::Primitive(_) | ResolvedType::List(_) | ResolvedType::Map { .. } => {}
+            ResolvedType::Nominal(id) => dependencies.push(*id),
+            ResolvedType::Union(alternatives) => {
+                for alternative in alternatives.iter() {
+                    let payload = match alternative {
+                        UnionAlternative::Untagged(payload)
+                        | UnionAlternative::Tagged { payload, .. }
+                        | UnionAlternative::Error(payload) => *payload,
+                    };
+                    self.collect_inline_type_dependencies(payload, dependencies);
+                }
+            }
+        }
     }
 
     fn parameter_binding(&self, parameter: &'ast Parameter) -> BindingId {
@@ -624,8 +1041,19 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
     }
 }
 
+fn union_style(alternatives: &[UnionAlternative]) -> UnionStyle {
+    if alternatives
+        .iter()
+        .any(|alternative| matches!(alternative, UnionAlternative::Tagged { .. }))
+    {
+        UnionStyle::Tagged
+    } else {
+        UnionStyle::Untagged
+    }
+}
+
 /// Creates the analysis result, collects top-level namespaces, and resolves all
-/// function signatures before declaration bodies are considered.
+/// type definitions and function signatures before function bodies are considered.
 pub(crate) fn analyze<'source, 'ast>(
     source: &'source SourceFile,
     program: &'ast Program,
@@ -671,6 +1099,7 @@ pub(crate) fn analyze<'source, 'ast>(
         expression_annotations: Vec::new(),
         type_names: Vec::new(),
         function_names: Vec::new(),
+        type_definitions: Vec::new(),
         function_signatures: Vec::new(),
         intrinsic_signatures: vec![
             IntrinsicSignature {
@@ -695,9 +1124,14 @@ pub(crate) fn analyze<'source, 'ast>(
         entry_point: EntryPoint::Missing,
         deferred: Vec::new(),
         diagnostics: Diagnostics::new(),
+        pending_map_keys: Vec::new(),
     };
     analysis.collect_top_level_names();
+    analysis.resolve_type_definitions();
     analysis.resolve_function_signatures();
+    analysis.validate_referenced_storage();
+    analysis.validate_map_keys();
+    analysis.validate_inline_layouts();
     analysis.entry_point = analysis.classify_entry_point();
     analysis
 }
@@ -1118,6 +1552,137 @@ mod tests {
             CallableResolution::Found(CallableId::Function(second))
         );
         assert!(analysis.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn classifies_type_definitions_and_preserves_nominal_identity() {
+        let source = source(
+            concat!(
+                "type Left(value int); type Right(value int); ",
+                "type Pair(int, str); type Choice(int | str); fn main() {}",
+            ),
+        );
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+
+        let left = analysis.type_by_name("Left").unwrap();
+        let right = analysis.type_by_name("Right").unwrap();
+        assert_ne!(ResolvedType::Nominal(left), ResolvedType::Nominal(right));
+        assert!(matches!(
+            &analysis.type_definition(left).kind,
+            TypeDefinitionKind::Struct(members) if members.len() == 1
+        ));
+        assert!(matches!(
+            &analysis.type_definition(analysis.type_by_name("Pair").unwrap()).kind,
+            TypeDefinitionKind::Tuple(members) if members.len() == 2
+        ));
+        assert!(matches!(
+            &analysis.type_definition(analysis.type_by_name("Choice").unwrap()).kind,
+            TypeDefinitionKind::Union {
+                style: UnionStyle::Untagged,
+                alternatives,
+            } if alternatives.len() == 2
+        ));
+        assert!(analysis.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn validates_member_and_union_forms() {
+        let source = source(
+            concat!(
+                "type Mixed(a int, str); type Fields(a int, a str); ",
+                "type Duplicate(int | int); type Tags(A(int) | A(str)); ",
+                "type Hybrid(A(int) | str); type BadError(Error(str) | int); ",
+                "fn main() {}",
+            ),
+        );
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        let diagnostics = analysis.diagnostics.to_string();
+
+        for expected in [
+            "cannot mix named and unnamed members",
+            "duplicate struct member 'a'",
+            "duplicate untagged union alternative",
+            "duplicate union tag 'A'",
+            "tagged and untagged union alternatives cannot be mixed",
+            "Error must be the final union alternative",
+        ] {
+            assert!(diagnostics.contains(expected), "{diagnostics}");
+        }
+    }
+
+    #[test]
+    fn union_identity_ignores_order_but_preserves_explicit_nesting() {
+        let source = source(
+            concat!(
+                "fn first(value int | str) {} fn second(value str | int) {} ",
+                "fn nested(value (int | str) | bool) {} fn flat(value int | str | bool) {} ",
+                "fn main() {}",
+            ),
+        );
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        let parameter_type = |name| {
+            analysis
+                .function_signature(analysis.function_by_name(name).unwrap())
+                .parameters[0]
+                .ty
+        };
+
+        assert_eq!(parameter_type("first"), parameter_type("second"));
+        assert_ne!(parameter_type("nested"), parameter_type("flat"));
+        assert!(analysis.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn validates_referenced_storage_and_recursive_inline_layouts() {
+        let source = source(
+            concat!(
+                "type Node(next &Node); type Safe(items [Safe]); ",
+                "type Pair(int, int); type BadReference(pair &Pair, count &int); ",
+                "type A(b B); type B(A); type Link(C | int); type C(link Link); ",
+                "fn main() {}",
+            ),
+        );
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        let diagnostics = analysis.diagnostics.to_string();
+
+        assert_eq!(diagnostics.matches("referenced storage '&'").count(), 2);
+        for name in ["A", "B", "Link", "C"] {
+            assert!(
+                diagnostics.contains(&format!(
+                    "type '{name}' has an infinitely recursive inline layout"
+                )),
+                "{diagnostics}",
+            );
+        }
+        assert!(!diagnostics.contains("type 'Node' has an infinitely"));
+        assert!(!diagnostics.contains("type 'Safe' has an infinitely"));
+    }
+
+    #[test]
+    fn accepts_composed_tuple_map_keys_and_rejects_other_keys() {
+        let source = source(
+            concat!(
+                "type Inner(str, bool); type Key(int, Inner); type Object(value int); ",
+                "fn valid(table {Key: str}) {} ",
+                "fn invalidObject(table {Object: str}) {} ",
+                "fn invalidList(table {[int]: str}) {} ",
+                "fn invalidFloat(table {float: str}) {} fn main() {}",
+            ),
+        );
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        let diagnostics = analysis.diagnostics.to_string();
+
+        assert_eq!(
+            diagnostics
+                .matches("map key type must be int, str, bool, or an immutable tuple")
+                .count(),
+            3
+        );
     }
 
     #[test]

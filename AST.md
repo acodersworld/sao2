@@ -104,6 +104,20 @@ registered as intrinsics yet because their documented syntax is not admitted
 by the current primary-expression grammar; resolving that documented
 discrepancy is separate from this phase.
 
+Phase 3 resolves every type declaration into a nominal struct, tuple, or union
+definition. Definition records retain member AST nodes, resolved member types,
+tuple positions, and inline-versus-referenced struct storage. Structural type
+interning makes union alternative order irrelevant while explicit nested union
+nodes remain distinct.
+
+The same pass validates mixed member forms, duplicate fields, union alternative
+and tag uniqueness, tagged-versus-untagged form, and final-position `Error`.
+Referenced storage is accepted only for struct-valued members. A separate
+layout walk follows inline structs, tuples, and union payloads, while referenced
+struct members and containers terminate a layout path. Map keys are restricted
+to `int`, `str`, `bool`, and nominal tuples recursively composed only of those
+valid map-key types.
+
 The analysis still does not run from the compiler pipeline and performs no
 body name resolution or expression inference. Later milestone-3 phases
 populate those facts; phase 7 installs the analysis call between parsing and
