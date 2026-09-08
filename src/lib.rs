@@ -1,3 +1,7 @@
+// Walking skeleton: milestone 3 phase 1 establishes this representation;
+// phase 7 connects it to the compiler pipeline.
+#[allow(dead_code)]
+mod analysis;
 mod ast;
 mod c_emitter;
 mod cli;

@@ -73,3 +73,23 @@ remains responsible for:
 - loop context for `break` and `continue`, and switch coverage;
 - the remaining executable-entry-point validation currently performed at the
   compiler boundary.
+
+## Name-and-type analysis handoff
+
+`src/analysis.rs` owns semantic facts separately from this syntax tree. Its
+entry point takes the owning `SourceFile` and parsed `Program`, assigns stable
+typed identities to declarations and binding sites, and retains direct AST
+references and spans in its records. Binding identities are assigned in source
+order; they do not imply that a binding is visible before its initializer has
+been analyzed.
+
+Resolved language value types live in a small type table. Primitive types have
+canonical identities and later structural types are interned there. Analysis
+states distinguish a resolved value type from no-value, non-returning, error,
+and explicitly deferred results, so recovery and later flow-sensitive work
+cannot masquerade as successfully typed expressions. Type and expression
+annotations, diagnostics, and deferred obligations are all analysis-owned.
+
+Phase 1 does not run from the compiler pipeline and performs no name lookup or
+type inference. The later milestone-3 phases populate these structures; phase
+7 installs the analysis call between parsing and the temporary backend.
