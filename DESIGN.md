@@ -281,6 +281,12 @@ a callable, an unqualified call whose name denotes entries in both is ambiguous
 and must be diagnosed; the compiler does not silently prefer the value callable
 or the constructor.
 
+The special `Error(value)` union constructor also participates in call-target
+resolution. If a user function or nominal type is named `Error`, an unqualified
+`Error(...)` call is ambiguous and must be diagnosed rather than preferring the
+declared callable or the special constructor. A lexical binding still shadows
+callable lookup, and qualified tagged construction remains distinct.
+
 The program entry point has one of four forms:
 
 ```text

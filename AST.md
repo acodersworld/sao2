@@ -135,6 +135,27 @@ only lexical bindings, so lookup never falls through to a type or intrinsic.
 Member and index receivers are traversed, with member selection itself left for
 type inference.
 
+Phase 5 decodes literal payloads once and annotates ordinary expressions and
+inferred local bindings with `TypeState`. Integer annotations retain the parsed
+magnitude so unary minus can admit the signed 64-bit minimum without admitting
+that magnitude as a positive value. Floating-point literals retain their
+binary64 value and reject non-finite results.
+
+Expression inference applies the language's exact operand rules without C
+conversions or truthiness. It resolves primitive operations, comparisons,
+membership, indexing, struct fields, tuple positions, declared function calls,
+intrinsics, and the documented list, map, and string methods. Method calls are
+given explicit built-in identities for later lowering. Assignment targets carry
+their selected root, field, or indexed-element type separately from expression
+annotations so Phase 6 can propagate that expected type. Blocks and compatible
+`if` expressions retain their value type; statement-only and non-returning
+results remain distinct from language value types.
+
+Flow-sensitive `is`, `switch`, and postfix `?` work remains explicit through
+deferred records. Collection literals, constructors, qualified union tags, and
+`Error(...)` are traversed but remain deferred to Phase 6, which owns expected
+types, collection compatibility, constructor checking, and union injection.
+
 The analysis still does not run from the compiler pipeline and performs no
-expression inference. Later milestone-3 phases populate those facts; phase 7
-installs the analysis call between parsing and the temporary backend.
+expected-type propagation. Later milestone-3 phases populate those facts;
+phase 7 installs the analysis call between parsing and the temporary backend.

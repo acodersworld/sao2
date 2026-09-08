@@ -6,10 +6,11 @@
 //! callable targets throughout function bodies.
 
 use crate::ast::{
-    ArgumentKind, AssignmentOperator, AssignmentTarget, AssignmentTargetSuffixKind, Block,
-    Declaration, Expression, ExpressionBody, ExpressionBodyKind, ExpressionKind,
-    FunctionDeclaration, Identifier, Parameter, PrimitiveType, Program, Statement, StatementBody,
-    StatementBodyKind, StatementKind, Type, TypeDeclaration, TypeKind, TypeMember, TypeMemberKind,
+    ArgumentKind, AssignmentOperator, AssignmentTarget, AssignmentTargetSuffixKind, BinaryOperator,
+    Block, Declaration, Expression, ExpressionBody, ExpressionBodyKind, ExpressionKind,
+    FunctionDeclaration, Identifier, Member, Parameter, PrimitiveType, Program, Statement,
+    StatementBody, StatementBodyKind, StatementKind, Type, TypeDeclaration, TypeKind, TypeMember,
+    TypeMemberKind, UnaryOperator,
 };
 use crate::diagnostic::{Diagnostic, Diagnostics};
 use crate::source::{SourceFile, Span};
@@ -134,6 +135,7 @@ pub(crate) enum AstNode<'ast> {
     Type(&'ast Type),
     Statement(&'ast Statement),
     Expression(&'ast Expression),
+    AssignmentTarget(&'ast AssignmentTarget),
 }
 
 impl AstNode<'_> {
@@ -144,6 +146,7 @@ impl AstNode<'_> {
             Self::Type(ty) => ty.span,
             Self::Statement(statement) => statement.span,
             Self::Expression(expression) => expression.span,
+            Self::AssignmentTarget(target) => target.span,
         }
     }
 }
@@ -177,6 +180,10 @@ pub(crate) enum BindingAccess {
 pub(crate) enum NameResolution {
     Binding(BindingId),
     Callable(CallableId),
+    ErrorConstructor,
+    AmbiguousErrorConstructor {
+        declared: CallableId,
+    },
     AmbiguousCall {
         value: CallableId,
         constructor: TypeDeclarationId,
@@ -195,6 +202,12 @@ pub(crate) struct NameUse<'ast> {
 pub(crate) enum CallTarget {
     Binding(BindingId),
     Callable(CallableId),
+    Builtin(BuiltinMethod),
+    QualifiedConstructor(TypeDeclarationId),
+    ErrorConstructor,
+    AmbiguousErrorConstructor {
+        declared: CallableId,
+    },
     Ambiguous {
         value: CallableId,
         constructor: TypeDeclarationId,
@@ -208,6 +221,43 @@ pub(crate) struct CallResolution<'ast> {
     pub(crate) node: &'ast Expression,
     pub(crate) callee: &'ast Expression,
     pub(crate) target: CallTarget,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BuiltinMethod {
+    ListAppend,
+    ListRemoveIndex,
+    ListLen,
+    MapRemoveKey,
+    MapLen,
+    StrLen,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum LiteralValue {
+    Integer(u64),
+    Float(f64),
+    String(Box<[u8]>),
+    Character(u8),
+    Boolean(bool),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LiteralAnnotation<'ast> {
+    pub(crate) node: &'ast Expression,
+    pub(crate) value: LiteralValue,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BindingTypeAnnotation {
+    pub(crate) binding: BindingId,
+    pub(crate) state: TypeState,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AssignmentTargetAnnotation<'ast> {
+    pub(crate) node: &'ast AssignmentTarget,
+    pub(crate) state: TypeState,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -330,6 +380,7 @@ pub(crate) enum EntryPoint {
 pub(crate) enum DeferredReason {
     FlowDependentType,
     ExpectedType,
+    Constructor,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -399,6 +450,9 @@ pub(crate) struct Analysis<'source, 'ast> {
     pub(crate) bindings: Vec<BindingRecord<'ast>>,
     pub(crate) name_uses: Vec<NameUse<'ast>>,
     pub(crate) calls: Vec<CallResolution<'ast>>,
+    pub(crate) literals: Vec<LiteralAnnotation<'ast>>,
+    pub(crate) binding_types: Vec<BindingTypeAnnotation>,
+    pub(crate) assignment_targets: Vec<AssignmentTargetAnnotation<'ast>>,
     pub(crate) types: TypeTable,
     pub(crate) type_annotations: Vec<TypeAnnotation<'ast>>,
     pub(crate) expression_annotations: Vec<ExpressionAnnotation<'ast>>,
@@ -495,6 +549,38 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
         self.calls
             .iter()
             .find(|resolution| std::ptr::eq(resolution.node, node))
+    }
+
+    pub(crate) fn expression_annotation(
+        &self,
+        node: &'ast Expression,
+    ) -> Option<&ExpressionAnnotation<'ast>> {
+        self.expression_annotations
+            .iter()
+            .rev()
+            .find(|annotation| std::ptr::eq(annotation.node, node))
+    }
+
+    pub(crate) fn literal(&self, node: &'ast Expression) -> Option<&LiteralValue> {
+        self.literals
+            .iter()
+            .find_map(|literal| std::ptr::eq(literal.node, node).then_some(&literal.value))
+    }
+
+    pub(crate) fn binding_type(&self, id: BindingId) -> TypeState {
+        let binding = self.binding_types[id.0];
+        debug_assert_eq!(binding.binding, id);
+        binding.state
+    }
+
+    pub(crate) fn assignment_target(
+        &self,
+        node: &'ast AssignmentTarget,
+    ) -> Option<&AssignmentTargetAnnotation<'ast>> {
+        self.assignment_targets
+            .iter()
+            .rev()
+            .find(|annotation| std::ptr::eq(annotation.node, node))
     }
 
     pub(crate) fn callable_by_name(&self, name: &str) -> CallableResolution {
@@ -1091,6 +1177,33 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
         }
     }
 
+    fn infer_function_bodies(&mut self) {
+        let parameter_types = self
+            .function_signatures
+            .iter()
+            .flat_map(|signature| {
+                signature
+                    .parameters
+                    .iter()
+                    .map(|parameter| (parameter.binding, parameter.ty))
+            })
+            .collect::<Vec<_>>();
+        for (binding, state) in parameter_types {
+            self.binding_types[binding.0].state = state;
+        }
+        let functions: Vec<&'ast FunctionDeclaration> = self
+            .declarations
+            .iter()
+            .filter_map(|record| match record.node {
+                DeclarationNode::Function(function) => Some(function),
+                DeclarationNode::Type(_) => None,
+            })
+            .collect();
+        for function in functions {
+            TypeInferrer::new(self).infer_function(function);
+        }
+    }
+
     fn classify_entry_point(&self) -> EntryPoint {
         let mut mains = self.function_signatures.iter().filter(|signature| {
             self.identifier_text(signature.node.name.span) == "main"
@@ -1374,6 +1487,24 @@ impl<'analysis, 'source, 'ast> BodyResolver<'analysis, 'source, 'ast> {
 
     fn resolve_call_callee(&mut self, callee: &'ast Expression) -> CallTarget {
         let ExpressionKind::Identifier(identifier) = &callee.kind else {
+            if let ExpressionKind::Member {
+                value,
+                member: Member::Named(_),
+            } = &callee.kind
+                && let ExpressionKind::Identifier(root) = &value.kind
+            {
+                let name = self.analysis.identifier_text(root.span).to_owned();
+                if self.lookup(&name).is_none()
+                    && let Some(constructor) = self.analysis.type_by_name(&name)
+                {
+                    self.record_name(
+                        root,
+                        BindingAccess::Call,
+                        NameResolution::Callable(CallableId::Constructor(constructor)),
+                    );
+                    return CallTarget::QualifiedConstructor(constructor);
+                }
+            }
             self.resolve_expression(callee);
             return CallTarget::Expression;
         };
@@ -1383,6 +1514,18 @@ impl<'analysis, 'source, 'ast> BodyResolver<'analysis, 'source, 'ast> {
             return CallTarget::Binding(binding);
         }
         match self.analysis.callable_by_name(&name) {
+            CallableResolution::Found(callable) if name == "Error" => {
+                self.analysis.error(
+                    identifier.span,
+                    "call target 'Error' is ambiguous between a declared callable and the special error constructor",
+                );
+                self.record_name(
+                    identifier,
+                    BindingAccess::Call,
+                    NameResolution::AmbiguousErrorConstructor { declared: callable },
+                );
+                CallTarget::AmbiguousErrorConstructor { declared: callable }
+            }
             CallableResolution::Found(callable) => {
                 self.record_name(
                     identifier,
@@ -1406,8 +1549,17 @@ impl<'analysis, 'source, 'ast> BodyResolver<'analysis, 'source, 'ast> {
                 CallTarget::Ambiguous { value, constructor }
             }
             CallableResolution::Unknown => {
-                self.unknown(identifier, &name, BindingAccess::Call);
-                CallTarget::Unknown
+                if name == "Error" {
+                    self.record_name(
+                        identifier,
+                        BindingAccess::Call,
+                        NameResolution::ErrorConstructor,
+                    );
+                    CallTarget::ErrorConstructor
+                } else {
+                    self.unknown(identifier, &name, BindingAccess::Call);
+                    CallTarget::Unknown
+                }
             }
         }
     }
@@ -1491,6 +1643,1278 @@ impl<'analysis, 'source, 'ast> BodyResolver<'analysis, 'source, 'ast> {
     }
 }
 
+struct TypeInferrer<'analysis, 'source, 'ast> {
+    analysis: &'analysis mut Analysis<'source, 'ast>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Compatibility {
+    Match,
+    Deferred,
+    Invalid,
+}
+
+impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
+    fn new(analysis: &'analysis mut Analysis<'source, 'ast>) -> Self {
+        Self { analysis }
+    }
+
+    fn infer_function(&mut self, function: &'ast FunctionDeclaration) {
+        self.infer_block(&function.body);
+    }
+
+    fn infer_block(&mut self, block: &'ast Block) -> TypeState {
+        for statement in &block.statements {
+            self.infer_statement(statement);
+        }
+        block
+            .value
+            .as_ref()
+            .map_or(TypeState::NoValue, |value| self.infer_expression(value))
+    }
+
+    fn infer_statement(&mut self, statement: &'ast Statement) {
+        match &statement.kind {
+            StatementKind::Local { initializer, .. } => {
+                let state = match self.infer_expression(initializer) {
+                    TypeState::NoValue => self.analysis.error(
+                        initializer.span,
+                        "local initializer must produce a value",
+                    ),
+                    state => state,
+                };
+                let binding = self.analysis.statement_binding(statement);
+                self.analysis.binding_types[binding.0].state = state;
+            }
+            StatementKind::Assignment { target, value, .. } => {
+                self.infer_assignment_target(target);
+                self.infer_expression(value);
+            }
+            StatementKind::Expression(expression) => {
+                self.infer_expression(expression);
+            }
+            StatementKind::Return(value) => {
+                if let Some(value) = value {
+                    self.infer_expression(value);
+                }
+            }
+            StatementKind::Break | StatementKind::Continue => {}
+            StatementKind::If {
+                branches,
+                else_body,
+            } => {
+                for branch in branches {
+                    let condition = self.infer_expression(&branch.condition);
+                    self.require_bool(condition, branch.condition.span);
+                    self.infer_statement_body(&branch.body);
+                }
+                if let Some(body) = else_body {
+                    self.infer_statement_body(body);
+                }
+            }
+            StatementKind::While { condition, body } => {
+                let condition_state = self.infer_expression(condition);
+                self.require_bool(condition_state, condition.span);
+                self.infer_statement_body(body);
+            }
+            StatementKind::For { iterable, body, .. } => {
+                let iterable_state = self.infer_expression(iterable);
+                let binding = self.analysis.statement_binding(statement);
+                self.analysis.binding_types[binding.0].state =
+                    self.iteration_binding_type(iterable_state, iterable);
+                self.infer_statement_body(body);
+            }
+            StatementKind::Switch {
+                value,
+                arms,
+                else_body,
+            } => {
+                let value_state = self.infer_expression(value);
+                if !matches!(value_state, TypeState::Error | TypeState::Never) {
+                    self.analysis.defer(
+                        AstNode::Statement(statement),
+                        DeferredReason::FlowDependentType,
+                    );
+                }
+                for arm in arms {
+                    self.infer_statement_body(&arm.body);
+                }
+                if let Some(body) = else_body {
+                    self.infer_statement_body(body);
+                }
+            }
+            StatementKind::Block(block) => {
+                self.infer_block(block);
+            }
+        }
+    }
+
+    fn infer_statement_body(&mut self, body: &'ast StatementBody) {
+        match &body.kind {
+            StatementBodyKind::Block(block) => {
+                self.infer_block(block);
+            }
+            StatementBodyKind::Statement(statement) => self.infer_statement(statement),
+        }
+    }
+
+    fn infer_assignment_target(&mut self, target: &'ast AssignmentTarget) -> TypeState {
+        let mut state = self.infer_identifier(&target.root);
+        for suffix in &target.suffixes {
+            state = match &suffix.kind {
+                AssignmentTargetSuffixKind::Index(index) => {
+                    let index_state = self.infer_expression(index);
+                    self.infer_target_index(target, state, index_state, suffix.span)
+                }
+                AssignmentTargetSuffixKind::Member(member) => {
+                    self.infer_target_member(target, state, *member)
+                }
+            };
+        }
+        self.analysis.assignment_targets.push(AssignmentTargetAnnotation {
+            node: target,
+            state,
+        });
+        state
+    }
+
+    fn infer_target_index(
+        &mut self,
+        target: &'ast AssignmentTarget,
+        value_state: TypeState,
+        index_state: TypeState,
+        span: Span,
+    ) -> TypeState {
+        let (TypeState::Resolved(value_type), TypeState::Resolved(index_type)) =
+            (value_state, index_state)
+        else {
+            return self.combine_target_states(target, value_state, index_state);
+        };
+        let int = self.analysis.types.primitive(PrimitiveType::Int);
+        match self.analysis.types.get(value_type).clone() {
+            ResolvedType::List(element) if index_type == int => TypeState::Resolved(element),
+            ResolvedType::Map { key, value } if index_type == key => TypeState::Resolved(value),
+            _ => self.analysis.error(
+                span,
+                "index assignment is not defined for these operand types",
+            ),
+        }
+    }
+
+    fn infer_target_member(
+        &mut self,
+        target: &'ast AssignmentTarget,
+        value_state: TypeState,
+        member: Member,
+    ) -> TypeState {
+        let TypeState::Resolved(value_type) = value_state else {
+            return self.non_value_target(target, value_state);
+        };
+        match self.analysis.types.get(value_type).clone() {
+            ResolvedType::Nominal(declaration) => {
+                let kind = self.analysis.type_definition(declaration).kind.clone();
+                match (kind, member) {
+                    (TypeDefinitionKind::Struct(members), Member::Named(name)) => {
+                        let spelling = self.analysis.identifier_text(name.span).to_owned();
+                        members
+                            .iter()
+                            .find(|field| {
+                                self.analysis.identifier_text(field.name.span) == spelling.as_str()
+                            })
+                            .map_or_else(
+                                || {
+                                    self.analysis.error(
+                                        name.span,
+                                        format!("struct has no member '{spelling}'"),
+                                    )
+                                },
+                                |field| field.ty,
+                            )
+                    }
+                    (TypeDefinitionKind::Tuple(members), Member::TupleIndex(span)) => self
+                        .parse_tuple_index(span)
+                        .and_then(|index| members.get(index))
+                        .map_or_else(
+                            || self.analysis.error(span, "tuple member index is out of range"),
+                            |field| field.ty,
+                        ),
+                    (TypeDefinitionKind::Union { .. }, _) => {
+                        self.defer_target(target, DeferredReason::FlowDependentType)
+                    }
+                    (TypeDefinitionKind::Invalid, _) => TypeState::Error,
+                    (TypeDefinitionKind::Struct(_), Member::TupleIndex(span)) => self
+                        .analysis
+                        .error(span, "struct members must be accessed by name"),
+                    (TypeDefinitionKind::Tuple(_), Member::Named(name)) => self
+                        .analysis
+                        .error(name.span, "tuple members must be accessed by position"),
+                }
+            }
+            ResolvedType::Union(_) => {
+                self.defer_target(target, DeferredReason::FlowDependentType)
+            }
+            _ => self.analysis.error(
+                target.span,
+                "assignment receiver has no assignable member",
+            ),
+        }
+    }
+
+    fn infer_expression(&mut self, expression: &'ast Expression) -> TypeState {
+        let state = match &expression.kind {
+            ExpressionKind::Identifier(identifier) => self.infer_identifier(identifier),
+            ExpressionKind::Integer => self.infer_integer(expression, i64::MAX as u128),
+            ExpressionKind::Float => self.infer_float(expression),
+            ExpressionKind::String(value) => {
+                self.analysis.literals.push(LiteralAnnotation {
+                    node: expression,
+                    value: LiteralValue::String(value.clone().into_boxed_slice()),
+                });
+                self.primitive(PrimitiveType::Str)
+            }
+            ExpressionKind::Character(value) => {
+                self.analysis.literals.push(LiteralAnnotation {
+                    node: expression,
+                    value: LiteralValue::Character(*value),
+                });
+                self.primitive(PrimitiveType::Char)
+            }
+            ExpressionKind::Boolean(value) => {
+                self.analysis.literals.push(LiteralAnnotation {
+                    node: expression,
+                    value: LiteralValue::Boolean(*value),
+                });
+                self.primitive(PrimitiveType::Bool)
+            }
+            ExpressionKind::Parenthesized(inner) => self.infer_expression(inner),
+            ExpressionKind::List(elements) => {
+                let children = elements
+                    .iter()
+                    .map(|element| self.infer_expression(element))
+                    .collect::<Vec<_>>();
+                if children.contains(&TypeState::Error) {
+                    TypeState::Error
+                } else if children.contains(&TypeState::Never) {
+                    TypeState::Never
+                } else if children.contains(&TypeState::NoValue) {
+                    self.analysis.error(
+                        expression.span,
+                        "list elements must produce values",
+                    )
+                } else {
+                    self.defer_expression(expression, DeferredReason::ExpectedType)
+                }
+            }
+            ExpressionKind::Map(entries) => {
+                let mut failed = false;
+                let mut never = false;
+                for entry in entries {
+                    for state in [
+                        self.infer_expression(&entry.key),
+                        self.infer_expression(&entry.value),
+                    ] {
+                        failed |= state == TypeState::Error;
+                        never |= state == TypeState::Never;
+                        if state == TypeState::NoValue {
+                            self.analysis.error(
+                                expression.span,
+                                "map keys and values must produce values",
+                            );
+                            failed = true;
+                        }
+                    }
+                }
+                if failed {
+                    TypeState::Error
+                } else if never {
+                    TypeState::Never
+                } else {
+                    self.defer_expression(expression, DeferredReason::ExpectedType)
+                }
+            }
+            ExpressionKind::TypedEmptyList(_) | ExpressionKind::TypedEmptyMap(_) => {
+                self.defer_expression(expression, DeferredReason::ExpectedType)
+            }
+            ExpressionKind::Block(block) => self.infer_block(block),
+            ExpressionKind::If {
+                branches,
+                else_branch,
+            } => self.infer_if_expression(expression, branches, else_branch),
+            ExpressionKind::Unary {
+                operator,
+                operator_span,
+                operand,
+            } => self.infer_unary(expression, *operator, *operator_span, operand),
+            ExpressionKind::Binary {
+                left,
+                operator,
+                operator_span,
+                right,
+            } => self.infer_binary(
+                expression,
+                left,
+                *operator,
+                *operator_span,
+                right,
+            ),
+            ExpressionKind::Is { value, .. } => {
+                let value = self.infer_expression(value);
+                self.flow_dependent(expression, value)
+            }
+            ExpressionKind::Call { callee, arguments } => {
+                self.infer_call(expression, callee, arguments)
+            }
+            ExpressionKind::Index { value, index } => {
+                self.infer_index(expression, value, index)
+            }
+            ExpressionKind::Member { value, member } => {
+                self.infer_member(expression, value, *member)
+            }
+            ExpressionKind::Try { value, .. } => {
+                let value = self.infer_expression(value);
+                self.flow_dependent(expression, value)
+            }
+        };
+        self.analysis.annotate_expression(expression, state);
+        state
+    }
+
+    fn infer_identifier(&self, identifier: &'ast Identifier) -> TypeState {
+        match self.analysis.name_use(identifier).map(|name_use| name_use.resolution) {
+            Some(NameResolution::Binding(binding)) => self.analysis.binding_type(binding),
+            Some(NameResolution::Callable(_)
+            | NameResolution::ErrorConstructor
+            | NameResolution::AmbiguousErrorConstructor { .. }
+            | NameResolution::AmbiguousCall { .. }
+            | NameResolution::Unknown)
+            | None => TypeState::Error,
+        }
+    }
+
+    fn infer_integer(&mut self, expression: &'ast Expression, maximum: u128) -> TypeState {
+        let text = self.analysis.identifier_text(expression.span);
+        let (radix, digits) = if let Some(digits) = text.strip_prefix("0x") {
+            (16, digits)
+        } else if let Some(digits) = text.strip_prefix("0b") {
+            (2, digits)
+        } else {
+            (10, text)
+        };
+        let digits = digits.replace('_', "");
+        match u128::from_str_radix(&digits, radix) {
+            Ok(value) if value <= maximum => {
+                self.analysis.literals.push(LiteralAnnotation {
+                    node: expression,
+                    value: LiteralValue::Integer(value as u64),
+                });
+                self.primitive(PrimitiveType::Int)
+            }
+            _ => self.analysis.error(
+                expression.span,
+                "integer literal is outside the signed 64-bit range",
+            ),
+        }
+    }
+
+    fn infer_float(&mut self, expression: &'ast Expression) -> TypeState {
+        let text = self
+            .analysis
+            .identifier_text(expression.span)
+            .replace('_', "");
+        match text.parse::<f64>() {
+            Ok(value) if value.is_finite() => {
+                self.analysis.literals.push(LiteralAnnotation {
+                    node: expression,
+                    value: LiteralValue::Float(value),
+                });
+                self.primitive(PrimitiveType::Float)
+            }
+            _ => self.analysis.error(
+                expression.span,
+                "floating-point literal is not a finite binary64 value",
+            ),
+        }
+    }
+
+    fn infer_unary(
+        &mut self,
+        expression: &'ast Expression,
+        operator: UnaryOperator,
+        operator_span: Span,
+        operand: &'ast Expression,
+    ) -> TypeState {
+        if operator == UnaryOperator::Minus && matches!(&operand.kind, ExpressionKind::Integer) {
+            let state = self.infer_integer(operand, (i64::MAX as u128) + 1);
+            self.analysis.annotate_expression(operand, state);
+            return state;
+        }
+        let operand_state = self.infer_expression(operand);
+        let TypeState::Resolved(operand_type) = operand_state else {
+            return self.non_value_operand(expression, operand_state);
+        };
+        let valid = match operator {
+            UnaryOperator::LogicalNot => self.is_primitive(operand_type, PrimitiveType::Bool),
+            UnaryOperator::BitwiseNot => self.is_primitive(operand_type, PrimitiveType::Int),
+            UnaryOperator::Plus | UnaryOperator::Minus => {
+                self.is_numeric(operand_type)
+            }
+        };
+        if valid {
+            TypeState::Resolved(operand_type)
+        } else {
+            self.analysis.error(
+                operator_span,
+                "unary operator is not defined for this operand type",
+            )
+        }
+    }
+
+    fn infer_binary(
+        &mut self,
+        expression: &'ast Expression,
+        left: &'ast Expression,
+        operator: BinaryOperator,
+        operator_span: Span,
+        right: &'ast Expression,
+    ) -> TypeState {
+        let left_state = self.infer_expression(left);
+        let right_state = self.infer_expression(right);
+        let (TypeState::Resolved(left_type), TypeState::Resolved(right_type)) =
+            (left_state, right_state)
+        else {
+            return self.combine_operand_states(expression, left_state, right_state);
+        };
+        let bool_type = self.analysis.types.primitive(PrimitiveType::Bool);
+        let int_type = self.analysis.types.primitive(PrimitiveType::Int);
+        let result = match operator {
+            BinaryOperator::LogicalOr | BinaryOperator::LogicalAnd
+                if left_type == bool_type && right_type == bool_type =>
+            {
+                Some(bool_type)
+            }
+            BinaryOperator::BitwiseOr
+            | BinaryOperator::BitwiseXor
+            | BinaryOperator::BitwiseAnd
+            | BinaryOperator::ShiftLeft
+            | BinaryOperator::ShiftRight
+                if left_type == int_type && right_type == int_type =>
+            {
+                Some(int_type)
+            }
+            BinaryOperator::Add
+            | BinaryOperator::Subtract
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+                if left_type == right_type && self.is_numeric(left_type) =>
+            {
+                Some(left_type)
+            }
+            BinaryOperator::Remainder if left_type == int_type && right_type == int_type => {
+                Some(int_type)
+            }
+            BinaryOperator::Equal | BinaryOperator::NotEqual
+                if left_type == right_type && self.supports_equality(left_type) =>
+            {
+                Some(bool_type)
+            }
+            BinaryOperator::Less
+            | BinaryOperator::LessEqual
+            | BinaryOperator::Greater
+            | BinaryOperator::GreaterEqual
+                if left_type == right_type && self.supports_ordering(left_type) =>
+            {
+                Some(bool_type)
+            }
+            BinaryOperator::In if self.membership_matches(left_type, right_type) => {
+                Some(bool_type)
+            }
+            _ => None,
+        };
+        result.map_or_else(
+            || {
+                self.analysis.error(
+                    operator_span,
+                    "binary operator is not defined for these operand types",
+                )
+            },
+            TypeState::Resolved,
+        )
+    }
+
+    fn infer_if_expression(
+        &mut self,
+        expression: &'ast Expression,
+        branches: &'ast [crate::ast::ConditionalExpressionBranch],
+        else_branch: &'ast ExpressionBody,
+    ) -> TypeState {
+        let mut states = Vec::with_capacity(branches.len() + 1);
+        let mut invalid_condition = false;
+        let mut deferred_condition = false;
+        for branch in branches {
+            let condition = self.infer_expression(&branch.condition);
+            deferred_condition |= matches!(condition, TypeState::Deferred(_));
+            invalid_condition |= !self.require_bool(condition, branch.condition.span);
+            states.push(self.infer_expression_body(&branch.body));
+        }
+        states.push(self.infer_expression_body(else_branch));
+        if invalid_condition || states.contains(&TypeState::Error) {
+            return TypeState::Error;
+        }
+        if deferred_condition
+            || states.iter().any(|state| matches!(state, TypeState::Deferred(_)))
+        {
+            return self.defer_expression(expression, DeferredReason::ExpectedType);
+        }
+        if states.contains(&TypeState::NoValue) {
+            return self.analysis.error(
+                expression.span,
+                "every if-expression branch must produce a value",
+            );
+        }
+        let resolved = states.iter().find_map(|state| match state {
+            TypeState::Resolved(ty) => Some(*ty),
+            _ => None,
+        });
+        match resolved {
+            None => TypeState::Never,
+            Some(expected)
+                if states.iter().all(|state| {
+                    *state == TypeState::Never || *state == TypeState::Resolved(expected)
+                }) => TypeState::Resolved(expected),
+            Some(_) => self.defer_expression(expression, DeferredReason::ExpectedType),
+        }
+    }
+
+    fn infer_expression_body(&mut self, body: &'ast ExpressionBody) -> TypeState {
+        match &body.kind {
+            ExpressionBodyKind::Block(block) => self.infer_block(block),
+            ExpressionBodyKind::Expression(expression) => self.infer_expression(expression),
+        }
+    }
+
+    fn infer_call(
+        &mut self,
+        expression: &'ast Expression,
+        callee: &'ast Expression,
+        arguments: &'ast [crate::ast::Argument],
+    ) -> TypeState {
+        let target = self
+            .analysis
+            .call_resolution(expression)
+            .map(|resolution| resolution.target)
+            .unwrap_or(CallTarget::Unknown);
+        match target {
+            CallTarget::Callable(CallableId::Function(function)) => {
+                self.infer_function_call(expression, function, arguments)
+            }
+            CallTarget::Callable(CallableId::Intrinsic(intrinsic)) => {
+                self.infer_intrinsic_call(expression, intrinsic, arguments)
+            }
+            CallTarget::Callable(CallableId::Constructor(_))
+            | CallTarget::QualifiedConstructor(_)
+            | CallTarget::ErrorConstructor => {
+                let states = self.infer_arguments(arguments);
+                if states.contains(&TypeState::Error) {
+                    TypeState::Error
+                } else if states.contains(&TypeState::Never) {
+                    TypeState::Never
+                } else {
+                    self.defer_expression(expression, DeferredReason::Constructor)
+                }
+            }
+            CallTarget::Binding(_) => {
+                self.infer_arguments(arguments);
+                self.analysis.error(callee.span, "value is not callable")
+            }
+            CallTarget::Expression => {
+                if let ExpressionKind::Member { value, member } = &callee.kind {
+                    self.infer_method_call(expression, value, *member, arguments)
+                } else {
+                    self.infer_expression(callee);
+                    self.infer_arguments(arguments);
+                    self.analysis.error(callee.span, "expression is not callable")
+                }
+            }
+            CallTarget::Builtin(_) => unreachable!("built-in targets are selected during inference"),
+            CallTarget::Ambiguous { .. }
+            | CallTarget::AmbiguousErrorConstructor { .. }
+            | CallTarget::Unknown => {
+                self.infer_arguments(arguments);
+                TypeState::Error
+            }
+        }
+    }
+
+    fn infer_function_call(
+        &mut self,
+        expression: &'ast Expression,
+        function: FunctionId,
+        arguments: &'ast [crate::ast::Argument],
+    ) -> TypeState {
+        let states = self.infer_arguments(arguments);
+        let (parameters, result) = {
+            let signature = self.analysis.function_signature(function);
+            (
+                signature
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.ty)
+                    .collect::<Vec<_>>(),
+                signature.result,
+            )
+        };
+        let mut failed = false;
+        let mut needs_expected_type = false;
+        for argument in arguments {
+            if matches!(&argument.kind, ArgumentKind::Named { .. }) {
+                self.analysis.error(
+                    argument.span,
+                    "named arguments are permitted only for struct constructors",
+                );
+                failed = true;
+            }
+        }
+        if states.len() != parameters.len() {
+            self.analysis.error(
+                expression.span,
+                format!(
+                    "function expects {} argument(s), but {} were provided",
+                    parameters.len(),
+                    states.len()
+                ),
+            );
+            failed = true;
+        }
+        for ((state, parameter), argument) in
+            states.iter().zip(parameters).zip(arguments.iter())
+        {
+            match self.argument_compatibility(*state, parameter, argument.span) {
+                Compatibility::Match => {}
+                Compatibility::Deferred => needs_expected_type = true,
+                Compatibility::Invalid => failed = true,
+            }
+        }
+        self.call_result(
+            expression,
+            &states,
+            failed,
+            needs_expected_type,
+            result,
+        )
+    }
+
+    fn infer_intrinsic_call(
+        &mut self,
+        expression: &'ast Expression,
+        intrinsic: IntrinsicId,
+        arguments: &'ast [crate::ast::Argument],
+    ) -> TypeState {
+        let states = self.infer_arguments(arguments);
+        let signature = self.analysis.intrinsic_signature(intrinsic).clone();
+        let mut failed = false;
+        let mut needs_expected_type = false;
+        for argument in arguments {
+            if matches!(&argument.kind, ArgumentKind::Named { .. }) {
+                self.analysis
+                    .error(argument.span, "intrinsics do not accept named arguments");
+                failed = true;
+            }
+        }
+        match signature.arguments {
+            IntrinsicArguments::OnePrintable => {
+                if states.len() != 1 {
+                    self.analysis
+                        .error(expression.span, "print expects exactly one argument");
+                    failed = true;
+                } else if let TypeState::Resolved(ty) = states[0]
+                    && !self.is_printable(ty, &mut Vec::new())
+                {
+                    self.analysis.error(
+                        arguments[0].span,
+                        "print argument must be a primitive or printable tuple",
+                    );
+                    failed = true;
+                }
+            }
+            IntrinsicArguments::ZeroOrOnePrintable => {
+                if states.len() > 1 {
+                    self.analysis
+                        .error(expression.span, "println expects zero or one argument");
+                    failed = true;
+                } else if let Some(TypeState::Resolved(ty)) = states.first()
+                    && !self.is_printable(*ty, &mut Vec::new())
+                {
+                    self.analysis.error(
+                        arguments[0].span,
+                        "println argument must be a primitive or printable tuple",
+                    );
+                    failed = true;
+                }
+            }
+            IntrinsicArguments::Exact(expected) => {
+                if states.len() != expected.len() {
+                    self.analysis.error(
+                        expression.span,
+                        format!(
+                            "intrinsic expects {} argument(s), but {} were provided",
+                            expected.len(),
+                            states.len()
+                        ),
+                    );
+                    failed = true;
+                }
+                for (state, expected) in states.iter().zip(expected.iter()) {
+                    match self.argument_compatibility(
+                        *state,
+                        TypeState::Resolved(*expected),
+                        expression.span,
+                    ) {
+                        Compatibility::Match => {}
+                        Compatibility::Deferred => needs_expected_type = true,
+                        Compatibility::Invalid => failed = true,
+                    }
+                }
+            }
+        }
+        self.call_result(
+            expression,
+            &states,
+            failed,
+            needs_expected_type,
+            signature.result,
+        )
+    }
+
+    fn infer_method_call(
+        &mut self,
+        expression: &'ast Expression,
+        receiver: &'ast Expression,
+        member: Member,
+        arguments: &'ast [crate::ast::Argument],
+    ) -> TypeState {
+        let receiver_state = self.infer_expression(receiver);
+        let states = self.infer_arguments(arguments);
+        let TypeState::Resolved(receiver_type) = receiver_state else {
+            return self.non_value_operand(expression, receiver_state);
+        };
+        let Member::Named(name) = member else {
+            return self.analysis.error(expression.span, "tuple member is not callable");
+        };
+        let spelling = self.analysis.identifier_text(name.span).to_owned();
+        let int = self.analysis.types.primitive(PrimitiveType::Int);
+        let method = match self.analysis.types.get(receiver_type).clone() {
+            ResolvedType::List(element) => match spelling.as_str() {
+                "append" => Some((BuiltinMethod::ListAppend, Some(element), TypeState::NoValue)),
+                "removeIndex" => Some((BuiltinMethod::ListRemoveIndex, Some(int), TypeState::NoValue)),
+                "len" => Some((BuiltinMethod::ListLen, None, TypeState::Resolved(int))),
+                _ => None,
+            },
+            ResolvedType::Map { key, .. } => match spelling.as_str() {
+                "removeKey" => Some((BuiltinMethod::MapRemoveKey, Some(key), TypeState::NoValue)),
+                "len" => Some((BuiltinMethod::MapLen, None, TypeState::Resolved(int))),
+                _ => None,
+            },
+            ResolvedType::Primitive(PrimitiveType::Str) if spelling == "len" => {
+                Some((BuiltinMethod::StrLen, None, TypeState::Resolved(int)))
+            }
+            _ => None,
+        };
+        let Some((method, expected, result)) = method else {
+            return self.analysis.error(
+                name.span,
+                format!("type has no built-in method '{spelling}'"),
+            );
+        };
+        if let Some(call) = self
+            .analysis
+            .calls
+            .iter_mut()
+            .find(|call| std::ptr::eq(call.node, expression))
+        {
+            call.target = CallTarget::Builtin(method);
+        }
+        let expected_count = usize::from(expected.is_some());
+        let mut failed = states.len() != expected_count;
+        let mut needs_expected_type = false;
+        if failed {
+            self.analysis.error(
+                expression.span,
+                format!(
+                    "method '{spelling}' expects {expected_count} argument(s), but {} were provided",
+                    states.len()
+                ),
+            );
+        }
+        for argument in arguments {
+            if matches!(&argument.kind, ArgumentKind::Named { .. }) {
+                self.analysis
+                    .error(argument.span, "built-in methods do not accept named arguments");
+                failed = true;
+            }
+        }
+        if let Some(expected) = expected
+            && let Some(state) = states.first()
+        {
+            match self.argument_compatibility(
+                *state,
+                TypeState::Resolved(expected),
+                arguments[0].span,
+            ) {
+                Compatibility::Match => {}
+                Compatibility::Deferred => needs_expected_type = true,
+                Compatibility::Invalid => failed = true,
+            }
+        }
+        self.call_result(
+            expression,
+            &states,
+            failed,
+            needs_expected_type,
+            result,
+        )
+    }
+
+    fn infer_arguments(&mut self, arguments: &'ast [crate::ast::Argument]) -> Vec<TypeState> {
+        arguments
+            .iter()
+            .map(|argument| match &argument.kind {
+                ArgumentKind::Positional(value) | ArgumentKind::Named { value, .. } => {
+                    self.infer_expression(value)
+                }
+            })
+            .collect()
+    }
+
+    fn call_result(
+        &mut self,
+        expression: &'ast Expression,
+        arguments: &[TypeState],
+        failed: bool,
+        needs_expected_type: bool,
+        result: TypeState,
+    ) -> TypeState {
+        if failed || arguments.contains(&TypeState::Error) {
+            TypeState::Error
+        } else if arguments.contains(&TypeState::Never) {
+            TypeState::Never
+        } else if needs_expected_type
+            || arguments
+            .iter()
+            .any(|state| matches!(state, TypeState::Deferred(_)))
+        {
+            self.defer_expression(expression, DeferredReason::ExpectedType)
+        } else {
+            result
+        }
+    }
+
+    fn argument_compatibility(
+        &mut self,
+        actual: TypeState,
+        expected: TypeState,
+        span: Span,
+    ) -> Compatibility {
+        match (actual, expected) {
+            (TypeState::Resolved(actual), TypeState::Resolved(expected)) if actual == expected => {
+                Compatibility::Match
+            }
+            (TypeState::Resolved(_), TypeState::Resolved(expected))
+                if self.is_union_type(expected) =>
+            {
+                Compatibility::Deferred
+            }
+            (TypeState::Error, _) | (_, TypeState::Error) | (TypeState::Never, _) => {
+                Compatibility::Match
+            }
+            (TypeState::Deferred(_), _) => Compatibility::Deferred,
+            (TypeState::NoValue, _) => {
+                self.analysis
+                    .error(span, "argument expression does not produce a value");
+                Compatibility::Invalid
+            }
+            _ => {
+                self.analysis
+                    .error(span, "argument type does not match parameter type");
+                Compatibility::Invalid
+            }
+        }
+    }
+
+    fn infer_index(
+        &mut self,
+        expression: &'ast Expression,
+        value: &'ast Expression,
+        index: &'ast Expression,
+    ) -> TypeState {
+        let value_state = self.infer_expression(value);
+        let index_state = self.infer_expression(index);
+        let (TypeState::Resolved(value_type), TypeState::Resolved(index_type)) =
+            (value_state, index_state)
+        else {
+            return self.combine_operand_states(expression, value_state, index_state);
+        };
+        let int = self.analysis.types.primitive(PrimitiveType::Int);
+        match self.analysis.types.get(value_type).clone() {
+            ResolvedType::List(element) if index_type == int => TypeState::Resolved(element),
+            ResolvedType::Map { key, value } if index_type == key => TypeState::Resolved(value),
+            ResolvedType::Primitive(PrimitiveType::Str) if index_type == int => {
+                self.primitive(PrimitiveType::Char)
+            }
+            _ => self.analysis.error(
+                expression.span,
+                "index operation is not defined for these operand types",
+            ),
+        }
+    }
+
+    fn infer_member(
+        &mut self,
+        expression: &'ast Expression,
+        value: &'ast Expression,
+        member: Member,
+    ) -> TypeState {
+        let value_state = self.infer_expression(value);
+        let TypeState::Resolved(value_type) = value_state else {
+            return self.non_value_operand(expression, value_state);
+        };
+        match self.analysis.types.get(value_type).clone() {
+            ResolvedType::Nominal(declaration) => {
+                let kind = self.analysis.type_definition(declaration).kind.clone();
+                match (kind, member) {
+                    (TypeDefinitionKind::Struct(members), Member::Named(name)) => {
+                        let spelling = self.analysis.identifier_text(name.span).to_owned();
+                        members
+                            .iter()
+                            .find(|field| {
+                                self.analysis.identifier_text(field.name.span) == spelling.as_str()
+                            })
+                            .map_or_else(
+                                || {
+                                    self.analysis.error(
+                                        name.span,
+                                        format!("struct has no member '{spelling}'"),
+                                    )
+                                },
+                                |field| field.ty,
+                            )
+                    }
+                    (TypeDefinitionKind::Tuple(members), Member::TupleIndex(span)) => {
+                        let index = self.parse_tuple_index(span);
+                        index
+                            .and_then(|index| members.get(index))
+                            .map_or_else(
+                                || self.analysis.error(span, "tuple member index is out of range"),
+                                |field| field.ty,
+                            )
+                    }
+                    (TypeDefinitionKind::Union { .. }, _) => {
+                        self.defer_expression(expression, DeferredReason::FlowDependentType)
+                    }
+                    (TypeDefinitionKind::Invalid, _) => TypeState::Error,
+                    (TypeDefinitionKind::Struct(_), Member::TupleIndex(span)) => self
+                        .analysis
+                        .error(span, "struct members must be accessed by name"),
+                    (TypeDefinitionKind::Tuple(_), Member::Named(name)) => self
+                        .analysis
+                        .error(name.span, "tuple members must be accessed by position"),
+                }
+            }
+            ResolvedType::List(_) => self.infer_method_member(
+                member,
+                &["append", "removeIndex", "len"],
+            ),
+            ResolvedType::Map { .. } => {
+                self.infer_method_member(member, &["removeKey", "len"])
+            }
+            ResolvedType::Primitive(PrimitiveType::Str) => {
+                self.infer_method_member(member, &["len"])
+            }
+            ResolvedType::Union(_) => {
+                self.defer_expression(expression, DeferredReason::FlowDependentType)
+            }
+            ResolvedType::Primitive(_) => self.analysis.error(
+                expression.span,
+                "primitive value has no accessible member",
+            ),
+        }
+    }
+
+    fn infer_method_member(&mut self, member: Member, methods: &[&str]) -> TypeState {
+        match member {
+            Member::Named(name) => {
+                let spelling = self.analysis.identifier_text(name.span).to_owned();
+                if methods.contains(&spelling.as_str()) {
+                    self.analysis.error(
+                        name.span,
+                        "container methods must be used as direct call targets",
+                    )
+                } else {
+                    self.analysis.error(
+                        name.span,
+                        format!("container has no member '{spelling}'"),
+                    )
+                }
+            }
+            Member::TupleIndex(span) => self
+                .analysis
+                .error(span, "container members must be accessed by name"),
+        }
+    }
+
+    fn iteration_binding_type(
+        &mut self,
+        state: TypeState,
+        iterable: &'ast Expression,
+    ) -> TypeState {
+        match state {
+            TypeState::Resolved(ty) => match self.analysis.types.get(ty).clone() {
+                ResolvedType::List(element) => TypeState::Resolved(element),
+                ResolvedType::Map { key, .. } => TypeState::Resolved(key),
+                _ => self
+                    .analysis
+                    .error(iterable.span, "for loop requires a list or map iterable"),
+            },
+            TypeState::Deferred(deferred) => TypeState::Deferred(deferred),
+            TypeState::NoValue => self.analysis.error(
+                iterable.span,
+                "for loop iterable must produce a value",
+            ),
+            other => other,
+        }
+    }
+
+    fn require_bool(&mut self, state: TypeState, span: Span) -> bool {
+        match state {
+            TypeState::Resolved(ty) if self.is_primitive(ty, PrimitiveType::Bool) => true,
+            TypeState::Error | TypeState::Never | TypeState::Deferred(_) => true,
+            _ => {
+                self.analysis.error(span, "condition must have type bool");
+                false
+            }
+        }
+    }
+
+    fn non_value_operand(
+        &mut self,
+        expression: &'ast Expression,
+        state: TypeState,
+    ) -> TypeState {
+        match state {
+            TypeState::Error => TypeState::Error,
+            TypeState::Never => TypeState::Never,
+            TypeState::Deferred(_) => {
+                self.defer_expression(expression, DeferredReason::FlowDependentType)
+            }
+            TypeState::NoValue => self.analysis.error(
+                expression.span,
+                "operand expression does not produce a value",
+            ),
+            TypeState::Resolved(_) => unreachable!(),
+        }
+    }
+
+    fn flow_dependent(
+        &mut self,
+        expression: &'ast Expression,
+        state: TypeState,
+    ) -> TypeState {
+        match state {
+            TypeState::Resolved(_) | TypeState::Deferred(_) => {
+                self.defer_expression(expression, DeferredReason::FlowDependentType)
+            }
+            other => self.non_value_operand(expression, other),
+        }
+    }
+
+    fn combine_operand_states(
+        &mut self,
+        expression: &'ast Expression,
+        left: TypeState,
+        right: TypeState,
+    ) -> TypeState {
+        if left == TypeState::Error || right == TypeState::Error {
+            TypeState::Error
+        } else if left == TypeState::Never || right == TypeState::Never {
+            TypeState::Never
+        } else if matches!(left, TypeState::Deferred(_))
+            || matches!(right, TypeState::Deferred(_))
+        {
+            self.defer_expression(expression, DeferredReason::FlowDependentType)
+        } else {
+            self.analysis.error(
+                expression.span,
+                "operator operand does not produce a value",
+            )
+        }
+    }
+
+    fn non_value_target(
+        &mut self,
+        target: &'ast AssignmentTarget,
+        state: TypeState,
+    ) -> TypeState {
+        match state {
+            TypeState::Error => TypeState::Error,
+            TypeState::Never => TypeState::Never,
+            TypeState::Deferred(deferred) => TypeState::Deferred(deferred),
+            TypeState::NoValue => self.analysis.error(
+                target.span,
+                "assignment receiver does not produce a value",
+            ),
+            TypeState::Resolved(_) => unreachable!(),
+        }
+    }
+
+    fn combine_target_states(
+        &mut self,
+        target: &'ast AssignmentTarget,
+        value: TypeState,
+        index: TypeState,
+    ) -> TypeState {
+        if value == TypeState::Error || index == TypeState::Error {
+            TypeState::Error
+        } else if value == TypeState::Never || index == TypeState::Never {
+            TypeState::Never
+        } else if let TypeState::Deferred(deferred) = value {
+            TypeState::Deferred(deferred)
+        } else if let TypeState::Deferred(deferred) = index {
+            TypeState::Deferred(deferred)
+        } else {
+            self.analysis.error(
+                target.span,
+                "assignment index does not produce a value",
+            )
+        }
+    }
+
+    fn defer_target(
+        &mut self,
+        target: &'ast AssignmentTarget,
+        reason: DeferredReason,
+    ) -> TypeState {
+        TypeState::Deferred(self.analysis.defer(AstNode::AssignmentTarget(target), reason))
+    }
+
+    fn defer_expression(
+        &mut self,
+        expression: &'ast Expression,
+        reason: DeferredReason,
+    ) -> TypeState {
+        TypeState::Deferred(self.analysis.defer(AstNode::Expression(expression), reason))
+    }
+
+    fn primitive(&self, primitive: PrimitiveType) -> TypeState {
+        TypeState::Resolved(self.analysis.types.primitive(primitive))
+    }
+
+    fn is_primitive(&self, ty: TypeId, primitive: PrimitiveType) -> bool {
+        ty == self.analysis.types.primitive(primitive)
+    }
+
+    fn is_numeric(&self, ty: TypeId) -> bool {
+        self.is_primitive(ty, PrimitiveType::Int)
+            || self.is_primitive(ty, PrimitiveType::Float)
+    }
+
+    fn supports_ordering(&self, ty: TypeId) -> bool {
+        matches!(
+            self.analysis.types.get(ty),
+            ResolvedType::Primitive(
+                PrimitiveType::Int
+                    | PrimitiveType::Float
+                    | PrimitiveType::Str
+                    | PrimitiveType::Char
+            )
+        )
+    }
+
+    fn supports_equality(&self, ty: TypeId) -> bool {
+        self.supports_equality_inner(ty, &mut Vec::new())
+    }
+
+    fn supports_equality_inner(
+        &self,
+        ty: TypeId,
+        visiting: &mut Vec<TypeDeclarationId>,
+    ) -> bool {
+        match self.analysis.types.get(ty) {
+            ResolvedType::Primitive(_) | ResolvedType::List(_) | ResolvedType::Map { .. } => true,
+            ResolvedType::Nominal(declaration) => {
+                if visiting.contains(declaration) {
+                    return false;
+                }
+                match &self.analysis.type_definition(*declaration).kind {
+                    TypeDefinitionKind::Struct(_) => true,
+                    TypeDefinitionKind::Tuple(members) => {
+                        visiting.push(*declaration);
+                        let comparable = members.iter().all(|member| {
+                            matches!(
+                                member.ty,
+                                TypeState::Resolved(member_type)
+                                    if self.supports_equality_inner(member_type, visiting)
+                            )
+                        });
+                        visiting.pop();
+                        comparable
+                    }
+                    TypeDefinitionKind::Union { .. } | TypeDefinitionKind::Invalid => false,
+                }
+            }
+            ResolvedType::Union(_) => false,
+        }
+    }
+
+    fn is_union_type(&self, ty: TypeId) -> bool {
+        match self.analysis.types.get(ty) {
+            ResolvedType::Union(_) => true,
+            ResolvedType::Nominal(declaration) => matches!(
+                &self.analysis.type_definition(*declaration).kind,
+                TypeDefinitionKind::Union { .. }
+            ),
+            _ => false,
+        }
+    }
+
+    fn membership_matches(&self, item: TypeId, container: TypeId) -> bool {
+        match self.analysis.types.get(container) {
+            ResolvedType::List(element) => item == *element,
+            ResolvedType::Map { key, .. } => item == *key,
+            _ => false,
+        }
+    }
+
+    fn is_printable(&self, ty: TypeId, visiting: &mut Vec<TypeDeclarationId>) -> bool {
+        match self.analysis.types.get(ty) {
+            ResolvedType::Primitive(_) => true,
+            ResolvedType::Nominal(declaration) => {
+                if visiting.contains(declaration) {
+                    return false;
+                }
+                let TypeDefinitionKind::Tuple(members) =
+                    &self.analysis.type_definition(*declaration).kind
+                else {
+                    return false;
+                };
+                visiting.push(*declaration);
+                let printable = members.iter().all(|member| {
+                    matches!(member.ty, TypeState::Resolved(ty) if self.is_printable(ty, visiting))
+                });
+                visiting.pop();
+                printable
+            }
+            ResolvedType::List(_) | ResolvedType::Map { .. } | ResolvedType::Union(_) => false,
+        }
+    }
+
+    fn parse_tuple_index(&self, span: Span) -> Option<usize> {
+        self.analysis
+            .identifier_text(span)
+            .replace('_', "")
+            .parse::<usize>()
+            .ok()
+    }
+}
+
 fn union_style(alternatives: &[UnionAlternative]) -> UnionStyle {
     if alternatives
         .iter()
@@ -1502,8 +2926,9 @@ fn union_style(alternatives: &[UnionAlternative]) -> UnionStyle {
     }
 }
 
-/// Creates the analysis result, collects top-level namespaces, and resolves all
-/// type definitions and function signatures before resolving function bodies.
+/// Creates the analysis result, resolves declarations and lexical bindings, and
+/// infers every expression type that does not require Phase 6 expected types or
+/// later flow-sensitive analysis.
 pub(crate) fn analyze<'source, 'ast>(
     source: &'source SourceFile,
     program: &'ast Program,
@@ -1539,6 +2964,12 @@ pub(crate) fn analyze<'source, 'ast>(
 
     let types = TypeTable::new();
     let str_type = types.primitive(PrimitiveType::Str);
+    let binding_types = (0..bindings.len())
+        .map(|index| BindingTypeAnnotation {
+            binding: BindingId(index),
+            state: TypeState::Error,
+        })
+        .collect();
     let mut analysis = Analysis {
         source,
         program,
@@ -1546,6 +2977,9 @@ pub(crate) fn analyze<'source, 'ast>(
         bindings,
         name_uses: Vec::new(),
         calls: Vec::new(),
+        literals: Vec::new(),
+        binding_types,
+        assignment_targets: Vec::new(),
         types,
         type_annotations: Vec::new(),
         expression_annotations: Vec::new(),
@@ -1585,6 +3019,7 @@ pub(crate) fn analyze<'source, 'ast>(
     analysis.validate_map_keys();
     analysis.validate_inline_layouts();
     analysis.resolve_function_bodies();
+    analysis.infer_function_bodies();
     analysis.entry_point = analysis.classify_entry_point();
     analysis
 }
@@ -1781,6 +3216,17 @@ mod tests {
         SourceFile::new(PathBuf::from("test.sao2"), text.to_owned())
     }
 
+    fn binding_named(analysis: &Analysis<'_, '_>, source: &SourceFile, name: &str) -> BindingId {
+        analysis
+            .bindings
+            .iter()
+            .find(|binding| {
+                &source.text[binding.span.start..binding.span.end] == name
+            })
+            .map(|binding| binding.id)
+            .unwrap()
+    }
+
     #[test]
     fn assigns_stable_typed_declaration_and_binding_identities() {
         let source = source(
@@ -1933,6 +3379,9 @@ mod tests {
             name_use.access == BindingAccess::Mutate
                 && name_use.resolution == NameResolution::Binding(BindingId(0))
         }));
+        let int = analysis.types.primitive(PrimitiveType::Int);
+        assert_eq!(analysis.assignment_targets[0].state, TypeState::Resolved(int));
+        assert_eq!(analysis.assignment_targets[1].state, TypeState::Resolved(int));
         let diagnostics = analysis.diagnostics.to_string();
         assert_eq!(diagnostics.matches("unknown value 'missing'").count(), 2);
         assert_eq!(diagnostics.matches("unknown value 'Build'").count(), 1);
@@ -1940,11 +3389,11 @@ mod tests {
 
     #[test]
     fn diagnoses_ambiguous_calls_without_choosing_a_namespace() {
-        let source = source(
+        let both_source = source(
             "type Both(int); fn Both() {} fn main() { Both(); }",
         );
-        let program = parser::parse(&source).unwrap();
-        let analysis = analyze(&source, &program);
+        let program = parser::parse(&both_source).unwrap();
+        let analysis = analyze(&both_source, &program);
         let function = analysis.function_by_name("Both").unwrap();
         let constructor = analysis.type_by_name("Both").unwrap();
 
@@ -1961,6 +3410,233 @@ mod tests {
                 .to_string()
                 .contains("call target 'Both' is ambiguous")
         );
+
+        let error_source = source("type Error(int); fn main() { Error(1); }");
+        let error_program = parser::parse(&error_source).unwrap();
+        let error_analysis = analyze(&error_source, &error_program);
+        assert!(matches!(
+            error_analysis.calls[0].target,
+            CallTarget::AmbiguousErrorConstructor { .. }
+        ));
+        assert!(
+            error_analysis
+                .diagnostics
+                .to_string()
+                .contains("declared callable and the special error constructor")
+        );
+    }
+
+    #[test]
+    fn decodes_numeric_literals_and_checks_binary64_boundaries() {
+        let source = source(
+            concat!(
+                "fn main() { ",
+                "decimal := 1_000; hexadecimal := 0xff; binary := 0b1010; ",
+                "fraction := 1.25e2; minimum := -9_223_372_036_854_775_808; ",
+                "too_large := 9_223_372_036_854_775_808; infinite := 1e400; ",
+                "}",
+            ),
+        );
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        let values = analysis
+            .literals
+            .iter()
+            .map(|literal| literal.value.clone())
+            .collect::<Vec<_>>();
+
+        for expected in [
+            LiteralValue::Integer(1_000),
+            LiteralValue::Integer(0xff),
+            LiteralValue::Integer(0b1010),
+            LiteralValue::Integer(1_u64 << 63),
+            LiteralValue::Float(125.0),
+        ] {
+            assert!(values.contains(&expected), "{values:?}");
+        }
+        let diagnostics = analysis.diagnostics.to_string();
+        assert!(diagnostics.contains("integer literal is outside the signed 64-bit range"));
+        assert!(diagnostics.contains("floating-point literal is not a finite binary64 value"));
+        assert!(matches!(
+            analysis.binding_type(binding_named(&analysis, &source, "minimum")),
+            TypeState::Resolved(ty)
+                if ty == analysis.types.primitive(PrimitiveType::Int)
+        ));
+    }
+
+    #[test]
+    fn infers_operators_indexes_members_and_container_methods() {
+        let source = source(
+            concat!(
+                "type Record(value int); type Pair(int, str); ",
+                "fn inspect(a int, b int, f float, ok bool, text str, xs [int], ",
+                "table {str: int}, record Record, pair Pair) { ",
+                "sum := a + b; quotient := f / f; logic := ok && true; ",
+                "comparison := text < \"z\"; bits := a << b; ",
+                "item := xs[a]; mapped := table[text]; character := text[a]; ",
+                "field := record.value; second := pair.1; ",
+                "list_length := xs.len(); map_length := table.len(); string_length := text.len(); ",
+                "xs.append(a); xs.removeIndex(a); table.removeKey(text); ",
+                "} fn main() {}",
+            ),
+        );
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        let int = analysis.types.primitive(PrimitiveType::Int);
+        let float = analysis.types.primitive(PrimitiveType::Float);
+        let bool = analysis.types.primitive(PrimitiveType::Bool);
+        let str_type = analysis.types.primitive(PrimitiveType::Str);
+        let char_type = analysis.types.primitive(PrimitiveType::Char);
+
+        for name in [
+            "sum",
+            "bits",
+            "item",
+            "mapped",
+            "field",
+            "list_length",
+            "map_length",
+            "string_length",
+        ] {
+            assert_eq!(
+                analysis.binding_type(binding_named(&analysis, &source, name)),
+                TypeState::Resolved(int),
+                "{name}",
+            );
+        }
+        assert_eq!(
+            analysis.binding_type(binding_named(&analysis, &source, "quotient")),
+            TypeState::Resolved(float)
+        );
+        for name in ["logic", "comparison"] {
+            assert_eq!(
+                analysis.binding_type(binding_named(&analysis, &source, name)),
+                TypeState::Resolved(bool)
+            );
+        }
+        assert_eq!(
+            analysis.binding_type(binding_named(&analysis, &source, "character")),
+            TypeState::Resolved(char_type)
+        );
+        assert_eq!(
+            analysis.binding_type(binding_named(&analysis, &source, "second")),
+            TypeState::Resolved(str_type)
+        );
+        assert_eq!(
+            analysis
+                .calls
+                .iter()
+                .filter(|call| matches!(call.target, CallTarget::Builtin(_)))
+                .count(),
+            6
+        );
+        assert!(analysis.diagnostics.is_empty(), "{}", analysis.diagnostics);
+    }
+
+    #[test]
+    fn uses_declared_recursive_and_intrinsic_call_results() {
+        let source = source(
+            concat!(
+                "fn recurse(value int) int { recurse(value) } ",
+                "fn main() { result := recurse(1); print(result); panic(\"stop\"); }",
+            ),
+        );
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        let int = analysis.types.primitive(PrimitiveType::Int);
+        let states = analysis
+            .calls
+            .iter()
+            .map(|call| {
+                (
+                    &source.text[call.callee.span.start..call.callee.span.end],
+                    analysis.expression_annotation(call.node).unwrap().state,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            states,
+            vec![
+                ("recurse", TypeState::Resolved(int)),
+                ("recurse", TypeState::Resolved(int)),
+                ("print", TypeState::NoValue),
+                ("panic", TypeState::Never),
+            ]
+        );
+        assert_eq!(
+            analysis.binding_type(binding_named(&analysis, &source, "result")),
+            TypeState::Resolved(int)
+        );
+        assert!(analysis.diagnostics.is_empty(), "{}", analysis.diagnostics);
+    }
+
+    #[test]
+    fn rejects_invalid_operand_argument_index_and_member_types() {
+        let source = source(
+            concat!(
+                "fn takes(value int) bool { true } ",
+                "fn main() { ",
+                "mixed := 1 + 1.0; truthy := 1 && true; ordered := true < false; ",
+                "bad_index := \"x\"[true]; takes(\"x\"); println(1, 2); ",
+                "member := 1.missing; ",
+                "}",
+            ),
+        );
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        let diagnostics = analysis.diagnostics.to_string();
+
+        for expected in [
+            "binary operator is not defined for these operand types",
+            "index operation is not defined for these operand types",
+            "argument type does not match parameter type",
+            "println expects zero or one argument",
+            "primitive value has no accessible member",
+        ] {
+            assert!(diagnostics.contains(expected), "{diagnostics}");
+        }
+    }
+
+    #[test]
+    fn infers_blocks_and_if_expressions_and_retains_deferred_work() {
+        let source = source(
+            concat!(
+                "type Choice(A(int) | B(str)); type Any(int | str); ",
+                "fn accept(input Any) {} ",
+                "fn inspect(flag bool, value int | str) { ",
+                "same := if flag: 1 else: 2; block_value := { local := 1; local }; ",
+                "tested := value is int; tried := value?; pending := [1, 2]; ",
+                "tagged := Choice.A(1); failed := Error(\"message\"); ",
+                "} fn main() { accept(1); }",
+            ),
+        );
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        let int = analysis.types.primitive(PrimitiveType::Int);
+
+        for name in ["same", "block_value"] {
+            assert_eq!(
+                analysis.binding_type(binding_named(&analysis, &source, name)),
+                TypeState::Resolved(int)
+            );
+        }
+        for name in ["tested", "tried", "pending", "tagged", "failed"] {
+            assert!(matches!(
+                analysis.binding_type(binding_named(&analysis, &source, name)),
+                TypeState::Deferred(_)
+            ));
+        }
+        assert!(analysis.deferred.iter().any(|deferred| {
+            deferred.reason == DeferredReason::FlowDependentType
+        }));
+        assert!(analysis.deferred.iter().any(|deferred| {
+            deferred.reason == DeferredReason::ExpectedType
+        }));
+        assert!(analysis.deferred.iter().any(|deferred| {
+            deferred.reason == DeferredReason::Constructor
+        }));
+        assert!(analysis.diagnostics.is_empty(), "{}", analysis.diagnostics);
     }
 
     #[test]
@@ -2003,7 +3679,10 @@ mod tests {
 
         assert_eq!(analysis.deferred[0].id, deferred);
         assert_eq!(analysis.deferred[0].node.span(), initializer.span);
-        assert_eq!(analysis.expression_annotations[0].state, TypeState::Deferred(deferred));
+        assert_eq!(
+            analysis.expression_annotations.last().unwrap().state,
+            TypeState::Deferred(deferred)
+        );
         assert_eq!(error, TypeState::Error);
         assert_eq!(analysis.diagnostics.len(), 1);
         assert!(analysis.diagnostics.to_string().contains("example analysis error"));
