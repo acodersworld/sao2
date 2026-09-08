@@ -118,7 +118,23 @@ struct members and containers terminate a layout path. Map keys are restricted
 to `int`, `str`, `bool`, and nominal tuples recursively composed only of those
 valid map-key types.
 
+Phase 4 resolves function bodies with lexical binding stacks. Parameters,
+locals, and iteration variables retain stable binding identities and declared
+mutability. Every identifier use records its binding or callable identity plus
+read, direct-write, receiver-mutation, compound, or call access for later
+semantic checks. Local
+initializers are walked before their new binding is introduced, so same-scope
+shadowing retains access to the previous declaration.
+
+Braced bodies introduce lexical scopes. Colon-form bodies do not introduce a
+brace scope, while a temporary loop environment limits an iteration binding to
+its body without hiding colon-body locals from the surrounding lexical scope.
+Direct call targets distinguish functions, constructors, intrinsics, visible
+bindings, ambiguous namespace matches, and unknown names. Assignment roots use
+only lexical bindings, so lookup never falls through to a type or intrinsic.
+Member and index receivers are traversed, with member selection itself left for
+type inference.
+
 The analysis still does not run from the compiler pipeline and performs no
-body name resolution or expression inference. Later milestone-3 phases
-populate those facts; phase 7 installs the analysis call between parsing and
-the temporary backend.
+expression inference. Later milestone-3 phases populate those facts; phase 7
+installs the analysis call between parsing and the temporary backend.

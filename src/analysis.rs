@@ -2,14 +2,14 @@
 //!
 //! This module establishes the analysis boundary and stable identities without
 //! adding semantic data to the parser AST. It collects top-level names, resolves
-//! type definitions, and resolves function signatures before later phases
-//! analyze declaration bodies.
+//! type definitions and function signatures, then resolves lexical bindings and
+//! callable targets throughout function bodies.
 
 use crate::ast::{
-    AssignmentTarget, AssignmentTargetSuffixKind, Block, Declaration, Expression,
-    ExpressionBody, ExpressionBodyKind, ExpressionKind, FunctionDeclaration, Parameter,
-    PrimitiveType, Program, Statement, StatementBody, StatementBodyKind, StatementKind, Type,
-    TypeDeclaration, TypeKind, TypeMember, TypeMemberKind,
+    ArgumentKind, AssignmentOperator, AssignmentTarget, AssignmentTargetSuffixKind, Block,
+    Declaration, Expression, ExpressionBody, ExpressionBodyKind, ExpressionKind,
+    FunctionDeclaration, Identifier, Parameter, PrimitiveType, Program, Statement, StatementBody,
+    StatementBodyKind, StatementKind, Type, TypeDeclaration, TypeKind, TypeMember, TypeMemberKind,
 };
 use crate::diagnostic::{Diagnostic, Diagnostics};
 use crate::source::{SourceFile, Span};
@@ -160,6 +160,54 @@ pub(crate) struct BindingRecord<'ast> {
     pub(crate) id: BindingId,
     pub(crate) node: BindingNode<'ast>,
     pub(crate) span: Span,
+    pub(crate) mutable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BindingAccess {
+    Read,
+    Write,
+    ReadWrite,
+    Mutate,
+    ReadMutate,
+    Call,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NameResolution {
+    Binding(BindingId),
+    Callable(CallableId),
+    AmbiguousCall {
+        value: CallableId,
+        constructor: TypeDeclarationId,
+    },
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NameUse<'ast> {
+    pub(crate) node: &'ast Identifier,
+    pub(crate) access: BindingAccess,
+    pub(crate) resolution: NameResolution,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CallTarget {
+    Binding(BindingId),
+    Callable(CallableId),
+    Ambiguous {
+        value: CallableId,
+        constructor: TypeDeclarationId,
+    },
+    Expression,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CallResolution<'ast> {
+    pub(crate) node: &'ast Expression,
+    pub(crate) callee: &'ast Expression,
+    pub(crate) target: CallTarget,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -349,6 +397,8 @@ pub(crate) struct Analysis<'source, 'ast> {
     pub(crate) program: &'ast Program,
     pub(crate) declarations: Vec<DeclarationRecord<'ast>>,
     pub(crate) bindings: Vec<BindingRecord<'ast>>,
+    pub(crate) name_uses: Vec<NameUse<'ast>>,
+    pub(crate) calls: Vec<CallResolution<'ast>>,
     pub(crate) types: TypeTable,
     pub(crate) type_annotations: Vec<TypeAnnotation<'ast>>,
     pub(crate) expression_annotations: Vec<ExpressionAnnotation<'ast>>,
@@ -424,6 +474,27 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
             .iter()
             .find(|signature| signature.id == id)
             .expect("every intrinsic identity has a registered signature")
+    }
+
+    pub(crate) fn binding(&self, id: BindingId) -> &BindingRecord<'ast> {
+        let binding = &self.bindings[id.0];
+        debug_assert_eq!(binding.id, id);
+        binding
+    }
+
+    pub(crate) fn name_use(&self, node: &'ast Identifier) -> Option<&NameUse<'ast>> {
+        self.name_uses
+            .iter()
+            .find(|name_use| std::ptr::eq(name_use.node, node))
+    }
+
+    pub(crate) fn call_resolution(
+        &self,
+        node: &'ast Expression,
+    ) -> Option<&CallResolution<'ast>> {
+        self.calls
+            .iter()
+            .find(|resolution| std::ptr::eq(resolution.node, node))
     }
 
     pub(crate) fn callable_by_name(&self, name: &str) -> CallableResolution {
@@ -992,6 +1063,34 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
             .expect("every parameter receives a binding identity during the syntax census")
     }
 
+    fn statement_binding(&self, statement: &'ast Statement) -> BindingId {
+        self.bindings
+            .iter()
+            .find_map(|record| match record.node {
+                BindingNode::Local(candidate) | BindingNode::Loop(candidate)
+                    if std::ptr::eq(candidate, statement) =>
+                {
+                    Some(record.id)
+                }
+                _ => None,
+            })
+            .expect("every local and loop binding receives an identity during the syntax census")
+    }
+
+    fn resolve_function_bodies(&mut self) {
+        let functions: Vec<&'ast FunctionDeclaration> = self
+            .declarations
+            .iter()
+            .filter_map(|record| match record.node {
+                DeclarationNode::Function(function) => Some(function),
+                DeclarationNode::Type(_) => None,
+            })
+            .collect::<Vec<_>>();
+        for function in functions {
+            BodyResolver::new(self).resolve_function(function);
+        }
+    }
+
     fn classify_entry_point(&self) -> EntryPoint {
         let mut mains = self.function_signatures.iter().filter(|signature| {
             self.identifier_text(signature.node.name.span) == "main"
@@ -1041,6 +1140,357 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
     }
 }
 
+#[derive(Debug)]
+struct Scope {
+    bindings: Vec<(Box<str>, BindingId)>,
+    accepts_locals: bool,
+}
+
+impl Scope {
+    fn lexical() -> Self {
+        Self {
+            bindings: Vec::new(),
+            accepts_locals: true,
+        }
+    }
+
+    fn loop_binding(name: Box<str>, binding: BindingId) -> Self {
+        Self {
+            bindings: vec![(name, binding)],
+            accepts_locals: false,
+        }
+    }
+}
+
+struct BodyResolver<'analysis, 'source, 'ast> {
+    analysis: &'analysis mut Analysis<'source, 'ast>,
+    scopes: Vec<Scope>,
+}
+
+impl<'analysis, 'source, 'ast> BodyResolver<'analysis, 'source, 'ast> {
+    fn new(analysis: &'analysis mut Analysis<'source, 'ast>) -> Self {
+        Self {
+            analysis,
+            scopes: Vec::new(),
+        }
+    }
+
+    fn resolve_function(&mut self, function: &'ast FunctionDeclaration) {
+        self.scopes.push(Scope::lexical());
+        for parameter in &function.parameters {
+            let name = self.analysis.identifier_text(parameter.name.span).to_owned();
+            let binding = self.analysis.parameter_binding(parameter);
+            let scope = self.scopes.last_mut().unwrap();
+            if !scope
+                .bindings
+                .iter()
+                .any(|(existing, _)| existing.as_ref() == name.as_str())
+            {
+                scope.bindings.push((name.into_boxed_str(), binding));
+            }
+        }
+        self.resolve_block(&function.body);
+        self.scopes.pop();
+    }
+
+    fn resolve_block(&mut self, block: &'ast Block) {
+        self.scopes.push(Scope::lexical());
+        for statement in &block.statements {
+            self.resolve_statement(statement);
+        }
+        if let Some(value) = &block.value {
+            self.resolve_expression(value);
+        }
+        self.scopes.pop();
+    }
+
+    fn resolve_statement(&mut self, statement: &'ast Statement) {
+        match &statement.kind {
+            StatementKind::Local {
+                name, initializer, ..
+            } => {
+                self.resolve_expression(initializer);
+                let binding = self.analysis.statement_binding(statement);
+                self.declare_local(name, binding);
+            }
+            StatementKind::Assignment {
+                target,
+                operator,
+                value,
+                ..
+            } => {
+                self.resolve_assignment_target(target, *operator);
+                self.resolve_expression(value);
+            }
+            StatementKind::Expression(expression) => self.resolve_expression(expression),
+            StatementKind::Return(value) => {
+                if let Some(value) = value {
+                    self.resolve_expression(value);
+                }
+            }
+            StatementKind::Break | StatementKind::Continue => {}
+            StatementKind::If {
+                branches,
+                else_body,
+            } => {
+                for branch in branches {
+                    self.resolve_expression(&branch.condition);
+                    self.resolve_statement_body(&branch.body);
+                }
+                if let Some(body) = else_body {
+                    self.resolve_statement_body(body);
+                }
+            }
+            StatementKind::While { condition, body } => {
+                self.resolve_expression(condition);
+                self.resolve_statement_body(body);
+            }
+            StatementKind::For {
+                binding,
+                iterable,
+                body,
+            } => {
+                self.resolve_expression(iterable);
+                let id = self.analysis.statement_binding(statement);
+                let name = self.analysis.identifier_text(binding.span).to_owned();
+                self.scopes
+                    .push(Scope::loop_binding(name.into_boxed_str(), id));
+                self.resolve_statement_body(body);
+                self.scopes.pop();
+            }
+            StatementKind::Switch {
+                value,
+                arms,
+                else_body,
+            } => {
+                self.resolve_expression(value);
+                for arm in arms {
+                    self.resolve_statement_body(&arm.body);
+                }
+                if let Some(body) = else_body {
+                    self.resolve_statement_body(body);
+                }
+            }
+            StatementKind::Block(block) => self.resolve_block(block),
+        }
+    }
+
+    fn resolve_statement_body(&mut self, body: &'ast StatementBody) {
+        match &body.kind {
+            StatementBodyKind::Block(block) => self.resolve_block(block),
+            StatementBodyKind::Statement(statement) => self.resolve_statement(statement),
+        }
+    }
+
+    fn resolve_assignment_target(
+        &mut self,
+        target: &'ast AssignmentTarget,
+        operator: AssignmentOperator,
+    ) {
+        let access = match (operator, target.suffixes.is_empty()) {
+            (AssignmentOperator::Assign, true) => BindingAccess::Write,
+            (AssignmentOperator::Assign, false) => BindingAccess::Mutate,
+            (_, true) => BindingAccess::ReadWrite,
+            (_, false) => BindingAccess::ReadMutate,
+        };
+        self.resolve_binding_name(&target.root, access);
+        for suffix in &target.suffixes {
+            if let AssignmentTargetSuffixKind::Index(index) = &suffix.kind {
+                self.resolve_expression(index);
+            }
+        }
+    }
+
+    fn resolve_expression(&mut self, expression: &'ast Expression) {
+        match &expression.kind {
+            ExpressionKind::Identifier(identifier) => {
+                self.resolve_value_name(identifier, BindingAccess::Read);
+            }
+            ExpressionKind::Integer
+            | ExpressionKind::Float
+            | ExpressionKind::String(_)
+            | ExpressionKind::Character(_)
+            | ExpressionKind::Boolean(_)
+            | ExpressionKind::TypedEmptyList(_)
+            | ExpressionKind::TypedEmptyMap(_) => {}
+            ExpressionKind::Parenthesized(inner)
+            | ExpressionKind::Unary { operand: inner, .. }
+            | ExpressionKind::Try { value: inner, .. } => self.resolve_expression(inner),
+            ExpressionKind::List(elements) => {
+                for element in elements {
+                    self.resolve_expression(element);
+                }
+            }
+            ExpressionKind::Map(entries) => {
+                for entry in entries {
+                    self.resolve_expression(&entry.key);
+                    self.resolve_expression(&entry.value);
+                }
+            }
+            ExpressionKind::Block(block) => self.resolve_block(block),
+            ExpressionKind::If {
+                branches,
+                else_branch,
+            } => {
+                for branch in branches {
+                    self.resolve_expression(&branch.condition);
+                    self.resolve_expression_body(&branch.body);
+                }
+                self.resolve_expression_body(else_branch);
+            }
+            ExpressionKind::Binary { left, right, .. } => {
+                self.resolve_expression(left);
+                self.resolve_expression(right);
+            }
+            ExpressionKind::Is { value, .. } => self.resolve_expression(value),
+            ExpressionKind::Call { callee, arguments } => {
+                let target = self.resolve_call_callee(callee);
+                self.analysis.calls.push(CallResolution {
+                    node: expression,
+                    callee,
+                    target,
+                });
+                for argument in arguments {
+                    match &argument.kind {
+                        ArgumentKind::Positional(value)
+                        | ArgumentKind::Named { value, .. } => self.resolve_expression(value),
+                    }
+                }
+            }
+            ExpressionKind::Index { value, index } => {
+                self.resolve_expression(value);
+                self.resolve_expression(index);
+            }
+            ExpressionKind::Member { value, .. } => self.resolve_expression(value),
+        }
+    }
+
+    fn resolve_expression_body(&mut self, body: &'ast ExpressionBody) {
+        match &body.kind {
+            ExpressionBodyKind::Block(block) => self.resolve_block(block),
+            ExpressionBodyKind::Expression(expression) => self.resolve_expression(expression),
+        }
+    }
+
+    fn resolve_call_callee(&mut self, callee: &'ast Expression) -> CallTarget {
+        let ExpressionKind::Identifier(identifier) = &callee.kind else {
+            self.resolve_expression(callee);
+            return CallTarget::Expression;
+        };
+        let name = self.analysis.identifier_text(identifier.span).to_owned();
+        if let Some(binding) = self.lookup(&name) {
+            self.record_name(identifier, BindingAccess::Call, NameResolution::Binding(binding));
+            return CallTarget::Binding(binding);
+        }
+        match self.analysis.callable_by_name(&name) {
+            CallableResolution::Found(callable) => {
+                self.record_name(
+                    identifier,
+                    BindingAccess::Call,
+                    NameResolution::Callable(callable),
+                );
+                CallTarget::Callable(callable)
+            }
+            CallableResolution::Ambiguous { value, constructor } => {
+                self.analysis.error(
+                    identifier.span,
+                    format!(
+                        "call target '{name}' is ambiguous between a value declaration and a type constructor"
+                    ),
+                );
+                self.record_name(
+                    identifier,
+                    BindingAccess::Call,
+                    NameResolution::AmbiguousCall { value, constructor },
+                );
+                CallTarget::Ambiguous { value, constructor }
+            }
+            CallableResolution::Unknown => {
+                self.unknown(identifier, &name, BindingAccess::Call);
+                CallTarget::Unknown
+            }
+        }
+    }
+
+    fn resolve_value_name(&mut self, identifier: &'ast Identifier, access: BindingAccess) {
+        let name = self.analysis.identifier_text(identifier.span).to_owned();
+        if let Some(binding) = self.lookup(&name) {
+            self.record_name(identifier, access, NameResolution::Binding(binding));
+            return;
+        }
+        if let Some(function) = self.analysis.function_by_name(&name) {
+            let callable = CallableId::Function(function);
+            self.analysis.error(
+                identifier.span,
+                format!("function '{name}' can only be used as a direct call target"),
+            );
+            self.record_name(identifier, access, NameResolution::Callable(callable));
+        } else if let Some(intrinsic) = self.analysis.intrinsic_by_name(&name) {
+            let callable = CallableId::Intrinsic(intrinsic);
+            self.analysis.error(
+                identifier.span,
+                format!("intrinsic '{name}' can only be used as a direct call target"),
+            );
+            self.record_name(identifier, access, NameResolution::Callable(callable));
+        } else {
+            self.unknown(identifier, &name, access);
+        }
+    }
+
+    fn resolve_binding_name(&mut self, identifier: &'ast Identifier, access: BindingAccess) {
+        let name = self.analysis.identifier_text(identifier.span).to_owned();
+        if let Some(binding) = self.lookup(&name) {
+            self.record_name(identifier, access, NameResolution::Binding(binding));
+        } else {
+            self.unknown(identifier, &name, access);
+        }
+    }
+
+    fn unknown(&mut self, identifier: &'ast Identifier, name: &str, access: BindingAccess) {
+        self.analysis
+            .error(identifier.span, format!("unknown value '{name}'"));
+        self.record_name(identifier, access, NameResolution::Unknown);
+    }
+
+    fn record_name(
+        &mut self,
+        identifier: &'ast Identifier,
+        access: BindingAccess,
+        resolution: NameResolution,
+    ) {
+        self.analysis.name_uses.push(NameUse {
+            node: identifier,
+            access,
+            resolution,
+        });
+    }
+
+    fn lookup(&self, name: &str) -> Option<BindingId> {
+        self.scopes.iter().rev().find_map(|scope| {
+            scope
+                .bindings
+                .iter()
+                .rev()
+                .find_map(|(candidate, binding)| (candidate.as_ref() == name).then_some(*binding))
+        })
+    }
+
+    fn declare_local(&mut self, identifier: &'ast Identifier, binding: BindingId) {
+        let name = self
+            .analysis
+            .identifier_text(identifier.span)
+            .to_owned()
+            .into_boxed_str();
+        self.scopes
+            .iter_mut()
+            .rev()
+            .find(|scope| scope.accepts_locals)
+            .expect("a function body always has a lexical scope")
+            .bindings
+            .push((name, binding));
+    }
+}
+
 fn union_style(alternatives: &[UnionAlternative]) -> UnionStyle {
     if alternatives
         .iter()
@@ -1053,7 +1503,7 @@ fn union_style(alternatives: &[UnionAlternative]) -> UnionStyle {
 }
 
 /// Creates the analysis result, collects top-level namespaces, and resolves all
-/// type definitions and function signatures before function bodies are considered.
+/// type definitions and function signatures before resolving function bodies.
 pub(crate) fn analyze<'source, 'ast>(
     source: &'source SourceFile,
     program: &'ast Program,
@@ -1094,6 +1544,8 @@ pub(crate) fn analyze<'source, 'ast>(
         program,
         declarations,
         bindings,
+        name_uses: Vec::new(),
+        calls: Vec::new(),
         types,
         type_annotations: Vec::new(),
         expression_annotations: Vec::new(),
@@ -1132,6 +1584,7 @@ pub(crate) fn analyze<'source, 'ast>(
     analysis.validate_referenced_storage();
     analysis.validate_map_keys();
     analysis.validate_inline_layouts();
+    analysis.resolve_function_bodies();
     analysis.entry_point = analysis.classify_entry_point();
     analysis
 }
@@ -1140,6 +1593,14 @@ fn push_binding<'ast>(bindings: &mut Vec<BindingRecord<'ast>>, node: BindingNode
     bindings.push(BindingRecord {
         id: BindingId(bindings.len()),
         span: node.span(),
+        mutable: match node {
+            BindingNode::Parameter(parameter) => parameter.mutable,
+            BindingNode::Local(statement) => match &statement.kind {
+                StatementKind::Local { mutable, .. } => *mutable,
+                _ => unreachable!("local binding must point to a local statement"),
+            },
+            BindingNode::Loop(_) => false,
+        },
         node,
     });
 }
@@ -1360,6 +1821,145 @@ mod tests {
                 .map(|binding| &source.text[binding.span.start..binding.span.end])
                 .collect::<Vec<_>>(),
             vec!["arg", "x", "item", "y"]
+        );
+    }
+
+    #[test]
+    fn resolves_initializers_before_same_scope_shadowing() {
+        let source = source(
+            concat!(
+                "fn main(seed int) { ",
+                "value := seed; value := value; ",
+                "{ value := value; value; } value; ",
+                "}",
+            ),
+        );
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        let uses = analysis
+            .name_uses
+            .iter()
+            .map(|name_use| {
+                (
+                    &source.text[name_use.node.span.start..name_use.node.span.end],
+                    name_use.resolution,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            uses,
+            vec![
+                ("seed", NameResolution::Binding(BindingId(0))),
+                ("value", NameResolution::Binding(BindingId(1))),
+                ("value", NameResolution::Binding(BindingId(2))),
+                ("value", NameResolution::Binding(BindingId(3))),
+                ("value", NameResolution::Binding(BindingId(2))),
+            ]
+        );
+        assert!(analysis.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn respects_brace_colon_and_loop_binding_visibility() {
+        let source = source(
+            concat!(
+                "fn main(items [int]) { ",
+                "for item in items: seen := item; seen; item; ",
+                "if true: leaked := seen; leaked; ",
+                "if true { hidden := seen; } hidden; ",
+                "}",
+            ),
+        );
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        let diagnostics = analysis.diagnostics.to_string();
+        let resolutions = analysis
+            .name_uses
+            .iter()
+            .map(|name_use| {
+                (
+                    &source.text[name_use.node.span.start..name_use.node.span.end],
+                    name_use.resolution,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(resolutions.contains(&("items", NameResolution::Binding(BindingId(0)))));
+        assert!(resolutions.contains(&("item", NameResolution::Binding(BindingId(1)))));
+        assert!(resolutions.contains(&("seen", NameResolution::Binding(BindingId(2)))));
+        assert!(resolutions.contains(&("leaked", NameResolution::Binding(BindingId(3)))));
+        assert_eq!(diagnostics.matches("unknown value 'item'").count(), 1);
+        assert_eq!(diagnostics.matches("unknown value 'hidden'").count(), 1);
+    }
+
+    #[test]
+    fn resolves_assignment_accesses_call_targets_and_member_receivers() {
+        let source = source(
+            concat!(
+                "type Build(int); fn helper() {} ",
+                "fn main(var target int) { ",
+                "target = target; target += target; helper(); Build(1); print(target); ",
+                "target(); target.member; target.member = target; ",
+                "missing = target; missing(); Build = target; ",
+                "}",
+            ),
+        );
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        let helper = analysis.function_by_name("helper").unwrap();
+        let build = analysis.type_by_name("Build").unwrap();
+
+        assert!(analysis.bindings[0].mutable);
+        assert_eq!(
+            analysis.calls.iter().map(|call| call.target).collect::<Vec<_>>(),
+            vec![
+                CallTarget::Callable(CallableId::Function(helper)),
+                CallTarget::Callable(CallableId::Constructor(build)),
+                CallTarget::Callable(CallableId::Intrinsic(IntrinsicId::Print)),
+                CallTarget::Binding(BindingId(0)),
+                CallTarget::Unknown,
+            ]
+        );
+        assert!(analysis.name_uses.iter().any(|name_use| {
+            name_use.access == BindingAccess::Write
+                && name_use.resolution == NameResolution::Binding(BindingId(0))
+        }));
+        assert!(analysis.name_uses.iter().any(|name_use| {
+            name_use.access == BindingAccess::ReadWrite
+                && name_use.resolution == NameResolution::Binding(BindingId(0))
+        }));
+        assert!(analysis.name_uses.iter().any(|name_use| {
+            name_use.access == BindingAccess::Mutate
+                && name_use.resolution == NameResolution::Binding(BindingId(0))
+        }));
+        let diagnostics = analysis.diagnostics.to_string();
+        assert_eq!(diagnostics.matches("unknown value 'missing'").count(), 2);
+        assert_eq!(diagnostics.matches("unknown value 'Build'").count(), 1);
+    }
+
+    #[test]
+    fn diagnoses_ambiguous_calls_without_choosing_a_namespace() {
+        let source = source(
+            "type Both(int); fn Both() {} fn main() { Both(); }",
+        );
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        let function = analysis.function_by_name("Both").unwrap();
+        let constructor = analysis.type_by_name("Both").unwrap();
+
+        assert_eq!(
+            analysis.calls[0].target,
+            CallTarget::Ambiguous {
+                value: CallableId::Function(function),
+                constructor,
+            }
+        );
+        assert!(
+            analysis
+                .diagnostics
+                .to_string()
+                .contains("call target 'Both' is ambiguous")
         );
     }
 

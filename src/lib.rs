@@ -1,4 +1,4 @@
-// Walking skeleton: milestone 3 phases 1-3 establish analysis, signatures, and types;
+// Walking skeleton: milestone 3 phases 1-4 establish names, scopes, and types;
 // phase 7 connects the result to the compiler pipeline.
 #[allow(dead_code)]
 mod analysis;
