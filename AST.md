@@ -90,6 +90,21 @@ and explicitly deferred results, so recovery and later flow-sensitive work
 cannot masquerade as successfully typed expressions. Type and expression
 annotations, diagnostics, and deferred obligations are all analysis-owned.
 
-Phase 1 does not run from the compiler pipeline and performs no name lookup or
-type inference. The later milestone-3 phases populate these structures; phase
-7 installs the analysis call between parsing and the temporary backend.
+Phase 2 adds source-order-independent top-level collection with separate type
+and value namespaces. It resolves every function parameter and return type
+against the complete type namespace, records parameter binding identities, and
+registers `print`, `println`, and `panic` with explicit intrinsic rules. The
+result also classifies the existing four-form executable entry point and can
+distinguish function, constructor, and intrinsic names in call position.
+
+Name collisions follow the rule recorded in `DESIGN.md`: intrinsic names are
+reserved in the value namespace, while a call matching both a type and a value
+callable is explicitly ambiguous. Primitive conversion calls are not
+registered as intrinsics yet because their documented syntax is not admitted
+by the current primary-expression grammar; resolving that documented
+discrepancy is separate from this phase.
+
+The analysis still does not run from the compiler pipeline and performs no
+body name resolution or expression inference. Later milestone-3 phases
+populate those facts; phase 7 installs the analysis call between parsing and
+the temporary backend.

@@ -274,6 +274,13 @@ matter, and direct and mutual recursion are allowed. Arguments are evaluated
 from left to right. Default and variadic parameters are not initially
 supported. Every path through a value-returning function must return a value.
 
+Compiler intrinsic names occupy the value namespace and cannot be redeclared
+as functions. A type may share a name with a function or intrinsic because type
+and value names use separate namespaces. Since both namespaces can contribute
+a callable, an unqualified call whose name denotes entries in both is ambiguous
+and must be diagnosed; the compiler does not silently prefer the value callable
+or the constructor.
+
 The program entry point has one of four forms:
 
 ```text
