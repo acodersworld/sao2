@@ -2,8 +2,8 @@
 //!
 //! This module establishes the analysis boundary and stable identities without
 //! adding semantic data to the parser AST. It collects top-level names, resolves
-//! type definitions and function signatures, then resolves lexical bindings and
-//! callable targets throughout function bodies.
+//! type definitions and function signatures, resolves lexical bindings and
+//! callable targets, and records expression types and constructor choices.
 
 use crate::ast::{
     ArgumentKind, AssignmentOperator, AssignmentTarget, AssignmentTargetSuffixKind, BinaryOperator,
@@ -260,6 +260,40 @@ pub(crate) struct AssignmentTargetAnnotation<'ast> {
     pub(crate) state: TypeState,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ConstructorKind {
+    Struct {
+        declaration: TypeDeclarationId,
+        argument_members: Box<[usize]>,
+    },
+    Tuple(TypeDeclarationId),
+    Union {
+        declaration: TypeDeclarationId,
+        alternative: UnionAlternative,
+    },
+    TaggedUnion {
+        declaration: TypeDeclarationId,
+        alternative: UnionAlternative,
+    },
+    Error {
+        union_type: TypeId,
+        alternative: UnionAlternative,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ConstructorResolution<'ast> {
+    pub(crate) node: &'ast Expression,
+    pub(crate) kind: ConstructorKind,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct UnionInjection<'ast> {
+    pub(crate) node: &'ast Expression,
+    pub(crate) union_type: TypeId,
+    pub(crate) alternative: UnionAlternative,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TypeAnnotation<'ast> {
     pub(crate) node: &'ast Type,
@@ -388,6 +422,7 @@ pub(crate) struct DeferredAnalysis<'ast> {
     pub(crate) id: DeferredId,
     pub(crate) node: AstNode<'ast>,
     pub(crate) reason: DeferredReason,
+    pub(crate) resolved: bool,
 }
 
 #[derive(Debug)]
@@ -453,6 +488,8 @@ pub(crate) struct Analysis<'source, 'ast> {
     pub(crate) literals: Vec<LiteralAnnotation<'ast>>,
     pub(crate) binding_types: Vec<BindingTypeAnnotation>,
     pub(crate) assignment_targets: Vec<AssignmentTargetAnnotation<'ast>>,
+    pub(crate) constructors: Vec<ConstructorResolution<'ast>>,
+    pub(crate) union_injections: Vec<UnionInjection<'ast>>,
     pub(crate) types: TypeTable,
     pub(crate) type_annotations: Vec<TypeAnnotation<'ast>>,
     pub(crate) expression_annotations: Vec<ExpressionAnnotation<'ast>>,
@@ -483,7 +520,12 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
         reason: DeferredReason,
     ) -> DeferredId {
         let id = DeferredId(self.deferred.len());
-        self.deferred.push(DeferredAnalysis { id, node, reason });
+        self.deferred.push(DeferredAnalysis {
+            id,
+            node,
+            reason,
+            resolved: false,
+        });
         id
     }
 
@@ -1201,6 +1243,22 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
             .collect();
         for function in functions {
             TypeInferrer::new(self).infer_function(function);
+        }
+    }
+
+    fn resolve_expected_types(&mut self) {
+        let functions = self
+            .function_signatures
+            .iter()
+            .map(|signature| (signature.node, signature.result))
+            .collect::<Vec<_>>();
+        for (function, result) in functions {
+            let expected = match result {
+                TypeState::Resolved(ty) => Some(ty),
+                _ => None,
+            };
+            ExpectedTypeResolver::new(self, result)
+                .resolve_block(&function.body, expected);
         }
     }
 
@@ -2915,6 +2973,1529 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
     }
 }
 
+struct ExpectedTypeResolver<'analysis, 'source, 'ast> {
+    analysis: &'analysis mut Analysis<'source, 'ast>,
+    function_result: TypeState,
+}
+
+impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
+    fn new(analysis: &'analysis mut Analysis<'source, 'ast>, function_result: TypeState) -> Self {
+        Self {
+            analysis,
+            function_result,
+        }
+    }
+
+    fn resolve_block(&mut self, block: &'ast Block, expected: Option<TypeId>) -> TypeState {
+        for statement in &block.statements {
+            self.resolve_statement(statement);
+        }
+        block.value.as_ref().map_or(TypeState::NoValue, |value| {
+            self.resolve_expression(value, expected)
+        })
+    }
+
+    fn resolve_statement(&mut self, statement: &'ast Statement) {
+        match &statement.kind {
+            StatementKind::Local { initializer, .. } => {
+                let state = self.resolve_expression(initializer, None);
+                let binding = self.analysis.statement_binding(statement);
+                self.analysis.binding_types[binding.0].state = state;
+            }
+            StatementKind::Assignment {
+                target,
+                operator,
+                operator_span,
+                value,
+            } => {
+                let target_state = self.resolve_assignment_target(target);
+                let expected = match target_state {
+                    TypeState::Resolved(ty) => Some(ty),
+                    _ => None,
+                };
+                let value_state = self.resolve_expression(value, expected);
+                self.validate_assignment(*operator, *operator_span, target_state, value_state);
+            }
+            StatementKind::Expression(expression) => {
+                self.resolve_expression(expression, None);
+            }
+            StatementKind::Return(value) => {
+                if let Some(value) = value {
+                    let expected = match self.function_result {
+                        TypeState::Resolved(ty) => Some(ty),
+                        _ => None,
+                    };
+                    self.resolve_expression(value, expected);
+                }
+            }
+            StatementKind::Break | StatementKind::Continue => {}
+            StatementKind::If {
+                branches,
+                else_body,
+            } => {
+                for branch in branches {
+                    self.resolve_condition(&branch.condition);
+                    self.resolve_statement_body(&branch.body);
+                }
+                if let Some(body) = else_body {
+                    self.resolve_statement_body(body);
+                }
+            }
+            StatementKind::While { condition, body } => {
+                self.resolve_condition(condition);
+                self.resolve_statement_body(body);
+            }
+            StatementKind::For { iterable, body, .. } => {
+                let state = self.resolve_expression(iterable, None);
+                let binding = self.analysis.statement_binding(statement);
+                if let TypeState::Resolved(ty) = state {
+                    self.analysis.binding_types[binding.0].state =
+                        match self.analysis.types.get(ty).clone() {
+                            ResolvedType::List(element) => TypeState::Resolved(element),
+                            ResolvedType::Map { key, .. } => TypeState::Resolved(key),
+                            _ => TypeState::Error,
+                        };
+                }
+                self.resolve_statement_body(body);
+            }
+            StatementKind::Switch {
+                value,
+                arms,
+                else_body,
+            } => {
+                self.resolve_expression(value, None);
+                for arm in arms {
+                    self.resolve_statement_body(&arm.body);
+                }
+                if let Some(body) = else_body {
+                    self.resolve_statement_body(body);
+                }
+            }
+            StatementKind::Block(block) => {
+                self.resolve_block(block, None);
+            }
+        }
+    }
+
+    fn resolve_statement_body(&mut self, body: &'ast StatementBody) {
+        match &body.kind {
+            StatementBodyKind::Block(block) => {
+                self.resolve_block(block, None);
+            }
+            StatementBodyKind::Statement(statement) => self.resolve_statement(statement),
+        }
+    }
+
+    fn resolve_condition(&mut self, expression: &'ast Expression) -> bool {
+        let current = self.analysis.expression_annotation(expression)
+            .map_or(TypeState::Error, |annotation| annotation.state);
+        let state = self.resolve_expression(expression, None);
+        if matches!(current, TypeState::Deferred(_))
+            && let TypeState::Resolved(ty) = state
+            && !self.is_primitive(ty, PrimitiveType::Bool)
+        {
+            self.analysis.error(expression.span, "condition must have type bool");
+            false
+        } else {
+            true
+        }
+    }
+
+    fn validate_assignment(
+        &mut self,
+        operator: AssignmentOperator,
+        operator_span: Span,
+        target: TypeState,
+        value: TypeState,
+    ) {
+        if operator == AssignmentOperator::Assign
+            || !matches!((target, value), (TypeState::Resolved(_), TypeState::Resolved(_)))
+        {
+            return;
+        }
+        let (TypeState::Resolved(target), TypeState::Resolved(value)) = (target, value) else {
+            unreachable!()
+        };
+        let int = self.analysis.types.primitive(PrimitiveType::Int);
+        let valid = match operator {
+            AssignmentOperator::Add
+            | AssignmentOperator::Subtract
+            | AssignmentOperator::Multiply
+            | AssignmentOperator::Divide => target == value && self.is_numeric(target),
+            AssignmentOperator::Remainder
+            | AssignmentOperator::BitwiseAnd
+            | AssignmentOperator::BitwiseOr
+            | AssignmentOperator::BitwiseXor
+            | AssignmentOperator::ShiftLeft
+            | AssignmentOperator::ShiftRight => target == int && value == int,
+            AssignmentOperator::Assign => true,
+        };
+        if !valid {
+            self.analysis.error(
+                operator_span,
+                "compound assignment is not defined for these operand types",
+            );
+        }
+    }
+
+    fn resolve_assignment_target(&mut self, target: &'ast AssignmentTarget) -> TypeState {
+        let current = self.analysis.assignment_target(target)
+            .map_or(TypeState::Error, |annotation| annotation.state);
+        if !matches!(current, TypeState::Deferred(_)) {
+            return current;
+        }
+        let mut state = match self.analysis.name_use(&target.root).map(|name| name.resolution) {
+            Some(NameResolution::Binding(binding)) => self.analysis.binding_type(binding),
+            _ => TypeState::Error,
+        };
+        for suffix in &target.suffixes {
+            state = match &suffix.kind {
+                AssignmentTargetSuffixKind::Index(index) => {
+                    let index = self.resolve_expression(index, None);
+                    self.resolve_target_index(target, state, index, suffix.span, current)
+                }
+                AssignmentTargetSuffixKind::Member(member) => {
+                    self.resolve_target_member(target, state, *member, current)
+                }
+            };
+        }
+        if !matches!(state, TypeState::Deferred(_)) {
+            for deferred in &mut self.analysis.deferred {
+                if matches!(
+                    deferred.node,
+                    AstNode::AssignmentTarget(node) if std::ptr::eq(node, target)
+                ) {
+                    deferred.resolved = true;
+                }
+            }
+        }
+        self.analysis.assignment_targets.push(AssignmentTargetAnnotation {
+            node: target,
+            state,
+        });
+        state
+    }
+
+    fn resolve_target_index(
+        &mut self,
+        target: &'ast AssignmentTarget,
+        value: TypeState,
+        index: TypeState,
+        span: Span,
+        deferred: TypeState,
+    ) -> TypeState {
+        let (TypeState::Resolved(value), TypeState::Resolved(index)) = (value, index) else {
+            return self.target_pair_state(target, value, index, deferred);
+        };
+        let int = self.analysis.types.primitive(PrimitiveType::Int);
+        match self.analysis.types.get(value).clone() {
+            ResolvedType::List(element) if index == int => TypeState::Resolved(element),
+            ResolvedType::Map { key, value } if index == key => TypeState::Resolved(value),
+            _ => self.analysis.error(
+                span,
+                "index assignment is not defined for these operand types",
+            ),
+        }
+    }
+
+    fn resolve_target_member(
+        &mut self,
+        target: &'ast AssignmentTarget,
+        value: TypeState,
+        member: Member,
+        deferred: TypeState,
+    ) -> TypeState {
+        let TypeState::Resolved(value) = value else {
+            return self.target_state(target, value, deferred);
+        };
+        match self.analysis.types.get(value).clone() {
+            ResolvedType::Nominal(declaration) => {
+                match (self.analysis.type_definition(declaration).kind.clone(), member) {
+                    (TypeDefinitionKind::Struct(members), Member::Named(name)) => {
+                        let spelling = self.analysis.identifier_text(name.span).to_owned();
+                        members.iter().find(|field| {
+                            self.analysis.identifier_text(field.name.span) == spelling.as_str()
+                        }).map_or_else(
+                            || self.analysis.error(name.span, format!("struct has no member '{spelling}'")),
+                            |field| field.ty,
+                        )
+                    }
+                    (TypeDefinitionKind::Tuple(members), Member::TupleIndex(span)) => {
+                        self.parse_tuple_index(span).and_then(|index| members.get(index)).map_or_else(
+                            || self.analysis.error(span, "tuple member index is out of range"),
+                            |field| field.ty,
+                        )
+                    }
+                    (TypeDefinitionKind::Union { .. }, _) => deferred,
+                    (TypeDefinitionKind::Invalid, _) => TypeState::Error,
+                    (TypeDefinitionKind::Struct(_), Member::TupleIndex(span)) => self
+                        .analysis
+                        .error(span, "struct members must be accessed by name"),
+                    (TypeDefinitionKind::Tuple(_), Member::Named(name)) => self
+                        .analysis
+                        .error(name.span, "tuple members must be accessed by position"),
+                }
+            }
+            ResolvedType::Union(_) => deferred,
+            _ => self.analysis.error(
+                target.span,
+                "assignment receiver has no assignable member",
+            ),
+        }
+    }
+
+    fn resolve_expression(
+        &mut self,
+        expression: &'ast Expression,
+        expected: Option<TypeId>,
+    ) -> TypeState {
+        let current = self
+            .analysis
+            .expression_annotation(expression)
+            .map_or(TypeState::Error, |annotation| annotation.state);
+        let state = match &expression.kind {
+            ExpressionKind::List(elements) => self.resolve_list(expression, elements, expected),
+            ExpressionKind::Map(entries) => self.resolve_map(expression, entries, expected),
+            ExpressionKind::TypedEmptyList(ty) | ExpressionKind::TypedEmptyMap(ty) => {
+                self.resolve_typed_empty(expression, ty, expected)
+            }
+            ExpressionKind::Parenthesized(inner) => self.resolve_expression(inner, expected),
+            ExpressionKind::Block(block) => self.resolve_block(block, expected),
+            ExpressionKind::If {
+                branches,
+                else_branch,
+            } => self.resolve_if(expression, branches, else_branch, expected),
+            ExpressionKind::Call { arguments, .. } => {
+                self.resolve_call(expression, arguments, expected)
+            }
+            ExpressionKind::Unary {
+                operator,
+                operator_span,
+                operand,
+            } => self.resolve_unary(
+                expression,
+                *operator,
+                *operator_span,
+                operand,
+                current,
+                expected,
+            ),
+            ExpressionKind::Binary {
+                left,
+                operator,
+                operator_span,
+                right,
+            } => self.resolve_binary(
+                expression,
+                left,
+                *operator,
+                *operator_span,
+                right,
+                current,
+                expected,
+            ),
+            ExpressionKind::Index { value, index } => {
+                self.resolve_index(expression, value, index, current, expected)
+            }
+            ExpressionKind::Member { value, member } => {
+                self.resolve_member(expression, value, *member, current, expected)
+            }
+            ExpressionKind::Try { value, .. } | ExpressionKind::Is { value, .. } => {
+                self.resolve_expression(value, None);
+                self.coerce(expression, current, expected)
+            }
+            ExpressionKind::Identifier(_)
+            | ExpressionKind::Integer
+            | ExpressionKind::Float
+            | ExpressionKind::String(_)
+            | ExpressionKind::Character(_)
+            | ExpressionKind::Boolean(_) => self.coerce(expression, current, expected),
+        };
+        for deferred in &mut self.analysis.deferred {
+            if matches!(
+                deferred.node,
+                AstNode::Expression(node) if std::ptr::eq(node, expression)
+            ) {
+                if !matches!(state, TypeState::Deferred(_))
+                    || deferred.reason != DeferredReason::FlowDependentType
+                {
+                    deferred.resolved = true;
+                }
+            }
+        }
+        self.analysis.annotate_expression(expression, state);
+        state
+    }
+
+    fn resolve_unary(
+        &mut self,
+        expression: &'ast Expression,
+        operator: UnaryOperator,
+        operator_span: Span,
+        operand: &'ast Expression,
+        current: TypeState,
+        expected: Option<TypeId>,
+    ) -> TypeState {
+        let operand = self.resolve_expression(operand, None);
+        if !matches!(current, TypeState::Deferred(_)) {
+            return self.coerce(expression, current, expected);
+        }
+        let TypeState::Resolved(operand) = operand else {
+            let state = self.operand_state(expression, operand, current);
+            return self.coerce(expression, state, expected);
+        };
+        let valid = match operator {
+            UnaryOperator::LogicalNot => self.is_primitive(operand, PrimitiveType::Bool),
+            UnaryOperator::BitwiseNot => self.is_primitive(operand, PrimitiveType::Int),
+            UnaryOperator::Plus | UnaryOperator::Minus => self.is_numeric(operand),
+        };
+        let state = if valid {
+            TypeState::Resolved(operand)
+        } else {
+            self.analysis.error(
+                operator_span,
+                "unary operator is not defined for this operand type",
+            )
+        };
+        self.coerce(expression, state, expected)
+    }
+
+    fn resolve_binary(
+        &mut self,
+        expression: &'ast Expression,
+        left: &'ast Expression,
+        operator: BinaryOperator,
+        operator_span: Span,
+        right: &'ast Expression,
+        current: TypeState,
+        expected: Option<TypeId>,
+    ) -> TypeState {
+        let left = self.resolve_expression(left, None);
+        let right = self.resolve_expression(right, None);
+        if !matches!(current, TypeState::Deferred(_)) {
+            return self.coerce(expression, current, expected);
+        }
+        let (TypeState::Resolved(left), TypeState::Resolved(right)) = (left, right) else {
+            let state = self.operand_pair_state(expression, left, right, current);
+            return self.coerce(expression, state, expected);
+        };
+        let bool_type = self.analysis.types.primitive(PrimitiveType::Bool);
+        let int_type = self.analysis.types.primitive(PrimitiveType::Int);
+        let result = match operator {
+            BinaryOperator::LogicalOr | BinaryOperator::LogicalAnd
+                if left == bool_type && right == bool_type => Some(bool_type),
+            BinaryOperator::BitwiseOr
+            | BinaryOperator::BitwiseXor
+            | BinaryOperator::BitwiseAnd
+            | BinaryOperator::ShiftLeft
+            | BinaryOperator::ShiftRight
+                if left == int_type && right == int_type => Some(int_type),
+            BinaryOperator::Add
+            | BinaryOperator::Subtract
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+                if left == right && self.is_numeric(left) => Some(left),
+            BinaryOperator::Remainder if left == int_type && right == int_type => Some(int_type),
+            BinaryOperator::Equal | BinaryOperator::NotEqual
+                if left == right && self.supports_equality(left) => Some(bool_type),
+            BinaryOperator::Less
+            | BinaryOperator::LessEqual
+            | BinaryOperator::Greater
+            | BinaryOperator::GreaterEqual
+                if left == right && self.supports_ordering(left) => Some(bool_type),
+            BinaryOperator::In if self.membership_matches(left, right) => Some(bool_type),
+            _ => None,
+        };
+        let state = result.map_or_else(
+            || self.analysis.error(
+                operator_span,
+                "binary operator is not defined for these operand types",
+            ),
+            TypeState::Resolved,
+        );
+        self.coerce(expression, state, expected)
+    }
+
+    fn resolve_index(
+        &mut self,
+        expression: &'ast Expression,
+        value: &'ast Expression,
+        index: &'ast Expression,
+        current: TypeState,
+        expected: Option<TypeId>,
+    ) -> TypeState {
+        let value = self.resolve_expression(value, None);
+        let index = self.resolve_expression(index, None);
+        if !matches!(current, TypeState::Deferred(_)) {
+            return self.coerce(expression, current, expected);
+        }
+        let (TypeState::Resolved(value), TypeState::Resolved(index)) = (value, index) else {
+            let state = self.operand_pair_state(expression, value, index, current);
+            return self.coerce(expression, state, expected);
+        };
+        let int = self.analysis.types.primitive(PrimitiveType::Int);
+        let state = match self.analysis.types.get(value).clone() {
+            ResolvedType::List(element) if index == int => TypeState::Resolved(element),
+            ResolvedType::Map { key, value } if index == key => TypeState::Resolved(value),
+            ResolvedType::Primitive(PrimitiveType::Str) if index == int => {
+                TypeState::Resolved(self.analysis.types.primitive(PrimitiveType::Char))
+            }
+            _ => self.analysis.error(
+                expression.span,
+                "index operation is not defined for these operand types",
+            ),
+        };
+        self.coerce(expression, state, expected)
+    }
+
+    fn resolve_member(
+        &mut self,
+        expression: &'ast Expression,
+        value: &'ast Expression,
+        member: Member,
+        current: TypeState,
+        expected: Option<TypeId>,
+    ) -> TypeState {
+        let value = self.resolve_expression(value, None);
+        if !matches!(current, TypeState::Deferred(_)) {
+            return self.coerce(expression, current, expected);
+        }
+        let TypeState::Resolved(value) = value else {
+            let state = self.operand_state(expression, value, current);
+            return self.coerce(expression, state, expected);
+        };
+        let state = match self.analysis.types.get(value).clone() {
+            ResolvedType::Nominal(declaration) => {
+                match (self.analysis.type_definition(declaration).kind.clone(), member) {
+                    (TypeDefinitionKind::Struct(members), Member::Named(name)) => {
+                        let spelling = self.analysis.identifier_text(name.span).to_owned();
+                        members.iter().find(|field| {
+                            self.analysis.identifier_text(field.name.span) == spelling.as_str()
+                        }).map_or_else(
+                            || self.analysis.error(name.span, format!("struct has no member '{spelling}'")),
+                            |field| field.ty,
+                        )
+                    }
+                    (TypeDefinitionKind::Tuple(members), Member::TupleIndex(span)) => {
+                        self.parse_tuple_index(span).and_then(|index| members.get(index)).map_or_else(
+                            || self.analysis.error(span, "tuple member index is out of range"),
+                            |field| field.ty,
+                        )
+                    }
+                    (TypeDefinitionKind::Union { .. }, _) => current,
+                    (TypeDefinitionKind::Invalid, _) => TypeState::Error,
+                    (TypeDefinitionKind::Struct(_), Member::TupleIndex(span)) => self
+                        .analysis
+                        .error(span, "struct members must be accessed by name"),
+                    (TypeDefinitionKind::Tuple(_), Member::Named(name)) => self
+                        .analysis
+                        .error(name.span, "tuple members must be accessed by position"),
+                }
+            }
+            ResolvedType::Union(_) => current,
+            ResolvedType::List(_) => self.resolve_method_member(
+                member,
+                &["append", "removeIndex", "len"],
+            ),
+            ResolvedType::Map { .. } => {
+                self.resolve_method_member(member, &["removeKey", "len"])
+            }
+            ResolvedType::Primitive(PrimitiveType::Str) => {
+                self.resolve_method_member(member, &["len"])
+            }
+            ResolvedType::Primitive(_) => self.analysis.error(
+                expression.span,
+                "primitive value has no accessible member",
+            ),
+        };
+        self.coerce(expression, state, expected)
+    }
+
+    fn resolve_method_member(&mut self, member: Member, methods: &[&str]) -> TypeState {
+        match member {
+            Member::Named(name) => {
+                let spelling = self.analysis.identifier_text(name.span).to_owned();
+                if methods.contains(&spelling.as_str()) {
+                    self.analysis.error(
+                        name.span,
+                        "container methods must be used as direct call targets",
+                    )
+                } else {
+                    self.analysis.error(
+                        name.span,
+                        format!("container has no member '{spelling}'"),
+                    )
+                }
+            }
+            Member::TupleIndex(span) => self
+                .analysis
+                .error(span, "container members must be accessed by name"),
+        }
+    }
+
+    fn resolve_list(
+        &mut self,
+        expression: &'ast Expression,
+        elements: &'ast [Expression],
+        expected: Option<TypeId>,
+    ) -> TypeState {
+        let expected_list = expected.and_then(|ty| self.expected_container(ty, true));
+        let expected_element = expected_list.and_then(|ty| match self.analysis.types.get(ty) {
+            ResolvedType::List(element) => Some(*element),
+            _ => None,
+        });
+        if elements.is_empty() && expected_element.is_none() {
+            return self.analysis.error(
+                expression.span,
+                "empty list requires an expected list type or explicit ascription",
+            );
+        }
+        let states = elements
+            .iter()
+            .map(|element| self.resolve_expression(element, expected_element))
+            .collect::<Vec<_>>();
+        if states.iter().any(|state| *state == TypeState::Error) {
+            return TypeState::Error;
+        }
+        if states.iter().any(|state| *state == TypeState::Never) {
+            return TypeState::Never;
+        }
+        if states.iter().any(|state| *state == TypeState::NoValue) {
+            return TypeState::Error;
+        }
+        if let Some(deferred) = states.iter().find(|state| matches!(state, TypeState::Deferred(_))) {
+            return *deferred;
+        }
+        if let (Some(list), Some(_)) = (expected_list, expected_element) {
+            return self.coerce(expression, TypeState::Resolved(list), expected);
+        }
+        let Some(element) = states.iter().find_map(|state| match state {
+            TypeState::Resolved(ty) => Some(*ty),
+            _ => None,
+        }) else {
+            return states.first().copied().unwrap_or(TypeState::Error);
+        };
+        if !states
+            .iter()
+            .all(|state| matches!(state, TypeState::Resolved(ty) if *ty == element))
+        {
+            return self.analysis.error(
+                expression.span,
+                "list elements have incompatible types",
+            );
+        }
+        let list = self.analysis.types.intern(ResolvedType::List(element));
+        self.coerce(expression, TypeState::Resolved(list), expected)
+    }
+
+    fn resolve_map(
+        &mut self,
+        expression: &'ast Expression,
+        entries: &'ast [crate::ast::MapEntry],
+        expected: Option<TypeId>,
+    ) -> TypeState {
+        let expected_map = expected.and_then(|ty| self.expected_container(ty, false));
+        let expected_parts = expected_map.and_then(|ty| match self.analysis.types.get(ty) {
+            ResolvedType::Map { key, value } => Some((*key, *value)),
+            _ => None,
+        });
+        if entries.is_empty() && expected_parts.is_none() {
+            return self.analysis.error(
+                expression.span,
+                "empty map requires an expected map type or explicit ascription",
+            );
+        }
+        let states = entries
+            .iter()
+            .map(|entry| {
+                (
+                    self.resolve_expression(&entry.key, expected_parts.map(|parts| parts.0)),
+                    self.resolve_expression(&entry.value, expected_parts.map(|parts| parts.1)),
+                )
+            })
+            .collect::<Vec<_>>();
+        if states
+            .iter()
+            .any(|(key, value)| *key == TypeState::Error || *value == TypeState::Error)
+        {
+            return TypeState::Error;
+        }
+        if states
+            .iter()
+            .any(|(key, value)| *key == TypeState::Never || *value == TypeState::Never)
+        {
+            return TypeState::Never;
+        }
+        if states
+            .iter()
+            .any(|(key, value)| *key == TypeState::NoValue || *value == TypeState::NoValue)
+        {
+            return TypeState::Error;
+        }
+        if let Some(deferred) = states.iter().find_map(|(key, value)| {
+            [*key, *value]
+                .into_iter()
+                .find(|state| matches!(state, TypeState::Deferred(_)))
+        }) {
+            return deferred;
+        }
+        if let (Some(map), Some(_)) = (expected_map, expected_parts) {
+            return self.coerce(expression, TypeState::Resolved(map), expected);
+        }
+        let Some((TypeState::Resolved(key), TypeState::Resolved(value))) = states.first().copied()
+        else {
+            return TypeState::Error;
+        };
+        if !states.iter().all(|state| {
+            state.0 == TypeState::Resolved(key) && state.1 == TypeState::Resolved(value)
+        }) {
+            return self.analysis.error(expression.span, "map entries have incompatible types");
+        }
+        if !self.analysis.is_valid_map_key(key, &mut Vec::new()) {
+            return self.analysis.error(
+                expression.span,
+                "map key type must be int, str, bool, or an immutable tuple of valid map keys",
+            );
+        }
+        let map = self.analysis.types.intern(ResolvedType::Map { key, value });
+        self.coerce(expression, TypeState::Resolved(map), expected)
+    }
+
+    fn resolve_typed_empty(
+        &mut self,
+        expression: &'ast Expression,
+        ty: &'ast Type,
+        expected: Option<TypeId>,
+    ) -> TypeState {
+        let state = self.analysis.resolve_type(ty);
+        let TypeState::Resolved(resolved) = state else {
+            return TypeState::Error;
+        };
+        let shape_matches = matches!(
+            (&expression.kind, self.analysis.types.get(resolved)),
+            (ExpressionKind::TypedEmptyList(_), ResolvedType::List(_))
+                | (ExpressionKind::TypedEmptyMap(_), ResolvedType::Map { .. })
+        );
+        if !shape_matches {
+            return self.analysis.error(expression.span, "empty collection ascription has the wrong container type");
+        }
+        if let ResolvedType::Map { key, .. } = self.analysis.types.get(resolved).clone()
+            && !self.analysis.is_valid_map_key(key, &mut Vec::new())
+        {
+            return self.analysis.error(
+                ty.span,
+                "map key type must be int, str, bool, or an immutable tuple of valid map keys",
+            );
+        }
+        self.coerce(expression, TypeState::Resolved(resolved), expected)
+    }
+
+    fn resolve_if(
+        &mut self,
+        expression: &'ast Expression,
+        branches: &'ast [crate::ast::ConditionalExpressionBranch],
+        else_branch: &'ast ExpressionBody,
+        expected: Option<TypeId>,
+    ) -> TypeState {
+        let mut states = Vec::new();
+        let mut valid_conditions = true;
+        for branch in branches {
+            valid_conditions &= self.resolve_condition(&branch.condition);
+            states.push(self.resolve_expression_body(&branch.body, expected));
+        }
+        states.push(self.resolve_expression_body(else_branch, expected));
+        if !valid_conditions || states.iter().any(|state| *state == TypeState::Error) {
+            return TypeState::Error;
+        }
+        if states.iter().any(|state| *state == TypeState::NoValue) {
+            return TypeState::Error;
+        }
+        if let Some(expected) = expected {
+            if states.iter().all(|state| {
+                *state == TypeState::Resolved(expected) || *state == TypeState::Never
+            }) {
+                return TypeState::Resolved(expected);
+            }
+        }
+        let resolved = states.iter().find_map(|state| match state {
+            TypeState::Resolved(ty) => Some(*ty),
+            _ => None,
+        });
+        match resolved {
+            Some(ty) if states.iter().all(|state| {
+                *state == TypeState::Resolved(ty) || *state == TypeState::Never
+            }) => TypeState::Resolved(ty),
+            None if states.iter().all(|state| *state == TypeState::Never) => TypeState::Never,
+            _ => self.analysis.error(expression.span, "if-expression branches have incompatible types"),
+        }
+    }
+
+    fn resolve_expression_body(
+        &mut self,
+        body: &'ast ExpressionBody,
+        expected: Option<TypeId>,
+    ) -> TypeState {
+        match &body.kind {
+            ExpressionBodyKind::Block(block) => self.resolve_block(block, expected),
+            ExpressionBodyKind::Expression(expression) => {
+                self.resolve_expression(expression, expected)
+            }
+        }
+    }
+
+    fn resolve_call(
+        &mut self,
+        expression: &'ast Expression,
+        arguments: &'ast [crate::ast::Argument],
+        expected: Option<TypeId>,
+    ) -> TypeState {
+        let target = self.analysis.call_resolution(expression).map(|call| call.target);
+        let result = match target {
+            Some(CallTarget::Callable(CallableId::Function(function))) => {
+                let (parameters, result) = {
+                    let signature = self.analysis.function_signature(function);
+                    (
+                        signature.parameters.iter().map(|parameter| parameter.ty).collect::<Vec<_>>(),
+                        signature.result,
+                    )
+                };
+                let mut states = Vec::new();
+                for (index, argument) in arguments.iter().enumerate() {
+                    let expected = parameters.get(index).and_then(|parameter| self.resolved(*parameter));
+                    states.push(self.resolve_argument(argument, expected));
+                }
+                self.finish_call(expression, &states, result)
+            }
+            Some(CallTarget::Callable(CallableId::Intrinsic(intrinsic))) => {
+                let signature = self.analysis.intrinsic_signature(intrinsic).clone();
+                let mut failed = false;
+                let mut states = Vec::new();
+                match signature.arguments {
+                    IntrinsicArguments::Exact(types) => {
+                        for (index, argument) in arguments.iter().enumerate() {
+                            let expected = types.get(index).copied();
+                            let state = self.resolve_argument(argument, expected);
+                            failed |= state == TypeState::Error;
+                            states.push(state);
+                        }
+                    }
+                    IntrinsicArguments::OnePrintable | IntrinsicArguments::ZeroOrOnePrintable => {
+                        for argument in arguments {
+                            let state = self.resolve_argument(argument, None);
+                            match state {
+                                TypeState::Resolved(ty) => {
+                                    if !self.is_printable(ty, &mut Vec::new()) {
+                                        self.analysis.error(
+                                            argument.span,
+                                            "print argument must be a primitive or printable tuple",
+                                        );
+                                        failed = true;
+                                    }
+                                }
+                                TypeState::Error => failed = true,
+                                TypeState::NoValue => {
+                                    self.analysis.error(
+                                        argument.span,
+                                        "print argument must produce a value",
+                                    );
+                                    failed = true;
+                                }
+                                _ => {}
+                            }
+                            states.push(state);
+                        }
+                    }
+                }
+                if failed {
+                    TypeState::Error
+                } else {
+                    self.finish_call(expression, &states, signature.result)
+                }
+            }
+            Some(CallTarget::Builtin(method)) => {
+                let expected_argument = self.builtin_argument_type(expression, method);
+                let mut states = Vec::new();
+                for argument in arguments {
+                    states.push(self.resolve_argument(argument, expected_argument));
+                }
+                let result = match method {
+                    BuiltinMethod::ListLen | BuiltinMethod::MapLen | BuiltinMethod::StrLen => {
+                        TypeState::Resolved(self.analysis.types.primitive(PrimitiveType::Int))
+                    }
+                    BuiltinMethod::ListAppend
+                    | BuiltinMethod::ListRemoveIndex
+                    | BuiltinMethod::MapRemoveKey => TypeState::NoValue,
+                };
+                self.finish_call(expression, &states, result)
+            }
+            Some(CallTarget::Callable(CallableId::Constructor(declaration))) => {
+                self.resolve_constructor(expression, declaration, arguments)
+            }
+            Some(CallTarget::QualifiedConstructor(declaration)) => {
+                self.resolve_qualified_constructor(expression, declaration, arguments)
+            }
+            Some(CallTarget::ErrorConstructor) => {
+                self.resolve_error_constructor(expression, arguments, expected)
+            }
+            Some(CallTarget::Expression) => {
+                self.resolve_method_call(expression, arguments)
+            }
+            _ => {
+                for argument in arguments {
+                    self.resolve_argument(argument, None);
+                }
+                TypeState::Error
+            }
+        };
+        self.coerce(expression, result, expected)
+    }
+
+    fn resolve_method_call(
+        &mut self,
+        expression: &'ast Expression,
+        arguments: &'ast [crate::ast::Argument],
+    ) -> TypeState {
+        let ExpressionKind::Call { callee, .. } = &expression.kind else { unreachable!() };
+        let ExpressionKind::Member { value, member } = &callee.kind else {
+            for argument in arguments {
+                self.resolve_argument(argument, None);
+            }
+            return TypeState::Error;
+        };
+        let receiver = self.resolve_expression(value, None);
+        let TypeState::Resolved(receiver) = receiver else {
+            for argument in arguments {
+                self.resolve_argument(argument, None);
+            }
+            let current = self.analysis.expression_annotation(expression)
+                .map_or(TypeState::Error, |annotation| annotation.state);
+            return self.operand_state(expression, receiver, current);
+        };
+        let Member::Named(name) = member else {
+            for argument in arguments {
+                self.resolve_argument(argument, None);
+            }
+            return self.analysis.error(expression.span, "tuple member is not callable");
+        };
+        let spelling = self.analysis.identifier_text(name.span).to_owned();
+        let int = self.analysis.types.primitive(PrimitiveType::Int);
+        let method = match self.analysis.types.get(receiver).clone() {
+            ResolvedType::List(element) => match spelling.as_str() {
+                "append" => Some((BuiltinMethod::ListAppend, Some(element), TypeState::NoValue)),
+                "removeIndex" => Some((BuiltinMethod::ListRemoveIndex, Some(int), TypeState::NoValue)),
+                "len" => Some((BuiltinMethod::ListLen, None, TypeState::Resolved(int))),
+                _ => None,
+            },
+            ResolvedType::Map { key, .. } => match spelling.as_str() {
+                "removeKey" => Some((BuiltinMethod::MapRemoveKey, Some(key), TypeState::NoValue)),
+                "len" => Some((BuiltinMethod::MapLen, None, TypeState::Resolved(int))),
+                _ => None,
+            },
+            ResolvedType::Primitive(PrimitiveType::Str) if spelling == "len" => {
+                Some((BuiltinMethod::StrLen, None, TypeState::Resolved(int)))
+            }
+            _ => None,
+        };
+        let Some((method, expected, result)) = method else {
+            for argument in arguments {
+                self.resolve_argument(argument, None);
+            }
+            return self.analysis.error(
+                name.span,
+                format!("type has no built-in method '{spelling}'"),
+            );
+        };
+        if let Some(call) = self
+            .analysis
+            .calls
+            .iter_mut()
+            .find(|call| std::ptr::eq(call.node, expression))
+        {
+            call.target = CallTarget::Builtin(method);
+        }
+        let expected_count = usize::from(expected.is_some());
+        let mut failed = arguments.len() != expected_count;
+        let mut states = Vec::new();
+        if failed {
+            self.analysis.error(
+                expression.span,
+                format!(
+                    "method '{spelling}' expects {expected_count} argument(s), but {} were provided",
+                    arguments.len()
+                ),
+            );
+        }
+        for argument in arguments {
+            if matches!(&argument.kind, ArgumentKind::Named { .. }) {
+                self.analysis.error(
+                    argument.span,
+                    "built-in methods do not accept named arguments",
+                );
+                failed = true;
+            }
+            let state = self.resolve_argument(argument, expected);
+            failed |= state == TypeState::Error;
+            states.push(state);
+        }
+        if failed {
+            TypeState::Error
+        } else {
+            self.finish_call(expression, &states, result)
+        }
+    }
+
+    fn finish_call(
+        &self,
+        expression: &'ast Expression,
+        arguments: &[TypeState],
+        result: TypeState,
+    ) -> TypeState {
+        if arguments.iter().any(|state| matches!(state, TypeState::Error | TypeState::NoValue)) {
+            TypeState::Error
+        } else if arguments.contains(&TypeState::Never) {
+            TypeState::Never
+        } else if let Some(deferred) = arguments.iter().find(|state| matches!(state, TypeState::Deferred(_))) {
+            self.analysis.expression_annotation(expression)
+                .map_or(*deferred, |annotation| match annotation.state {
+                    TypeState::Deferred(_) => annotation.state,
+                    _ => *deferred,
+                })
+        } else {
+            result
+        }
+    }
+
+    fn resolve_argument(&mut self, argument: &'ast crate::ast::Argument, expected: Option<TypeId>) -> TypeState {
+        match &argument.kind {
+            ArgumentKind::Positional(value) | ArgumentKind::Named { value, .. } => {
+                self.resolve_expression(value, expected)
+            }
+        }
+    }
+
+    fn resolve_constructor(
+        &mut self,
+        expression: &'ast Expression,
+        declaration: TypeDeclarationId,
+        arguments: &'ast [crate::ast::Argument],
+    ) -> TypeState {
+        let result_type = self.analysis.types.intern(ResolvedType::Nominal(declaration));
+        match self.analysis.type_definition(declaration).kind.clone() {
+            TypeDefinitionKind::Struct(members) => {
+                let mut selected = Vec::new();
+                let mut seen = Vec::new();
+                let mut failed = false;
+                let mut states = Vec::new();
+                for argument in arguments {
+                    let ArgumentKind::Named { name, value } = &argument.kind else {
+                        states.push(self.resolve_argument(argument, None));
+                        self.analysis.error(argument.span, "struct constructor arguments must be named");
+                        failed = true;
+                        continue;
+                    };
+                    let spelling = self.analysis.identifier_text(name.span).to_owned();
+                    let member = members.iter().position(|member| {
+                        self.analysis.identifier_text(member.name.span) == spelling.as_str()
+                    });
+                    let Some(member) = member else {
+                        states.push(self.resolve_expression(value, None));
+                        self.analysis.error(name.span, format!("unknown struct member '{spelling}'"));
+                        failed = true;
+                        continue;
+                    };
+                    if seen.contains(&member) {
+                        self.analysis.error(name.span, format!("duplicate struct argument '{spelling}'"));
+                        failed = true;
+                    }
+                    seen.push(member);
+                    selected.push(member);
+                    let expected = self.resolved(members[member].ty);
+                    let state = self.resolve_expression(value, expected);
+                    failed |= state == TypeState::Error;
+                    states.push(state);
+                }
+                for (index, member) in members.iter().enumerate() {
+                    if !seen.contains(&index) {
+                        let name = self.analysis.identifier_text(member.name.span).to_owned();
+                        self.analysis.error(expression.span, format!("missing struct argument '{name}'"));
+                        failed = true;
+                    }
+                }
+                let state = if failed {
+                    TypeState::Error
+                } else {
+                    self.finish_call(expression, &states, TypeState::Resolved(result_type))
+                };
+                if state == TypeState::Resolved(result_type) {
+                    self.analysis.constructors.push(ConstructorResolution {
+                        node: expression,
+                        kind: ConstructorKind::Struct {
+                            declaration,
+                            argument_members: selected.into_boxed_slice(),
+                        },
+                    });
+                }
+                state
+            }
+            TypeDefinitionKind::Tuple(members) => {
+                let mut failed = arguments.len() != members.len();
+                let mut states = Vec::new();
+                if failed {
+                    self.analysis.error(expression.span, format!("tuple constructor expects {} argument(s), but {} were provided", members.len(), arguments.len()));
+                }
+                for (index, argument) in arguments.iter().enumerate() {
+                    if matches!(&argument.kind, ArgumentKind::Named { .. }) {
+                        self.analysis.error(argument.span, "tuple constructor arguments must be positional");
+                        failed = true;
+                    }
+                    let expected = members
+                        .get(index)
+                        .and_then(|member| self.resolved(member.ty));
+                    let state = self.resolve_argument(argument, expected);
+                    failed |= state == TypeState::Error;
+                    states.push(state);
+                }
+                let state = if failed {
+                    TypeState::Error
+                } else {
+                    self.finish_call(expression, &states, TypeState::Resolved(result_type))
+                };
+                if state == TypeState::Resolved(result_type) {
+                    self.analysis.constructors.push(ConstructorResolution { node: expression, kind: ConstructorKind::Tuple(declaration) });
+                }
+                state
+            }
+            TypeDefinitionKind::Union { style: UnionStyle::Untagged, alternatives } => {
+                self.resolve_union_constructor(expression, declaration, &alternatives, arguments, result_type)
+            }
+            TypeDefinitionKind::Union { style: UnionStyle::Tagged, .. } => {
+                for argument in arguments { self.resolve_argument(argument, None); }
+                self.analysis.error(expression.span, "tagged union constructor requires a qualified tag")
+            }
+            TypeDefinitionKind::Invalid => {
+                for argument in arguments {
+                    self.resolve_argument(argument, None);
+                }
+                TypeState::Error
+            }
+        }
+    }
+
+    fn resolve_union_constructor(
+        &mut self,
+        expression: &'ast Expression,
+        declaration: TypeDeclarationId,
+        alternatives: &[UnionAlternative],
+        arguments: &'ast [crate::ast::Argument],
+        result_type: TypeId,
+    ) -> TypeState {
+        let [argument] = arguments else {
+            for argument in arguments { self.resolve_argument(argument, None); }
+            return self.analysis.error(expression.span, "union constructor expects exactly one argument");
+        };
+        if matches!(&argument.kind, ArgumentKind::Named { .. }) {
+            self.resolve_argument(argument, None);
+            return self.analysis.error(argument.span, "union constructor argument must be positional");
+        }
+        let value = match &argument.kind {
+            ArgumentKind::Positional(value) => value,
+            ArgumentKind::Named { .. } => unreachable!(),
+        };
+        if matches!(&value.kind, ExpressionKind::List(elements) if elements.is_empty())
+            || matches!(&value.kind, ExpressionKind::Map(entries) if entries.is_empty())
+        {
+            let candidates = alternatives
+                .iter()
+                .filter_map(|alternative| match alternative {
+                    UnionAlternative::Untagged(ty)
+                        if self.collection_shape_matches(value, *ty) =>
+                    {
+                        Some(alternative.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let [alternative] = candidates.as_slice() else {
+                self.resolve_argument(argument, None);
+                return self.analysis.error(
+                    argument.span,
+                    "empty collection does not select exactly one union alternative",
+                );
+            };
+            let payload = match alternative {
+                UnionAlternative::Untagged(payload) => *payload,
+                _ => unreachable!(),
+            };
+            let state = self.resolve_argument(argument, Some(payload));
+            if !matches!(state, TypeState::Resolved(_)) {
+                return state;
+            }
+            self.analysis.constructors.push(ConstructorResolution {
+                node: expression,
+                kind: ConstructorKind::Union {
+                    declaration,
+                    alternative: alternative.clone(),
+                },
+            });
+            return TypeState::Resolved(result_type);
+        }
+        let state = self.resolve_argument(argument, None);
+        let TypeState::Resolved(actual) = state else {
+            return if state == TypeState::NoValue {
+                self.analysis.error(argument.span, "union constructor argument must produce a value")
+            } else {
+                state
+            };
+        };
+        let matches = alternatives.iter().filter(|alternative| {
+            matches!(alternative, UnionAlternative::Untagged(ty) if *ty == actual)
+        }).cloned().collect::<Vec<_>>();
+        let [alternative] = matches.as_slice() else {
+            return self.analysis.error(argument.span, "union constructor argument does not select exactly one alternative");
+        };
+        self.analysis.constructors.push(ConstructorResolution {
+            node: expression,
+            kind: ConstructorKind::Union { declaration, alternative: alternative.clone() },
+        });
+        TypeState::Resolved(result_type)
+    }
+
+    fn resolve_qualified_constructor(
+        &mut self,
+        expression: &'ast Expression,
+        declaration: TypeDeclarationId,
+        arguments: &'ast [crate::ast::Argument],
+    ) -> TypeState {
+        let ExpressionKind::Call { callee, .. } = &expression.kind else { unreachable!() };
+        let ExpressionKind::Member { member: Member::Named(tag), .. } = &callee.kind else { unreachable!() };
+        let spelling = self.analysis.identifier_text(tag.span).to_owned();
+        let TypeDefinitionKind::Union { style: UnionStyle::Tagged, alternatives } = self.analysis.type_definition(declaration).kind.clone() else {
+            for argument in arguments { self.resolve_argument(argument, None); }
+            return self.analysis.error(tag.span, "qualified constructor requires a tagged union");
+        };
+        let alternative = alternatives.iter().find(|alternative| {
+            matches!(alternative, UnionAlternative::Tagged { tag, .. } if tag.as_ref() == spelling.as_str())
+        }).cloned();
+        let Some(alternative) = alternative else {
+            for argument in arguments { self.resolve_argument(argument, None); }
+            return self.analysis.error(tag.span, format!("unknown union tag '{spelling}'"));
+        };
+        let [argument] = arguments else {
+            for argument in arguments { self.resolve_argument(argument, None); }
+            return self.analysis.error(expression.span, "tagged union constructor expects exactly one argument");
+        };
+        if matches!(&argument.kind, ArgumentKind::Named { .. }) {
+            self.resolve_argument(argument, None);
+            return self.analysis.error(argument.span, "tagged union constructor argument must be positional");
+        }
+        let payload = match &alternative { UnionAlternative::Tagged { payload, .. } => *payload, _ => unreachable!() };
+        let state = self.resolve_argument(argument, Some(payload));
+        if !matches!(state, TypeState::Resolved(_)) { return state; }
+        self.analysis.constructors.push(ConstructorResolution {
+            node: expression,
+            kind: ConstructorKind::TaggedUnion { declaration, alternative },
+        });
+        TypeState::Resolved(self.analysis.types.intern(ResolvedType::Nominal(declaration)))
+    }
+
+    fn resolve_error_constructor(
+        &mut self,
+        expression: &'ast Expression,
+        arguments: &'ast [crate::ast::Argument],
+        expected: Option<TypeId>,
+    ) -> TypeState {
+        let Some(union_type) = expected else {
+            for argument in arguments { self.resolve_argument(argument, None); }
+            return self.analysis.error(expression.span, "Error constructor requires an expected union type");
+        };
+        let alternatives = self.union_alternatives(union_type);
+        let errors = alternatives.iter().filter(|alternative| matches!(alternative, UnionAlternative::Error(_))).cloned().collect::<Vec<_>>();
+        let [alternative] = errors.as_slice() else {
+            for argument in arguments { self.resolve_argument(argument, None); }
+            return self.analysis.error(expression.span, "expected type does not contain one Error alternative");
+        };
+        let [argument] = arguments else {
+            for argument in arguments { self.resolve_argument(argument, None); }
+            return self.analysis.error(expression.span, "Error constructor expects exactly one argument");
+        };
+        if matches!(&argument.kind, ArgumentKind::Named { .. }) {
+            self.resolve_argument(argument, None);
+            return self.analysis.error(argument.span, "Error constructor argument must be positional");
+        }
+        let payload = match alternative { UnionAlternative::Error(payload) => *payload, _ => unreachable!() };
+        let state = self.resolve_argument(argument, Some(payload));
+        if !matches!(state, TypeState::Resolved(_)) { return state; }
+        self.analysis.constructors.push(ConstructorResolution {
+            node: expression,
+            kind: ConstructorKind::Error { union_type, alternative: alternative.clone() },
+        });
+        TypeState::Resolved(union_type)
+    }
+
+    fn builtin_argument_type(&self, expression: &'ast Expression, method: BuiltinMethod) -> Option<TypeId> {
+        let ExpressionKind::Call { callee, .. } = &expression.kind else { return None };
+        let ExpressionKind::Member { value, .. } = &callee.kind else { return None };
+        let receiver = self.analysis.expression_annotation(value).and_then(|annotation| self.resolved(annotation.state));
+        match (method, receiver.map(|ty| self.analysis.types.get(ty))) {
+            (BuiltinMethod::ListAppend, Some(ResolvedType::List(element))) => Some(*element),
+            (BuiltinMethod::ListRemoveIndex, _) => Some(self.analysis.types.primitive(PrimitiveType::Int)),
+            (BuiltinMethod::MapRemoveKey, Some(ResolvedType::Map { key, .. })) => Some(*key),
+            _ => None,
+        }
+    }
+
+    fn collection_shape_matches(&self, expression: &Expression, ty: TypeId) -> bool {
+        matches!(
+            (&expression.kind, self.analysis.types.get(ty)),
+            (ExpressionKind::List(_), ResolvedType::List(_))
+                | (ExpressionKind::Map(_), ResolvedType::Map { .. })
+        )
+    }
+
+    fn expected_container(&self, expected: TypeId, list: bool) -> Option<TypeId> {
+        let direct = matches!(
+            (list, self.analysis.types.get(expected)),
+            (true, ResolvedType::List(_)) | (false, ResolvedType::Map { .. })
+        );
+        if direct {
+            return Some(expected);
+        }
+        let matches = self
+            .union_alternatives(expected)
+            .into_iter()
+            .filter_map(|alternative| match alternative {
+                UnionAlternative::Untagged(ty)
+                    if matches!(
+                        (list, self.analysis.types.get(ty)),
+                        (true, ResolvedType::List(_))
+                            | (false, ResolvedType::Map { .. })
+                    ) => Some(ty),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [only] = matches.as_slice() else {
+            return None;
+        };
+        Some(*only)
+    }
+
+    fn coerce(&mut self, expression: &'ast Expression, state: TypeState, expected: Option<TypeId>) -> TypeState {
+        let Some(expected) = expected else { return state; };
+        match state {
+            TypeState::Resolved(actual) if actual == expected => state,
+            TypeState::Resolved(actual) => {
+                let matches = self.union_alternatives(expected).into_iter().filter(|alternative| {
+                    matches!(alternative, UnionAlternative::Untagged(ty) if *ty == actual)
+                }).collect::<Vec<_>>();
+                let [alternative] = matches.as_slice() else {
+                    return self.analysis.error(expression.span, "expression type does not match expected type");
+                };
+                self.analysis.union_injections.push(UnionInjection {
+                    node: expression,
+                    union_type: expected,
+                    alternative: alternative.clone(),
+                });
+                TypeState::Resolved(expected)
+            }
+            TypeState::Never | TypeState::Error | TypeState::Deferred(_) => state,
+            TypeState::NoValue => self.analysis.error(expression.span, "expression does not produce an expected value"),
+        }
+    }
+
+    fn union_alternatives(&self, ty: TypeId) -> Vec<UnionAlternative> {
+        match self.analysis.types.get(ty) {
+            ResolvedType::Union(alternatives) => alternatives.to_vec(),
+            ResolvedType::Nominal(declaration) => match &self.analysis.type_definition(*declaration).kind {
+                TypeDefinitionKind::Union { alternatives, .. } => alternatives.to_vec(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    fn resolved(&self, state: TypeState) -> Option<TypeId> {
+        match state { TypeState::Resolved(ty) => Some(ty), _ => None }
+    }
+
+    fn operand_state(
+        &mut self,
+        expression: &'ast Expression,
+        state: TypeState,
+        deferred: TypeState,
+    ) -> TypeState {
+        match state {
+            TypeState::Error => TypeState::Error,
+            TypeState::Never => TypeState::Never,
+            TypeState::Deferred(_) => deferred,
+            TypeState::NoValue => self.analysis.error(
+                expression.span,
+                "operand expression does not produce a value",
+            ),
+            TypeState::Resolved(_) => unreachable!(),
+        }
+    }
+
+    fn operand_pair_state(
+        &mut self,
+        expression: &'ast Expression,
+        left: TypeState,
+        right: TypeState,
+        deferred: TypeState,
+    ) -> TypeState {
+        if left == TypeState::Error || right == TypeState::Error {
+            TypeState::Error
+        } else if left == TypeState::Never || right == TypeState::Never {
+            TypeState::Never
+        } else if matches!(left, TypeState::Deferred(_))
+            || matches!(right, TypeState::Deferred(_))
+        {
+            deferred
+        } else {
+            self.analysis.error(
+                expression.span,
+                "operator operand does not produce a value",
+            )
+        }
+    }
+
+    fn target_state(
+        &mut self,
+        target: &'ast AssignmentTarget,
+        state: TypeState,
+        deferred: TypeState,
+    ) -> TypeState {
+        match state {
+            TypeState::Error => TypeState::Error,
+            TypeState::Never => TypeState::Never,
+            TypeState::Deferred(_) => deferred,
+            TypeState::NoValue => self.analysis.error(
+                target.span,
+                "assignment receiver does not produce a value",
+            ),
+            TypeState::Resolved(_) => unreachable!(),
+        }
+    }
+
+    fn target_pair_state(
+        &mut self,
+        target: &'ast AssignmentTarget,
+        value: TypeState,
+        index: TypeState,
+        deferred: TypeState,
+    ) -> TypeState {
+        if value == TypeState::Error || index == TypeState::Error {
+            TypeState::Error
+        } else if value == TypeState::Never || index == TypeState::Never {
+            TypeState::Never
+        } else if matches!(value, TypeState::Deferred(_))
+            || matches!(index, TypeState::Deferred(_))
+        {
+            deferred
+        } else {
+            self.analysis.error(
+                target.span,
+                "assignment index does not produce a value",
+            )
+        }
+    }
+
+    fn is_primitive(&self, ty: TypeId, primitive: PrimitiveType) -> bool {
+        ty == self.analysis.types.primitive(primitive)
+    }
+
+    fn is_numeric(&self, ty: TypeId) -> bool {
+        self.is_primitive(ty, PrimitiveType::Int)
+            || self.is_primitive(ty, PrimitiveType::Float)
+    }
+
+    fn supports_ordering(&self, ty: TypeId) -> bool {
+        matches!(
+            self.analysis.types.get(ty),
+            ResolvedType::Primitive(
+                PrimitiveType::Int
+                    | PrimitiveType::Float
+                    | PrimitiveType::Str
+                    | PrimitiveType::Char
+            )
+        )
+    }
+
+    fn supports_equality(&self, ty: TypeId) -> bool {
+        self.supports_equality_inner(ty, &mut Vec::new())
+    }
+
+    fn supports_equality_inner(
+        &self,
+        ty: TypeId,
+        visiting: &mut Vec<TypeDeclarationId>,
+    ) -> bool {
+        match self.analysis.types.get(ty) {
+            ResolvedType::Primitive(_) | ResolvedType::List(_) | ResolvedType::Map { .. } => true,
+            ResolvedType::Nominal(declaration) => {
+                if visiting.contains(declaration) {
+                    return false;
+                }
+                match &self.analysis.type_definition(*declaration).kind {
+                    TypeDefinitionKind::Struct(_) => true,
+                    TypeDefinitionKind::Tuple(members) => {
+                        visiting.push(*declaration);
+                        let comparable = members.iter().all(|member| {
+                            matches!(
+                                member.ty,
+                                TypeState::Resolved(member_type)
+                                    if self.supports_equality_inner(member_type, visiting)
+                            )
+                        });
+                        visiting.pop();
+                        comparable
+                    }
+                    TypeDefinitionKind::Union { .. } | TypeDefinitionKind::Invalid => false,
+                }
+            }
+            ResolvedType::Union(_) => false,
+        }
+    }
+
+    fn membership_matches(&self, item: TypeId, container: TypeId) -> bool {
+        match self.analysis.types.get(container) {
+            ResolvedType::List(element) => item == *element,
+            ResolvedType::Map { key, .. } => item == *key,
+            _ => false,
+        }
+    }
+
+    fn is_printable(&self, ty: TypeId, visiting: &mut Vec<TypeDeclarationId>) -> bool {
+        match self.analysis.types.get(ty) {
+            ResolvedType::Primitive(_) => true,
+            ResolvedType::Nominal(declaration) => {
+                if visiting.contains(declaration) {
+                    return false;
+                }
+                let TypeDefinitionKind::Tuple(members) =
+                    &self.analysis.type_definition(*declaration).kind
+                else {
+                    return false;
+                };
+                visiting.push(*declaration);
+                let printable = members.iter().all(|member| {
+                    matches!(member.ty, TypeState::Resolved(ty) if self.is_printable(ty, visiting))
+                });
+                visiting.pop();
+                printable
+            }
+            ResolvedType::List(_) | ResolvedType::Map { .. } | ResolvedType::Union(_) => false,
+        }
+    }
+
+    fn parse_tuple_index(&self, span: Span) -> Option<usize> {
+        self.analysis
+            .identifier_text(span)
+            .replace('_', "")
+            .parse::<usize>()
+            .ok()
+    }
+}
+
 fn union_style(alternatives: &[UnionAlternative]) -> UnionStyle {
     if alternatives
         .iter()
@@ -2927,8 +4508,8 @@ fn union_style(alternatives: &[UnionAlternative]) -> UnionStyle {
 }
 
 /// Creates the analysis result, resolves declarations and lexical bindings, and
-/// infers every expression type that does not require Phase 6 expected types or
-/// later flow-sensitive analysis.
+/// resolves names, types, constructors, and expected-type-dependent expressions,
+/// leaving only later flow-sensitive analysis deferred.
 pub(crate) fn analyze<'source, 'ast>(
     source: &'source SourceFile,
     program: &'ast Program,
@@ -2980,6 +4561,8 @@ pub(crate) fn analyze<'source, 'ast>(
         literals: Vec::new(),
         binding_types,
         assignment_targets: Vec::new(),
+        constructors: Vec::new(),
+        union_injections: Vec::new(),
         types,
         type_annotations: Vec::new(),
         expression_annotations: Vec::new(),
@@ -3020,6 +4603,7 @@ pub(crate) fn analyze<'source, 'ast>(
     analysis.validate_inline_layouts();
     analysis.resolve_function_bodies();
     analysis.infer_function_bodies();
+    analysis.resolve_expected_types();
     analysis.entry_point = analysis.classify_entry_point();
     analysis
 }
@@ -3599,15 +5183,16 @@ mod tests {
     }
 
     #[test]
-    fn infers_blocks_and_if_expressions_and_retains_deferred_work() {
+    fn resolves_expected_types_and_retains_only_flow_dependent_work() {
         let source = source(
             concat!(
                 "type Choice(A(int) | B(str)); type Any(int | str); ",
                 "fn accept(input Any) {} ",
+                "fn fail() int | Error(str) { Error(\"message\") } ",
                 "fn inspect(flag bool, value int | str) { ",
                 "same := if flag: 1 else: 2; block_value := { local := 1; local }; ",
                 "tested := value is int; tried := value?; pending := [1, 2]; ",
-                "tagged := Choice.A(1); failed := Error(\"message\"); ",
+                "tagged := Choice.A(1); ",
                 "} fn main() { accept(1); }",
             ),
         );
@@ -3621,22 +5206,139 @@ mod tests {
                 TypeState::Resolved(int)
             );
         }
-        for name in ["tested", "tried", "pending", "tagged", "failed"] {
+        for name in ["tested", "tried"] {
             assert!(matches!(
                 analysis.binding_type(binding_named(&analysis, &source, name)),
                 TypeState::Deferred(_)
             ));
         }
+        let TypeState::Resolved(list) =
+            analysis.binding_type(binding_named(&analysis, &source, "pending"))
+        else {
+            panic!("nonempty list should infer its element type");
+        };
+        assert_eq!(analysis.types.get(list), &ResolvedType::List(int));
+        assert!(matches!(
+            analysis.binding_type(binding_named(&analysis, &source, "tagged")),
+            TypeState::Resolved(_)
+        ));
         assert!(analysis.deferred.iter().any(|deferred| {
-            deferred.reason == DeferredReason::FlowDependentType
+            !deferred.resolved && deferred.reason == DeferredReason::FlowDependentType
         }));
-        assert!(analysis.deferred.iter().any(|deferred| {
-            deferred.reason == DeferredReason::ExpectedType
+        assert!(analysis.deferred.iter().all(|deferred| {
+            deferred.resolved || deferred.reason == DeferredReason::FlowDependentType
         }));
-        assert!(analysis.deferred.iter().any(|deferred| {
-            deferred.reason == DeferredReason::Constructor
+        assert_eq!(analysis.constructors.len(), 2);
+        assert_eq!(analysis.union_injections.len(), 1);
+        assert!(analysis.diagnostics.is_empty(), "{}", analysis.diagnostics);
+    }
+
+    #[test]
+    fn resolves_struct_tuple_and_contextual_collection_construction() {
+        let source = source(
+            concat!(
+                "type Point(x int, label str); type Pair(int, str); ",
+                "fn consume(items [int], table {str: int}) {} ",
+                "fn consumeNested(items [[int]]) {} ",
+                "fn main() { ",
+                "point := Point(label = \"p\", x = 1); pair := Pair(2, \"q\"); ",
+                "consume([], {}); consumeNested([[]]); ",
+                "explicit := [] : [int]; nested := [[1], [2]]; ",
+                "indexed := [1][0]; equal := [1] == [1]; length := [1].len(); ",
+                "var reassigned := [1]; reassigned = []; ",
+                "}",
+            ),
+        );
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        let int = analysis.types.primitive(PrimitiveType::Int);
+
+        assert_eq!(analysis.constructors.len(), 2);
+        assert!(matches!(
+            &analysis.constructors[0].kind,
+            ConstructorKind::Struct { argument_members, .. }
+                if argument_members.as_ref() == [1, 0]
+        ));
+        assert!(matches!(
+            analysis.constructors[1].kind,
+            ConstructorKind::Tuple(_)
+        ));
+        let TypeState::Resolved(explicit) =
+            analysis.binding_type(binding_named(&analysis, &source, "explicit"))
+        else {
+            panic!("typed empty list should resolve");
+        };
+        assert_eq!(analysis.types.get(explicit), &ResolvedType::List(int));
+        let TypeState::Resolved(nested) =
+            analysis.binding_type(binding_named(&analysis, &source, "nested"))
+        else {
+            panic!("nested nonempty list should resolve");
+        };
+        assert!(matches!(
+            analysis.types.get(nested),
+            ResolvedType::List(inner)
+                if matches!(analysis.types.get(*inner), ResolvedType::List(element) if *element == int)
+        ));
+        assert_eq!(
+            analysis.binding_type(binding_named(&analysis, &source, "indexed")),
+            TypeState::Resolved(int)
+        );
+        for name in ["equal"] {
+            assert_eq!(
+                analysis.binding_type(binding_named(&analysis, &source, name)),
+                TypeState::Resolved(analysis.types.primitive(PrimitiveType::Bool))
+            );
+        }
+        assert_eq!(
+            analysis.binding_type(binding_named(&analysis, &source, "length")),
+            TypeState::Resolved(int)
+        );
+        let TypeState::Resolved(reassigned) =
+            analysis.binding_type(binding_named(&analysis, &source, "reassigned"))
+        else {
+            panic!("assignment target should acquire the resolved local type");
+        };
+        assert_eq!(analysis.types.get(reassigned), &ResolvedType::List(int));
+        assert!(analysis.calls.iter().any(|call| {
+            matches!(call.target, CallTarget::Builtin(BuiltinMethod::ListLen))
         }));
         assert!(analysis.diagnostics.is_empty(), "{}", analysis.diagnostics);
+    }
+
+    #[test]
+    fn diagnoses_invalid_constructors_and_uncontextualized_empty_collections() {
+        let source = source(
+            concat!(
+                "type Point(x int, y str); type Pair(int, str); type Choice(int | str); ",
+                "type Collections([int] | [str]); ",
+                "fn main() { ",
+                "bad_point := Point(x = 1, x = 2, z = 3); bad_pair := Pair(1); ",
+                "bad_union := Choice(true); ambiguous := Collections([]); ",
+                "empty_list := []; empty_map := {}; ",
+                "bad_error := Error(\"message\"); ",
+                "if [1]: println(); print([1]); ",
+                "}",
+            ),
+        );
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        let diagnostics = analysis.diagnostics.to_string();
+
+        for expected in [
+            "duplicate struct argument 'x'",
+            "unknown struct member 'z'",
+            "missing struct argument 'y'",
+            "tuple constructor expects 2 argument(s), but 1 were provided",
+            "union constructor argument does not select exactly one alternative",
+            "empty collection does not select exactly one union alternative",
+            "empty list requires an expected list type or explicit ascription",
+            "empty map requires an expected map type or explicit ascription",
+            "Error constructor requires an expected union type",
+            "condition must have type bool",
+            "print argument must be a primitive or printable tuple",
+        ] {
+            assert!(diagnostics.contains(expected), "{diagnostics}");
+        }
     }
 
     #[test]

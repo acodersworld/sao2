@@ -152,10 +152,25 @@ annotations so Phase 6 can propagate that expected type. Blocks and compatible
 results remain distinct from language value types.
 
 Flow-sensitive `is`, `switch`, and postfix `?` work remains explicit through
-deferred records. Collection literals, constructors, qualified union tags, and
-`Error(...)` are traversed but remain deferred to Phase 6, which owns expected
-types, collection compatibility, constructor checking, and union injection.
+deferred records.
+
+Phase 6 propagates expected types from function parameters and results,
+constructor members, assignment targets, and enclosing collections. Nonempty
+lists and maps infer a single compatible element or entry type; empty
+collections require either propagated context or an explicit ascription, and
+that context continues through nested collections. Expressions that Phase 5
+deferred only because a child collection lacked a type are recomputed after the
+child resolves.
+
+Constructor annotations identify the selected struct, tuple, or union
+alternative. Struct annotations also map each source-order argument to its
+declaration-order member, preserving evaluation order without requiring later
+stages to repeat name lookup. Tagged alternatives and `Error(...)` retain their
+selected payload alternative. Implicit conversion of a value to an expected
+untagged union is represented by a separate union-injection annotation rather
+than hidden in its expression type. Completed expected-type and constructor
+deferred records are marked resolved; only flow-sensitive work remains active.
 
 The analysis still does not run from the compiler pipeline and performs no
-expected-type propagation. Later milestone-3 phases populate those facts;
-phase 7 installs the analysis call between parsing and the temporary backend.
+flow-sensitive refinement. Phase 7 installs the analysis call between parsing
+and the temporary backend.
