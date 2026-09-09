@@ -1,5 +1,7 @@
 # Current Work: Names and Types
 
+Status: complete.
+
 This document expands milestone 3 of `ROADMAP.md`. The objective is to resolve
 the syntax tree into named declarations, bindings, and static types that later
 compiler stages can consume without repeating name lookup or type inference.
@@ -174,6 +176,12 @@ explicit types and selected union alternatives, or report useful diagnostics.
 Exit criterion: the compiler has a stable name-and-type analysis boundary,
 the hello regression remains executable, and later stages can consume resolved
 facts without repeating lookup or literal conversion.
+
+Phase 7 is complete. The compiler runs analysis immediately after parsing,
+reports its bounded source diagnostics before considering temporary-backend
+limits, and uses the analyzed entry-point, intrinsic-call, expression-type, and
+decoded-literal records for the retained string-print path. Milestone 4 can
+extend that analyzed lowering boundary without repeating frontend work.
 
 ## Design questions encountered during implementation
 

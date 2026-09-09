@@ -2,9 +2,12 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::analysis::{
+    self, Analysis, CallableId, CallTarget, EntryPoint, IntrinsicId, LiteralValue, TypeState,
+};
 use crate::ast::{
     ArgumentKind, Declaration, ExpressionKind, FunctionDeclaration, PrimitiveType, Program,
-    StatementKind, TypeKind,
+    StatementKind,
 };
 use crate::c_emitter;
 use crate::diagnostic::{Diagnostic, Diagnostics};
@@ -41,16 +44,28 @@ impl fmt::Display for CompileError {
     }
 }
 
-/// Stable orchestration boundary from loaded SAO2 source to generated C.
-/// The AST-to-C subset remains temporary until the typed backend replaces it.
+/// Stable orchestration boundary from loaded SAO2 source through parsing and
+/// name-and-type analysis to generated C. The analyzed-AST-to-C subset remains
+/// temporary until the typed backend replaces it.
 pub fn compile(source: &SourceFile) -> Result<PathBuf, CompileError> {
     compile_into(source, Path::new("build"))
 }
 
 fn compile_into(source: &SourceFile, build_directory: &Path) -> Result<PathBuf, CompileError> {
     let program = parser::parse(source).map_err(CompileError::SourceDiagnostics)?;
-    let main = validate_main(source, &program)?;
-    let bytes = lower_temporary_print_main(source, &program, main)?;
+    let mut analysis = analysis::analyze(source, &program);
+    let main = match validate_main(source, &analysis) {
+        Ok(main) => Some(main),
+        Err(diagnostic) => {
+            analysis.diagnostics.push(diagnostic);
+            None
+        }
+    };
+    if !analysis.diagnostics.is_empty() {
+        return Err(CompileError::SourceDiagnostics(analysis.diagnostics));
+    }
+    let main = main.expect("a diagnostic-free analysis has a valid entry point");
+    let bytes = lower_temporary_print_main(source, &program, &analysis, main)?;
     let generated_c = c_emitter::emit_print_program(bytes);
 
     fs::create_dir_all(build_directory).map_err(|error| {
@@ -71,66 +86,34 @@ fn compile_into(source: &SourceFile, build_directory: &Path) -> Result<PathBuf, 
 
 fn validate_main<'program>(
     source: &SourceFile,
-    program: &'program Program,
+    analysis: &Analysis<'_, 'program>,
 ) -> Result<&'program FunctionDeclaration, Diagnostic> {
-    let mains: Vec<&FunctionDeclaration> = program
-        .declarations
-        .iter()
-        .filter_map(|declaration| match declaration {
-            Declaration::Function(function)
-                if identifier_text(source, function.name.span) == "main" =>
-            {
-                Some(function)
-            }
-            _ => None,
-        })
-        .collect();
-
-    let main = match mains.as_slice() {
-        [] => {
-            return Err(Diagnostic::source(
-                source,
-                Span::empty(source.text.len()),
-                "executable program requires one 'main' function",
-            ));
-        }
-        [main] => *main,
-        [_, duplicate, ..] => {
-            return Err(Diagnostic::source(
-                source,
-                duplicate.name.span,
-                "duplicate 'main' function",
-            ));
-        }
-    };
-
-    let parameters_valid = match main.parameters.as_slice() {
-        [] => true,
-        [parameter] => {
-            !parameter.mutable
-                && identifier_text(source, parameter.name.span) == "args"
-                && matches!(&parameter.ty.kind, TypeKind::List(element) if matches!(element.kind, TypeKind::Primitive(PrimitiveType::Str)))
-        }
-        _ => false,
-    };
-    let return_valid = main.return_type.as_ref().is_none_or(|return_type| {
-        matches!(return_type.kind, TypeKind::Primitive(PrimitiveType::Int))
-    });
-    if !parameters_valid || !return_valid {
-        return Err(Diagnostic::source(
+    match analysis.entry_point {
+        EntryPoint::Missing => Err(Diagnostic::source(
             source,
-            main.name.span,
+            Span::empty(source.text.len()),
+            "executable program requires one 'main' function",
+        )),
+        EntryPoint::Duplicate { duplicate, .. } => Err(Diagnostic::source(
+            source,
+            analysis.function_signature(duplicate).node.name.span,
+            "duplicate 'main' function",
+        )),
+        EntryPoint::Invalid(main) => Err(Diagnostic::source(
+            source,
+            analysis.function_signature(main).node.name.span,
             "invalid 'main' signature; expected main(), main() int, main(args [str]), or main(args [str]) int",
-        ));
+        )),
+        EntryPoint::Valid(main) => Ok(analysis.function_signature(main).node),
     }
-    Ok(main)
 }
 
-fn lower_temporary_print_main<'program>(
+fn lower_temporary_print_main<'analysis, 'source, 'program>(
     source: &SourceFile,
     program: &'program Program,
+    analysis: &'analysis Analysis<'source, 'program>,
     main: &'program FunctionDeclaration,
-) -> Result<&'program [u8], Diagnostic> {
+) -> Result<&'analysis [u8], Diagnostic> {
     if program.declarations.len() != 1 {
         let unsupported = program
             .declarations
@@ -155,10 +138,13 @@ fn lower_temporary_print_main<'program>(
     let ExpressionKind::Call { callee, arguments } = &expression.kind else {
         return Err(temporary_backend_error(source, main));
     };
-    let ExpressionKind::Identifier(identifier) = &callee.kind else {
+    let ExpressionKind::Identifier(_) = &callee.kind else {
         return Err(temporary_backend_error(source, main));
     };
-    if identifier_text(source, identifier.span) != "print" {
+    if !matches!(
+        analysis.call_resolution(expression).map(|call| call.target),
+        Some(CallTarget::Callable(CallableId::Intrinsic(IntrinsicId::Print)))
+    ) {
         return Err(temporary_backend_error(source, main));
     }
     let [argument] = arguments.as_slice() else {
@@ -167,10 +153,25 @@ fn lower_temporary_print_main<'program>(
     let ArgumentKind::Positional(argument) = &argument.kind else {
         return Err(temporary_backend_error(source, main));
     };
-    let ExpressionKind::String(bytes) = &argument.kind else {
+    let ExpressionKind::String(_) = &argument.kind else {
         return Err(temporary_backend_error(source, main));
     };
-    Ok(bytes)
+    let str_type = analysis.types.primitive(PrimitiveType::Str);
+    if analysis.expression_annotation(expression).map(|annotation| annotation.state)
+        != Some(TypeState::NoValue)
+        || analysis.expression_annotation(argument).map(|annotation| annotation.state)
+            != Some(TypeState::Resolved(str_type))
+    {
+        return Err(Diagnostic::compiler(
+            "temporary backend received an unresolved expression from analysis",
+        ));
+    }
+    match analysis.literal(argument) {
+        Some(LiteralValue::String(bytes)) => Ok(bytes),
+        _ => Err(Diagnostic::compiler(
+            "temporary backend received a string expression without a decoded literal",
+        )),
+    }
 }
 
 fn temporary_backend_error(source: &SourceFile, main: &FunctionDeclaration) -> Diagnostic {
@@ -179,10 +180,6 @@ fn temporary_backend_error(source: &SourceFile, main: &FunctionDeclaration) -> D
         main.body.span,
         "temporary backend supports only fn main() containing one print call with one string literal",
     )
-}
-
-fn identifier_text(source: &SourceFile, span: Span) -> &str {
-    &source.text[span.start..span.end]
 }
 
 #[cfg(test)]
@@ -234,7 +231,8 @@ mod tests {
         ] {
             let source = source(text);
             let program = parser::parse(&source).unwrap();
-            assert!(validate_main(&source, &program).is_ok(), "{text}");
+            let analysis = analysis::analyze(&source, &program);
+            assert!(validate_main(&source, &analysis).is_ok(), "{text}");
         }
     }
 
@@ -249,7 +247,8 @@ mod tests {
         ] {
             let source = source(text);
             let program = parser::parse(&source).unwrap();
-            let diagnostic = validate_main(&source, &program).unwrap_err().to_string();
+            let analysis = analysis::analyze(&source, &program);
+            let diagnostic = validate_main(&source, &analysis).unwrap_err().to_string();
             assert!(diagnostic.contains(expected), "{text}: {diagnostic}");
         }
     }
@@ -258,10 +257,10 @@ mod tests {
     fn temporary_backend_rejects_valid_but_unsupported_programs() {
         for text in [
             "fn main() {}",
-            "fn main() int { \"value\" }",
+            "fn main() int { 1 }",
             "fn main(args [str]) { print(\"x\"); }",
             "fn main() { println(\"x\"); }",
-            "fn main() { print(\"one\", \"two\"); }",
+            "fn helper() { value := 1; } fn main() { print(\"x\"); }",
         ] {
             let source = source(text);
             let diagnostic = compile_into(&source, &temporary_directory("unsupported"))
@@ -271,6 +270,33 @@ mod tests {
                 diagnostic.contains("temporary backend"),
                 "{text}: {diagnostic}"
             );
+        }
+    }
+
+    #[test]
+    fn analysis_errors_precede_temporary_backend_limits() {
+        for (text, expected) in [
+            (
+                "fn helper() { missing; } fn main() { print(\"x\"); }",
+                "unknown value 'missing'",
+            ),
+            (
+                "fn main() { print(\"one\", \"two\"); }",
+                "print expects exactly one argument",
+            ),
+            (
+                "fn main() { value := []; print(\"x\"); }",
+                "empty list requires an expected list type",
+            ),
+        ] {
+            let source = source(text);
+            let build_directory = temporary_directory("analysis-error");
+            let diagnostic = compile_into(&source, &build_directory)
+                .unwrap_err()
+                .to_string();
+            assert!(diagnostic.contains(expected), "{text}: {diagnostic}");
+            assert!(!diagnostic.contains("temporary backend"), "{diagnostic}");
+            assert!(!build_directory.exists());
         }
     }
 

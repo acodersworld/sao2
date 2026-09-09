@@ -171,6 +171,19 @@ untagged union is represented by a separate union-injection annotation rather
 than hidden in its expression type. Completed expected-type and constructor
 deferred records are marked resolved; only flow-sensitive work remains active.
 
-The analysis still does not run from the compiler pipeline and performs no
-flow-sensitive refinement. Phase 7 installs the analysis call between parsing
-and the temporary backend.
+Phase 7 runs analysis immediately after parsing and before any temporary
+backend checks. Analysis diagnostics stop compilation without creating an
+output file, including diagnostics from declarations outside the backend's
+current executable subset. The compiler boundary uses the analyzed entry-point
+classification rather than repeating signature resolution. The retained
+string-print lowering consumes the resolved intrinsic target, expression
+states, and decoded string literal from `Analysis`; it treats an unresolved
+emitted expression or missing decoded literal as a compiler invariant failure.
+
+The handoff is intentionally a resolved-AST interface rather than a typed IR.
+Milestone 4 may consume the stable declaration and binding identities, type
+table, expression and assignment annotations, constructor selections, union
+injections, literal values, and call targets directly. Milestone 5 still owns
+mutability enforcement, loop-context and return-path validation, exhaustive
+switch checking, union narrowing, postfix `?`, and completion of explicitly
+flow-dependent records. Such deferred expressions cannot enter C generation.

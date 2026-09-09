@@ -1,5 +1,5 @@
-// Walking skeleton: milestone 3 phases 1-6 establish names, scopes, expression types,
-// constructors, and expected types; phase 7 connects the result to the compiler pipeline.
+// Walking skeleton: milestone 3 supplies analyzed names, types, constructors, and
+// expected types to the compiler pipeline; milestone 4 expands the temporary backend.
 #[allow(dead_code)]
 mod analysis;
 mod ast;

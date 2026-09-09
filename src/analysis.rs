@@ -477,6 +477,12 @@ impl TypeTable {
 ///
 /// References provide an explicit connection back to the immutable parser AST;
 /// semantic annotations live only in this structure.
+///
+/// A diagnostic-free result is the milestone-4 resolved-AST input, not yet a
+/// complete semantic proof. Milestone 5 must enforce mutability and control-flow
+/// rules, validate return paths and exhaustive switches, perform union narrowing
+/// and postfix-`?` analysis, and complete every unresolved flow-dependent record
+/// before the affected expression can be lowered.
 #[derive(Debug)]
 pub(crate) struct Analysis<'source, 'ast> {
     pub(crate) source: &'source SourceFile,

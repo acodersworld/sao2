@@ -50,7 +50,7 @@ source-based diagnostics.
 
 ## 3. Names and types
 
-Status: next.
+Status: complete.
 
 The phase breakdown for this milestone is in
 [Current Work: Names and Types](CURRENT_WORK.md).
@@ -65,6 +65,8 @@ The phase breakdown for this milestone is in
 Outcome: declarations and expressions have resolved, statically known types.
 
 ## 4. Early primitive C backend
+
+Status: next.
 
 - Replace the print-only lowering with a deliberately limited direct emitter
   over the resolved syntax tree.
