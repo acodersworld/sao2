@@ -1,6 +1,6 @@
 # Current Work: Early Primitive C Backend
 
-Status: planned.
+Status: in progress (Phase 1).
 
 This document expands milestone 4 of `ROADMAP.md`. The objective is to replace
 the one-call string-print lowering with a small direct C emitter over the

@@ -2,13 +2,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::analysis::{
-    self, Analysis, CallableId, CallTarget, EntryPoint, IntrinsicId, LiteralValue, TypeState,
-};
-use crate::ast::{
-    ArgumentKind, Declaration, ExpressionKind, FunctionDeclaration, PrimitiveType, Program,
-    StatementKind,
-};
+use crate::analysis::{self, Analysis, EntryPoint, FunctionId};
 use crate::c_emitter;
 use crate::diagnostic::{Diagnostic, Diagnostics};
 use crate::parser;
@@ -64,9 +58,10 @@ fn compile_into(source: &SourceFile, build_directory: &Path) -> Result<PathBuf, 
     if !analysis.diagnostics.is_empty() {
         return Err(CompileError::SourceDiagnostics(analysis.diagnostics));
     }
-    let main = main.expect("a diagnostic-free analysis has a valid entry point");
-    let bytes = lower_temporary_print_main(source, &program, &analysis, main)?;
-    let generated_c = c_emitter::emit_print_program(bytes);
+    let main = analysis.function_signature(
+        main.expect("a diagnostic-free analysis has a valid entry point"),
+    );
+    let generated_c = c_emitter::emit(source, &program, &analysis, main)?;
 
     fs::create_dir_all(build_directory).map_err(|error| {
         Diagnostic::compiler(format!(
@@ -84,10 +79,10 @@ fn compile_into(source: &SourceFile, build_directory: &Path) -> Result<PathBuf, 
     Ok(output_path)
 }
 
-fn validate_main<'program>(
+fn validate_main(
     source: &SourceFile,
-    analysis: &Analysis<'_, 'program>,
-) -> Result<&'program FunctionDeclaration, Diagnostic> {
+    analysis: &Analysis<'_, '_>,
+) -> Result<FunctionId, Diagnostic> {
     match analysis.entry_point {
         EntryPoint::Missing => Err(Diagnostic::source(
             source,
@@ -104,82 +99,8 @@ fn validate_main<'program>(
             analysis.function_signature(main).node.name.span,
             "invalid 'main' signature; expected main(), main() int, main(args [str]), or main(args [str]) int",
         )),
-        EntryPoint::Valid(main) => Ok(analysis.function_signature(main).node),
+        EntryPoint::Valid(main) => Ok(main),
     }
-}
-
-fn lower_temporary_print_main<'analysis, 'source, 'program>(
-    source: &SourceFile,
-    program: &'program Program,
-    analysis: &'analysis Analysis<'source, 'program>,
-    main: &'program FunctionDeclaration,
-) -> Result<&'analysis [u8], Diagnostic> {
-    if program.declarations.len() != 1 {
-        let unsupported = program
-            .declarations
-            .iter()
-            .find(|declaration| declaration.span() != main.span)
-            .map_or(main.span, Declaration::span);
-        return Err(Diagnostic::source(
-            source,
-            unsupported,
-            "temporary backend supports only the 'main' function",
-        ));
-    }
-    if !main.parameters.is_empty() || main.return_type.is_some() || main.body.value.is_some() {
-        return Err(temporary_backend_error(source, main));
-    }
-    let [statement] = main.body.statements.as_slice() else {
-        return Err(temporary_backend_error(source, main));
-    };
-    let StatementKind::Expression(expression) = &statement.kind else {
-        return Err(temporary_backend_error(source, main));
-    };
-    let ExpressionKind::Call { callee, arguments } = &expression.kind else {
-        return Err(temporary_backend_error(source, main));
-    };
-    let ExpressionKind::Identifier(_) = &callee.kind else {
-        return Err(temporary_backend_error(source, main));
-    };
-    if !matches!(
-        analysis.call_resolution(expression).map(|call| call.target),
-        Some(CallTarget::Callable(CallableId::Intrinsic(IntrinsicId::Print)))
-    ) {
-        return Err(temporary_backend_error(source, main));
-    }
-    let [argument] = arguments.as_slice() else {
-        return Err(temporary_backend_error(source, main));
-    };
-    let ArgumentKind::Positional(argument) = &argument.kind else {
-        return Err(temporary_backend_error(source, main));
-    };
-    let ExpressionKind::String(_) = &argument.kind else {
-        return Err(temporary_backend_error(source, main));
-    };
-    let str_type = analysis.types.primitive(PrimitiveType::Str);
-    if analysis.expression_annotation(expression).map(|annotation| annotation.state)
-        != Some(TypeState::NoValue)
-        || analysis.expression_annotation(argument).map(|annotation| annotation.state)
-            != Some(TypeState::Resolved(str_type))
-    {
-        return Err(Diagnostic::compiler(
-            "temporary backend received an unresolved expression from analysis",
-        ));
-    }
-    match analysis.literal(argument) {
-        Some(LiteralValue::String(bytes)) => Ok(bytes),
-        _ => Err(Diagnostic::compiler(
-            "temporary backend received a string expression without a decoded literal",
-        )),
-    }
-}
-
-fn temporary_backend_error(source: &SourceFile, main: &FunctionDeclaration) -> Diagnostic {
-    Diagnostic::source(
-        source,
-        main.body.span,
-        "temporary backend supports only fn main() containing one print call with one string literal",
-    )
 }
 
 #[cfg(test)]
@@ -205,7 +126,7 @@ mod tests {
         let output_path = compile_into(&source, &build_directory).unwrap();
         assert_eq!(
             fs::read_to_string(&output_path).unwrap(),
-            c_emitter::emit_print_program(b"hello")
+            c_emitter::render_print_program(b"hello")
         );
         fs::remove_dir_all(build_directory).unwrap();
     }
@@ -255,19 +176,37 @@ mod tests {
 
     #[test]
     fn temporary_backend_rejects_valid_but_unsupported_programs() {
-        for text in [
-            "fn main() {}",
-            "fn main() int { 1 }",
-            "fn main(args [str]) { print(\"x\"); }",
-            "fn main() { println(\"x\"); }",
-            "fn helper() { value := 1; } fn main() { print(\"x\"); }",
+        for (text, expected) in [
+            ("fn main() {}", "exactly one print statement"),
+            ("fn main() int { 1 }", "does not support this type"),
+            (
+                "fn main(args [str]) { print(\"x\"); }",
+                "does not support parameters",
+            ),
+            (
+                "fn main() { println(\"x\"); }",
+                "only a direct call to 'print'",
+            ),
+            (
+                "fn main() { value := 1; }",
+                "does not support this statement",
+            ),
+            ("fn main() { 1; }", "does not support this expression"),
+            (
+                "type Number(int); fn main() { print(\"x\"); }",
+                "does not support type declaration",
+            ),
+            (
+                "fn helper() {} fn main() { print(\"x\"); }",
+                "function declaration other than 'main'",
+            ),
         ] {
             let source = source(text);
             let diagnostic = compile_into(&source, &temporary_directory("unsupported"))
                 .unwrap_err()
                 .to_string();
             assert!(
-                diagnostic.contains("temporary backend"),
+                diagnostic.contains(expected),
                 "{text}: {diagnostic}"
             );
         }
@@ -309,8 +248,25 @@ mod tests {
         let output_path = compile_into(&second_source, &build_directory).unwrap();
         assert_eq!(
             fs::read_to_string(output_path).unwrap(),
-            c_emitter::emit_print_program(b"second")
+            c_emitter::render_print_program(b"second")
         );
+        fs::remove_dir_all(build_directory).unwrap();
+    }
+
+    #[test]
+    fn unsupported_source_does_not_truncate_existing_output() {
+        let build_directory = temporary_directory("preserve-output");
+        fs::create_dir(&build_directory).unwrap();
+        let output_path = build_directory.join("program.c");
+        fs::write(&output_path, "existing generated C").unwrap();
+
+        let source = source("fn main() { println(\"unsupported\"); }");
+        let diagnostic = compile_into(&source, &build_directory)
+            .unwrap_err()
+            .to_string();
+
+        assert!(diagnostic.contains("temporary backend"));
+        assert_eq!(fs::read_to_string(output_path).unwrap(), "existing generated C");
         fs::remove_dir_all(build_directory).unwrap();
     }
 }
