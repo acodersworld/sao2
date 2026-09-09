@@ -52,8 +52,7 @@ source-based diagnostics.
 
 Status: complete.
 
-The phase breakdown for this milestone is in
-[Current Work: Names and Types](CURRENT_WORK.md).
+This milestone's completed analysis handoff is documented in `AST.md`.
 
 - Build the top-level function and nominal-type tables.
 - Resolve primitive, container, struct, tuple, union, and error types.
@@ -66,7 +65,10 @@ Outcome: declarations and expressions have resolved, statically known types.
 
 ## 4. Early primitive C backend
 
-Status: next.
+Status: current.
+
+The phase breakdown for this milestone is in
+[Current Work: Early Primitive C Backend](CURRENT_WORK.md).
 
 - Replace the print-only lowering with a deliberately limited direct emitter
   over the resolved syntax tree.

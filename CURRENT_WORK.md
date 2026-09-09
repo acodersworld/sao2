@@ -1,244 +1,183 @@
-# Current Work: Names and Types
+# Current Work: Early Primitive C Backend
 
-Status: complete.
+Status: planned.
 
-This document expands milestone 3 of `ROADMAP.md`. The objective is to resolve
-the syntax tree into named declarations, bindings, and static types that later
-compiler stages can consume without repeating name lookup or type inference.
+This document expands milestone 4 of `ROADMAP.md`. The objective is to replace
+the one-call string-print lowering with a small direct C emitter over the
+resolved AST produced by milestone 3. The source-to-executable path must remain
+working after every phase.
 
-Milestone 2 supplies the complete parser and the spanned AST documented in
-`AST.md`. The existing hello program must continue to compile and run:
+The milestone deliberately implements only a primitive, side-effect-limited
+subset. Programs outside that subset remain valid SAO2 where analysis permits
+them, but receive a clear temporary-backend source diagnostic. Backend limits
+must not be reported before parser or analysis diagnostics.
 
-```sao2
-fn main() {
-    print("hello");
-}
-```
+## Supported subset and boundary
 
-Milestone 4 begins the early primitive C backend. This milestone supplies its
-analysis inputs; it does not expand the current emitter's executable subset.
+This milestone targets a no-argument `main` with linear primitive computation:
 
-## Scope and analysis boundary
+- signed 64-bit integer and boolean literals and values;
+- parenthesized expressions and the analyzed integer and boolean unary
+  operators;
+- integer arithmetic, remainder, bitwise operations, shifts, comparisons, and
+  boolean operations;
+- primitive local bindings, lexical blocks, identifier reads, direct
+  assignment, and compound assignment;
+- direct `print` and `println` calls for string literals, integers, and booleans;
+- an implicit successful result for `fn main()`, and an integer result for
+  `fn main() int` through a final value or an unconditional `return` supported
+  by the emitter.
 
-This milestone owns:
+The emitter consumes `Analysis` identities, expression types, converted
+literals, binding records, assignment targets, and intrinsic call targets. It
+does not repeat source name lookup, numeric parsing, or type inference. C names
+are generated from stable identities rather than source spellings, so SAO2
+shadowing and C keywords cannot collide.
 
-- top-level function and nominal-type tables;
-- primitive, container, struct, tuple, union, and error type resolution;
-- declaration, constructor, member, and storage validation;
-- lexical scopes, parameters, locals, and unrestricted local shadowing;
-- identification of calls to functions, constructors, and intrinsics;
-- literal conversion and expression type inference; and
-- expected-type propagation for unions and empty collections.
+String values remain limited to the existing direct literal-output path.
+Floats, characters, string locals, user function calls, parameters, control
+flow, constructors, containers, members, indexing, unions, `panic`, and
+flow-dependent expressions remain unsupported by this backend.
 
-Type inference necessarily checks the operands and arguments needed to
-establish a result type. Reuse those checks in later analysis. Milestone 5 owns
-the complete semantic validation pass, including mutability, return paths,
-loop context, exhaustive switches, and flow-sensitive union narrowing.
+Milestone 5 still owns full semantic validity. Until then, the emitter accepts
+only structurally safe cases it can lower without relying on missing
+mutability, return-path, loop-context, or narrowing checks. In particular,
+assignment lowering is limited to mutable local bindings and no expression in
+an emitted construct may have `Error` or `Deferred` state.
 
-Distinguish a resolved expression type from a fully validated program.
-Flow-dependent expressions whose types require milestone-5 narrowing may
-retain explicit deferred analysis records. They must never masquerade as
-successfully typed values or reach C generation with unresolved types.
+## Phase 1: Analyzed emitter boundary
 
-## Phase 1: Analysis representation and diagnostics
+- Replace the specialized print-only lowering with a temporary emitter object
+  that receives `SourceFile`, `Program`, `Analysis`, and the analyzed `main`.
+- Separate subset validation from filesystem output so unsupported programs do
+  not create or truncate `build/program.c`.
+- Centralize source diagnostics for unsupported declarations, signatures,
+  statements, expressions, calls, and types.
+- Generate a complete deterministic C translation unit in memory before the
+  compiler writes it.
+- Preserve the exact existing `print("...")` C output behavior, including
+  embedded NUL bytes and Windows binary stdout handling.
 
-- Introduce a name-and-type analysis entry point over `SourceFile` and `Program`.
-- Add stable identities for declarations, bindings, and resolved types.
-- Represent primitive and container types alongside nominal declaration
-  identities; distinguish no-value results and non-returning expressions from
-  language value types.
-- Retain source spans and connections to AST nodes in analysis results.
-- Keep analysis annotations separate from parser syntax invariants.
-- Reuse bounded, source-ordered diagnostics. Use an internal error state to
-  suppress cascading failures without treating an error as a valid type.
-- Keep the representation dependency-free and small; a full typed IR belongs
-  to milestone 6.
+Exit criterion: the hello regression travels through the new emitter boundary,
+while analyzed but unsupported programs fail before output creation.
 
-Exit criterion: analysis results can record identities, types, errors, and
-deferred work without changing parsing or the existing executable path.
+## Phase 2: Primitive values and expressions
 
-## Phase 2: Top-level declarations and signatures
+- Add explicit temporary C representations for SAO2 `int` and `bool`, using
+  fixed-width integer and boolean C types.
+- Emit converted integer and boolean literals from analysis annotations rather
+  than reparsing source text.
+- Emit binding reads, parentheses, unary `+`, unary `-`, `~`, and `!` according
+  to their resolved operand types.
+- Emit integer arithmetic, remainder, bitwise operators, shifts, integer
+  comparisons, equality, and short-circuit boolean operators.
+- Parenthesize generated expressions deliberately so correctness does not
+  depend on matching the C precedence table.
+- Reject every expression form or resolved type not explicitly supported.
 
-- Collect all type and function names before resolving declaration bodies.
-- Use separate type and value namespaces.
-- Diagnose duplicate declarations within their respective namespaces and
-  duplicate function parameter names.
-- Resolve function parameter and return annotations independently of function
-  body order, supporting forward calls and direct or mutual recursion.
-- Register compiler intrinsics with explicit identities and signature rules.
-- Distinguish ordinary function calls from constructors and built-in calls;
-  do not introduce first-class function values or overloads.
-- Preserve the compiler boundary's exactly-one-main and four-signature checks;
-  reuse resolved signatures when integrating the new analysis.
+During this milestone, generated signed C operations are intentionally
+unchecked. Tests must avoid overflow, division or remainder by zero, invalid
+shift counts, and other cases for which the roadmap permits temporary host-C
+behavior. Runtime checks belong to typed-IR lowering in milestone 6.
 
-Exit criterion: every declared function and type has a stable identity and
-resolved signature, or a precise declaration diagnostic.
+Exit criterion: pure in-range integer and boolean expressions lower
+deterministically from resolved analysis facts.
 
-## Phase 3: Type definitions, unions, and storage
+## Phase 3: Bindings, scopes, and assignments
 
-- Resolve primitive, named, list, map, and parenthesized type syntax.
-- Classify declarations as structs, tuples, or unions according to the design
-  and grammar; reject mixed named and unnamed members.
-- Give each named type nominal identity even when another declaration has the
-  same structure.
-- Validate member uniqueness, union alternative uniqueness, tag uniqueness,
-  and the special final-position rule for `Error`.
-- Respect the designed distinction between tagged alternatives and the special
-  error alternative; reject invalid tagged/untagged combinations.
-- Ignore alternative order for union type identity while retaining source
-  order for diagnostics and preserving explicitly nested union structure.
-- Keep `&` as member storage metadata, permitted only for struct-valued
-  members; do not construct a first-class reference type.
-- Detect recursive inline layouts, including dependencies through tuples and
-  union payloads. Referenced struct members and container references break
-  inline layout cycles.
-- Validate map key types, including recursively composed immutable tuples.
+- Emit primitive local declarations with generated names based on `BindingId`.
+- Initialize locals in source evaluation order and preserve lexical block
+  structure and same-scope shadowing.
+- Resolve identifier reads exclusively through recorded `NameResolution`.
+- Lower direct assignments through `AssignmentTargetAnnotation`; do not add
+  member or index assignment support.
+- Lower the supported compound assignments only when analysis gives both sides
+  the required primitive type.
+- Accept assignment only to mutable local bindings until milestone 5 installs
+  complete mutability validation.
+- Reject no-value, non-returning, error, or deferred initializers and operands
+  instead of manufacturing C values.
 
-Exit criterion: type definitions resolve independently of source order, valid
-referenced recursion terminates, and invalid or infinitely sized types receive
-bounded diagnostics.
+Exit criterion: linear programs can declare, shadow, read, and update primitive
+locals without exposing source identifiers to C.
 
-## Phase 4: Lexical scopes and binding resolution
+## Phase 4: Output and entry-point results
 
-- Resolve parameters and local references with explicit binding identities.
-- Resolve each initializer before introducing its local binding.
-- Permit shadowing in nested scopes and within the same scope.
-- Traverse braced and colon-form bodies using the scopes defined by the
-  language; resolve loop bindings only where they are visible.
-- Resolve assignment roots, call targets, and member receivers.
-- Preserve declaration mutability and access information for milestone 5.
-- Diagnose unknown names without falling through to a different namespace or
-  silently substituting an intrinsic.
+- Generalize the retained byte-safe output support so multiple `print` and
+  `println` statements can be emitted in evaluation order.
+- Preserve exact string-literal byte output and add decimal integer and
+  `true`/`false` boolean output needed by executable arithmetic tests.
+- Check C library output results and return a nonzero status on output failure,
+  retaining the walking skeleton's current behavior.
+- Emit `fn main()` with an implicit successful result.
+- Emit supported `fn main() int` final values and unconditional integer returns
+  through C `main`; keep native exit-code fixtures within the portable test
+  range.
+- Keep `main(args [str])` valid at the language boundary but explicitly
+  unsupported by this milestone's no-argument backend.
 
-Exit criterion: each name use resolves to the correct declaration or binding.
-For `x := 1; x := x + 1;`, the second initializer refers to the first binding
-and subsequent uses refer to the second.
+Exit criterion: an analyzed program can compute primitive values, print its
+observable result, and return a small integer exit status through generated C.
 
-## Phase 5: Literals and expression type inference
+## Phase 5: Integration, tests, and handoff
 
-- Convert numeric lexemes once, respecting decimal, hexadecimal, binary, and
-  separator syntax; retain decoded values for downstream consumers.
-- Check literal representability, including the signed minimum integer under
-  unary minus and finite binary64 values. Keep runtime arithmetic checks for
-  the later lowering milestone.
-- Type primitive literals, identifier references, parentheses, and unary and
-  binary expressions according to the design's operand rules.
-- Record result types for comparisons, boolean operations, indexing, and
-  member access; do not import C's implicit conversions or truthiness.
-- Resolve struct fields, tuple positions, and built-in container methods.
-- Use declared function signatures to infer call results, including recursive
-  calls, without inferring a signature from its body.
-- Represent intrinsic argument rules and no-value/non-returning results.
-- Infer local types and ordinary block and if-expression result types where
-  context suffices; keep statements distinct from value-producing expressions.
-- Record type-dependent union tests, switch labels, and postfix `?` analysis
-  needs for milestone 5 rather than guessing narrowed types.
+- Add emitter unit tests for stable generated C, identity-based names,
+  precedence preservation, multiple output operations, and unsupported-node
+  diagnostics.
+- Add compiler tests proving parser and analysis errors still precede backend
+  capability errors and no C file is written on failure.
+- Add native end-to-end fixtures for arithmetic, comparisons, boolean output,
+  local mutation and shadowing, string-print regression, and integer exit
+  status; skip only native assertions when no supported C compiler is present.
+- Keep test arithmetic inside the temporary unchecked domain documented above.
+- Update `AST.md` with the exact analyzed-AST facts consumed by the emitter and
+  the capability obligations handed to milestone 5.
+- Mark this emitter as temporary and avoid designing APIs that milestone 6's
+  typed IR would be forced to preserve.
 
-Exit criterion: ordinary expressions and local declarations have concrete
-static types and converted literal payloads. Invalid type combinations receive
-source diagnostics; flow-dependent obligations remain explicitly identified.
+Exit criterion: the milestone's complete primitive subset builds and executes
+through the existing CLI, unsupported valid programs receive stable source
+diagnostics, and milestone 5 can add semantic validation without undoing the
+backend boundary.
 
-## Phase 6: Constructors and expected types
+## Implementation constraints
 
-- Validate named struct arguments for missing, duplicate, and unknown members.
-- Validate positional tuple arguments and declared member types.
-- Preserve source argument evaluation order independently of declaration order.
-- Resolve untagged union constructors, qualified tagged constructors, and
-  `Error(value)`.
-- Propagate expected types from parameter signatures, constructor members,
-  assignment targets, return annotations, and enclosing collection contexts.
-- Record implicit injection into an expected union alternative explicitly.
-- Infer nonempty collection types using the design's compatibility rules.
-- Require a suitable expected type or explicit ascription for empty lists and
-  maps; propagate that context through nested collections.
-- Reject incompatible or ambiguous construction without inventing implicit
-  numeric conversions, union flattening, or new inference rules.
-
-Exit criterion: constructors and context-dependent expressions resolve with
-explicit types and selected union alternatives, or report useful diagnostics.
-
-## Phase 7: Pipeline integration and handoff
-
-- Run name-and-type analysis after parsing and before temporary backend checks.
-- Analyze all declarations, including functions the temporary backend cannot
-  yet execute.
-- Keep the current print-only executable regression working; distinguish name
-  and type errors from valid programs outside the backend's supported subset.
-- Supply resolved identities, types, literal values, and intrinsic targets to
-  milestone 4. Prevent emission of expressions with error or deferred states.
-- Document the obligations retained for milestone 5 in the analysis interface.
-- Add focused valid and invalid fixtures for each phase; parser conformance
-  fixtures are not automatically semantically valid programs.
-- Preserve the CLI, output paths, source/tool/program error categories, and
-  existing 20-diagnostic limit.
-- Update `AST.md` with the concrete analysis handoff once implemented.
-
-Exit criterion: the compiler has a stable name-and-type analysis boundary,
-the hello regression remains executable, and later stages can consume resolved
-facts without repeating lookup or literal conversion.
-
-Phase 7 is complete. The compiler runs analysis immediately after parsing,
-reports its bounded source diagnostics before considering temporary-backend
-limits, and uses the analyzed entry-point, intrinsic-call, expression-type, and
-decoded-literal records for the retained string-print path. Milestone 4 can
-extend that analyzed lowering boundary without repeating frontend work.
-
-## Design questions encountered during implementation
-
-Use `DESIGN.md` and `GRAMMAR.ebnf` as the authorities. Where they leave a
-decision unresolved or disagree, record an explicit design decision before
-implementing the affected behavior. Known examples to check include:
-
-- primitive conversion calls such as `int(value)`, which the design describes
-  but the current primary-expression grammar does not admit;
-- collisions between intrinsic names, user declarations, and constructor
-  names in call position; and
-- any ambiguous declaration classification or union/error construction case
-  not determined by the documented rules.
-
-These questions do not authorize unrelated syntax changes or block independent
-analysis work.
+- Keep the compiler dependency-free.
+- Invoke the host compiler with argument lists through the existing toolchain
+  boundary; generated source never becomes a shell command.
+- Keep generated artifacts under `build/` and preserve current CLI paths and
+  source, compiler/toolchain, and program error categories.
+- Consume decoded literals and stable semantic identities from `Analysis`.
+- Emit only expressions whose latest analysis state is resolved or explicitly
+  no-value where the surrounding statement permits it.
+- Preserve left-to-right observable evaluation. The supported expression
+  subset is otherwise side-effect free, so direct C operators cannot reorder
+  visible operations.
+- Do not add runtime arithmetic checks during this milestone.
 
 ## Non-goals
 
-- Expanded C emission or native arithmetic execution (milestone 4)
-- Complete mutability, control-flow, narrowing, and return-path validation
-  (milestone 5)
-- Typed IR, evaluation-order lowering, or runtime arithmetic checks (milestone 6)
-- Runtime layouts, allocation, escape analysis, garbage collection, or containers
-- New language syntax or undocumented implicit conversions
-
-The early backend's temporary unchecked arithmetic does not change this
-milestone's static type rules or literal range validation.
+- Floats, characters, general string values, or primitive conversions
+- User-defined function emission or calls
+- Parameters or command-line argument decoding
+- `if`, loops, `switch`, short-circuit expressions with side-effecting calls,
+  or general control-flow validation
+- Structs, tuples, unions, errors, lists, maps, members, or indexing
+- Full mutability, return-path, unreachable-code, or loop-context validation
+- Checked arithmetic, bounds checks, runtime source locations, or typed IR
+- Runtime layouts, allocation, escape analysis, or garbage collection
 
 ## Test requirements
 
-- Forward declarations, recursive calls, duplicate names, and separate namespaces
-- Nominal identity, container identity, union ordering, and preserved nesting
-- Valid referenced recursion and rejected inline layout cycles
-- Invalid member forms, referenced storage, tags, error ordering, and map keys
-- Parameter/local lookup, initializer visibility, and same-scope shadowing
-- Literal boundaries and operator, call, index, and member result types
-- Struct, tuple, union, and error constructors
-- Empty collections with and without expected types, including nested contexts
-- Explicit deferred states for flow-dependent analysis
-- Multiple errors, source ordering, diagnostic caps, and cascade suppression
-- Analysis-to-backend handoff and the existing hello end-to-end regression
-
-Add tests alongside each phase. Execute verification only when repository
-instructions permit it; record any verification that remains outstanding.
-
-## Definition of done
-
-Milestone 3 is complete when:
-
-- top-level declarations, signatures, and lexical bindings resolve independently
-  of source order where the language permits it;
-- all documented type forms, member storage rules, and constructors are covered;
-- ordinary expressions carry resolved types and converted literal values;
-- expected types resolve union injection and empty collections;
-- remaining flow-sensitive work is explicit and reserved for milestone 5;
-- milestone 4 can consume resolved primitive programs without redoing analysis;
-- source diagnostics remain precise and bounded; and
-- the existing executable path is preserved, with test coverage added and
-  verification status recorded.
+- The exact string-print and empty-string regressions
+- Integer literal boundaries used within portable emitted operations
+- Unary, arithmetic, remainder, bitwise, shift, comparison, and boolean cases
+- Parenthesized combinations whose SAO2 and C precedence could otherwise differ
+- Mutable locals, direct and compound assignment, nested blocks, and shadowing
+- Multiple `print`/`println` calls with string, integer, and boolean output
+- No-value `main`, integer final value, and unconditional integer return
+- Analysis failure in an otherwise backend-unsupported program
+- Clear rejection of every excluded declaration, signature, statement,
+  expression, call, assignment target, and primitive type encountered by the
+  emitter
+- No generated file on parser, analysis, or backend-capability failure
