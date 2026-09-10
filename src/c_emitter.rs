@@ -1,9 +1,7 @@
 //! Temporary direct C emitter over the analyzed AST.
 //!
-//! It retains the walking skeleton's exact string `print` program and has a
-//! separate primitive-only path for locals, assignments, and lexical blocks.
-//! Output and entry-point results remain separate until Phase 4, and milestone
-//! 6 replaces this emitter with typed-IR lowering.
+//! It supports the milestone-4 primitive subset directly over resolved syntax.
+//! Milestone 6 replaces this emitter with typed-IR lowering.
 
 use std::fmt::Write;
 
@@ -70,6 +68,9 @@ impl CPrimitive {
 struct PrimitiveUsage {
     int: bool,
     boolean: bool,
+    output: bool,
+    integer_output: bool,
+    next_text: usize,
 }
 
 impl PrimitiveUsage {
@@ -79,50 +80,56 @@ impl PrimitiveUsage {
             CPrimitive::Bool => self.boolean = true,
         }
     }
+
+    fn next_text_id(&mut self) -> usize {
+        let id = self.next_text;
+        self.next_text += 1;
+        id
+    }
 }
 
 impl<'analysis, 'source, 'ast> TemporaryEmitter<'analysis, 'source, 'ast> {
     fn emit(&self) -> Result<String, Diagnostic> {
         self.validate_declarations()?;
         self.validate_main_signature()?;
-
-        if let Some(bytes) = self.legacy_print_bytes()? {
-            return Ok(render_print_program(bytes));
-        }
-        self.emit_primitive_program()
+        self.emit_program()
     }
 
-    fn legacy_print_bytes(&self) -> Result<Option<&'analysis [u8]>, Diagnostic> {
+    fn emit_program(&self) -> Result<String, Diagnostic> {
         let body = &self.main.node.body;
-        let [statement] = body.statements.as_slice() else {
-            return Ok(None);
-        };
-        if body.value.is_some()
-            || !matches!(&statement.kind, StatementKind::Expression(Expression {
-                kind: ExpressionKind::Call { .. },
-                ..
-            }))
-        {
-            return Ok(None);
-        }
-        self.validate_print_statement(statement).map(Some)
-    }
-
-    fn emit_primitive_program(&self) -> Result<String, Diagnostic> {
-        let body = &self.main.node.body;
-        if let Some(value) = &body.value {
-            return Err(self.unsupported_expression(value));
-        }
-        if body.statements.is_empty() {
-            return Err(self.unsupported_statement(
-                body.span,
-                "temporary backend requires at least one primitive statement",
-            ));
-        }
-
         let mut statements = String::new();
         let mut usage = PrimitiveUsage::default();
-        self.render_block_contents(body, 1, &mut statements, &mut usage)?;
+        let returns = self.render_block_contents(body, 1, &mut statements, &mut usage)?;
+        let int = self.analysis.types.primitive(PrimitiveType::Int);
+        match (self.main.result, &body.value) {
+            (TypeState::NoValue, None) => statements.push_str("    return 0;\n"),
+            (TypeState::NoValue, Some(value)) => {
+                return Err(self.unsupported(
+                    value.span,
+                    "temporary backend does not support a final value in no-value main",
+                ));
+            }
+            (TypeState::Resolved(result), Some(value)) if result == int => {
+                if self.primitive_expression_type(value)? != CPrimitive::Int {
+                    return Err(self.inconsistent_expression_type(value));
+                }
+                usage.record(CPrimitive::Int);
+                writeln!(statements, "    return {};", self.render_expression(value)?)
+                    .expect("writing to a String cannot fail");
+            }
+            (TypeState::Resolved(result), None) if result == int && returns => {}
+            (TypeState::Resolved(result), None) if result == int => {
+                return Err(self.unsupported(
+                    body.span,
+                    "temporary backend requires integer main to have a final value or unconditional return",
+                ));
+            }
+            _ => {
+                return Err(Diagnostic::compiler(
+                    "temporary backend received an inconsistent analyzed main result",
+                ));
+            }
+        }
 
         let mut output = String::new();
         if usage.boolean {
@@ -133,10 +140,31 @@ impl<'analysis, 'source, 'ast> TemporaryEmitter<'analysis, 'source, 'ast> {
             writeln!(output, "#include {}", CPrimitive::Int.required_header())
                 .expect("writing to a String cannot fail");
         }
-        if usage.boolean || usage.int {
+        if usage.integer_output {
+            output.push_str("#include <inttypes.h>\n");
+        }
+        if usage.output {
+            output.push_str("#include <stdio.h>\n");
+        }
+        if usage.boolean || usage.int || usage.output {
             output.push('\n');
         }
+        if usage.output {
+            output.push_str(concat!(
+                "#ifdef _WIN32\n",
+                "#include <fcntl.h>\n",
+                "#include <io.h>\n",
+                "#endif\n\n",
+            ));
+        }
         output.push_str("int main(void) {\n");
+        if usage.output {
+            output.push_str(concat!(
+                "#ifdef _WIN32\n",
+                "    if (_setmode(_fileno(stdout), _O_BINARY) == -1) return 1;\n",
+                "#endif\n",
+            ));
+        }
         output.push_str(&statements);
         output.push_str("}\n");
         Ok(output)
@@ -169,69 +197,20 @@ impl<'analysis, 'source, 'ast> TemporaryEmitter<'analysis, 'source, 'ast> {
                 "temporary backend does not support parameters on 'main'",
             ));
         }
-        if let Some(return_type) = &self.main.node.return_type {
-            return Err(self.unsupported_type(return_type));
-        }
-        if self.main.result != TypeState::NoValue {
-            return Err(Diagnostic::compiler(
-                "temporary backend received an inconsistent analyzed main signature",
-            ));
+        let int = self.analysis.types.primitive(PrimitiveType::Int);
+        match (&self.main.node.return_type, self.main.result) {
+            (None, TypeState::NoValue) => {}
+            (Some(_), TypeState::Resolved(result)) if result == int => {}
+            (Some(return_type), TypeState::Resolved(_)) => {
+                return Err(self.unsupported_type(return_type));
+            }
+            _ => {
+                return Err(Diagnostic::compiler(
+                    "temporary backend received an inconsistent analyzed main signature",
+                ));
+            }
         }
         Ok(())
-    }
-
-    fn validate_print_statement(
-        &self,
-        statement: &'ast Statement,
-    ) -> Result<&'analysis [u8], Diagnostic> {
-        let StatementKind::Expression(expression) = &statement.kind else {
-            return Err(self.unsupported_statement(
-                statement.span,
-                "temporary backend does not support this statement",
-            ));
-        };
-        let ExpressionKind::Call { arguments, .. } = &expression.kind else {
-            return Err(self.unsupported_expression(expression));
-        };
-
-        if !matches!(
-            self.analysis.call_resolution(expression).map(|call| call.target),
-            Some(CallTarget::Callable(CallableId::Intrinsic(IntrinsicId::Print)))
-        ) {
-            return Err(self.unsupported_call(expression));
-        }
-        let [argument] = arguments.as_slice() else {
-            return Err(self.unsupported_call(expression));
-        };
-        let ArgumentKind::Positional(argument) = &argument.kind else {
-            return Err(self.unsupported(
-                argument.span,
-                "temporary backend does not support named call arguments",
-            ));
-        };
-        if !matches!(&argument.kind, ExpressionKind::String(_)) {
-            return Err(self.unsupported_expression(argument));
-        }
-
-        let str_type = self
-            .analysis
-            .types
-            .primitive(crate::ast::PrimitiveType::Str);
-        if self.analysis.expression_annotation(expression).map(|annotation| annotation.state)
-            != Some(TypeState::NoValue)
-            || self.analysis.expression_annotation(argument).map(|annotation| annotation.state)
-                != Some(TypeState::Resolved(str_type))
-        {
-            return Err(Diagnostic::compiler(
-                "temporary backend received an unresolved expression from analysis",
-            ));
-        }
-        match self.analysis.literal(argument) {
-            Some(LiteralValue::String(bytes)) => Ok(bytes),
-            _ => Err(Diagnostic::compiler(
-                "temporary backend received a string expression without a decoded literal",
-            )),
-        }
     }
 
     fn render_block_contents(
@@ -240,14 +219,12 @@ impl<'analysis, 'source, 'ast> TemporaryEmitter<'analysis, 'source, 'ast> {
         indentation: usize,
         output: &mut String,
         usage: &mut PrimitiveUsage,
-    ) -> Result<(), Diagnostic> {
-        if let Some(value) = &block.value {
-            return Err(self.unsupported_expression(value));
-        }
+    ) -> Result<bool, Diagnostic> {
+        let mut returns = false;
         for statement in &block.statements {
-            self.render_statement(statement, indentation, output, usage)?;
+            returns |= self.render_statement(statement, indentation, output, usage)?;
         }
-        Ok(())
+        Ok(returns)
     }
 
     fn render_statement(
@@ -256,7 +233,7 @@ impl<'analysis, 'source, 'ast> TemporaryEmitter<'analysis, 'source, 'ast> {
         indentation: usize,
         output: &mut String,
         usage: &mut PrimitiveUsage,
-    ) -> Result<(), Diagnostic> {
+    ) -> Result<bool, Diagnostic> {
         match &statement.kind {
             StatementKind::Local {
                 mutable,
@@ -301,28 +278,219 @@ impl<'analysis, 'source, 'ast> TemporaryEmitter<'analysis, 'source, 'ast> {
                     self.render_expression(initializer)?
                 )
                 .expect("writing to a String cannot fail");
-                Ok(())
+                Ok(false)
             }
             StatementKind::Assignment {
                 target,
                 operator,
                 value,
                 ..
-            } => self.render_assignment(target, *operator, value, indentation, output, usage),
+            } => {
+                self.render_assignment(target, *operator, value, indentation, output, usage)?;
+                Ok(false)
+            }
             StatementKind::Block(block) => {
+                if let Some(value) = &block.value {
+                    return Err(self.unsupported_expression(value));
+                }
                 Self::write_indentation(output, indentation);
                 output.push_str("{\n");
-                self.render_block_contents(block, indentation + 1, output, usage)?;
+                let returns =
+                    self.render_block_contents(block, indentation + 1, output, usage)?;
                 Self::write_indentation(output, indentation);
                 output.push_str("}\n");
-                Ok(())
+                Ok(returns)
             }
-            StatementKind::Expression(expression) => Err(self.unsupported_expression(expression)),
+            StatementKind::Expression(expression) => {
+                self.render_output(expression, indentation, output, usage)?;
+                Ok(false)
+            }
+            StatementKind::Return(value) => {
+                let TypeState::Resolved(result) = self.main.result else {
+                    return Err(self.unsupported_statement(
+                        statement.span,
+                        "temporary backend supports return only from integer main",
+                    ));
+                };
+                let int = self.analysis.types.primitive(PrimitiveType::Int);
+                if result != int {
+                    return Err(Diagnostic::compiler(
+                        "temporary backend received an inconsistent main return type",
+                    ));
+                }
+                let Some(value) = value else {
+                    return Err(self.unsupported_statement(
+                        statement.span,
+                        "temporary backend requires integer return to have a value",
+                    ));
+                };
+                if self.primitive_expression_type(value)? != CPrimitive::Int {
+                    return Err(self.inconsistent_expression_type(value));
+                }
+                usage.record(CPrimitive::Int);
+                Self::write_indentation(output, indentation);
+                writeln!(output, "return {};", self.render_expression(value)?)
+                    .expect("writing to a String cannot fail");
+                Ok(true)
+            }
             _ => Err(self.unsupported_statement(
                 statement.span,
                 "temporary backend does not support this statement",
             )),
         }
+    }
+
+    fn render_output(
+        &self,
+        expression: &'ast Expression,
+        indentation: usize,
+        output: &mut String,
+        usage: &mut PrimitiveUsage,
+    ) -> Result<(), Diagnostic> {
+        let ExpressionKind::Call { arguments, .. } = &expression.kind else {
+            return Err(self.unsupported_expression(expression));
+        };
+        let Some(resolution) = self.analysis.call_resolution(expression) else {
+            return Err(Diagnostic::compiler(
+                "temporary backend received an output call without call resolution",
+            ));
+        };
+        let intrinsic = match resolution.target {
+            CallTarget::Callable(CallableId::Intrinsic(IntrinsicId::Print)) => IntrinsicId::Print,
+            CallTarget::Callable(CallableId::Intrinsic(IntrinsicId::Println)) => {
+                IntrinsicId::Println
+            }
+            _ => return Err(self.unsupported_call(expression)),
+        };
+        if self
+            .analysis
+            .expression_annotation(expression)
+            .map(|annotation| annotation.state)
+            != Some(TypeState::NoValue)
+        {
+            return Err(Diagnostic::compiler(
+                "temporary backend received an unresolved output call",
+            ));
+        }
+
+        let argument = match (intrinsic, arguments.as_slice()) {
+            (IntrinsicId::Print, [argument]) | (IntrinsicId::Println, [argument]) => {
+                let ArgumentKind::Positional(argument) = &argument.kind else {
+                    return Err(self.unsupported(
+                        argument.span,
+                        "temporary backend does not support named output arguments",
+                    ));
+                };
+                Some(argument)
+            }
+            (IntrinsicId::Println, []) => None,
+            _ => return Err(self.unsupported_call(expression)),
+        };
+
+        usage.output = true;
+        let newline = intrinsic == IntrinsicId::Println;
+        if let Some(argument) = argument {
+            self.render_output_value(argument, newline, indentation, output, usage)?;
+        } else if newline {
+            Self::write_indentation(output, indentation);
+            output.push_str("if (fputc('\\n', stdout) == EOF) return 1;\n");
+        }
+        Ok(())
+    }
+
+    fn render_output_value(
+        &self,
+        argument: &'ast Expression,
+        newline: bool,
+        indentation: usize,
+        output: &mut String,
+        usage: &mut PrimitiveUsage,
+    ) -> Result<(), Diagnostic> {
+        let Some(annotation) = self.analysis.expression_annotation(argument) else {
+            return Err(Diagnostic::compiler(
+                "temporary backend received an output argument without a type annotation",
+            ));
+        };
+        let str_type = self.analysis.types.primitive(PrimitiveType::Str);
+        if annotation.state == TypeState::Resolved(str_type) {
+            if !matches!(&argument.kind, ExpressionKind::String(_)) {
+                return Err(self.unsupported(
+                    argument.span,
+                    "temporary backend supports string output only for direct literals",
+                ));
+            }
+            let Some(LiteralValue::String(bytes)) = self.analysis.literal(argument) else {
+                return Err(Diagnostic::compiler(
+                    "temporary backend received a string output without a decoded literal",
+                ));
+            };
+            let id = usage.next_text_id();
+            Self::write_indentation(output, indentation);
+            write!(output, "static const unsigned char sao2_text_{id}[] = {{")
+                .expect("writing to a String cannot fail");
+            if bytes.is_empty() {
+                if newline {
+                    output.push_str("10");
+                } else {
+                    output.push('0');
+                }
+            } else {
+                for (index, byte) in bytes.iter().enumerate() {
+                    if index != 0 {
+                        output.push_str(", ");
+                    }
+                    write!(output, "{byte}").expect("writing to a String cannot fail");
+                }
+                if newline {
+                    output.push_str(", 10");
+                }
+            }
+            output.push_str("};\n");
+            let output_length = bytes.len() + if newline { 1 } else { 0 };
+            Self::write_indentation(output, indentation);
+            writeln!(
+                output,
+                "if (fwrite(sao2_text_{id}, 1, {}, stdout) != {}) return 1;",
+                output_length,
+                output_length
+            )
+            .expect("writing to a String cannot fail");
+            return Ok(());
+        }
+
+        let primitive = self.primitive_expression_type(argument)?;
+        usage.record(primitive);
+        Self::write_indentation(output, indentation);
+        match primitive {
+            CPrimitive::Int => {
+                usage.integer_output = true;
+                if newline {
+                    writeln!(
+                        output,
+                        "if (printf(\"%\" PRId64 \"\\n\", {}) < 0) return 1;",
+                        self.render_expression(argument)?
+                    )
+                    .expect("writing to a String cannot fail");
+                } else {
+                    writeln!(
+                        output,
+                        "if (printf(\"%\" PRId64, {}) < 0) return 1;",
+                        self.render_expression(argument)?
+                    )
+                    .expect("writing to a String cannot fail");
+                }
+            }
+            CPrimitive::Bool => {
+                let suffix = if newline { "\\n" } else { "" };
+                writeln!(
+                    output,
+                    "if (fputs(({}) ? \"true{suffix}\" : \"false{suffix}\", stdout) == EOF) return 1;",
+                    self.render_expression(argument)?
+                )
+                .expect("writing to a String cannot fail");
+            }
+        }
+        Ok(())
     }
 
     fn render_assignment(
@@ -723,7 +891,10 @@ impl<'analysis, 'source, 'ast> TemporaryEmitter<'analysis, 'source, 'ast> {
             ExpressionKind::Call { callee, .. } => callee.span,
             _ => expression.span,
         };
-        self.unsupported(span, "temporary backend supports only a direct call to 'print'")
+        self.unsupported(
+            span,
+            "temporary backend supports only direct calls to 'print' and 'println'",
+        )
     }
 
     fn unsupported_type(&self, ty: &Type) -> Diagnostic {
@@ -735,6 +906,7 @@ impl<'analysis, 'source, 'ast> TemporaryEmitter<'analysis, 'source, 'ast> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn render_print_program(bytes: &[u8]) -> String {
     let mut output = String::from(concat!(
         "#include <stdio.h>\n\n",
@@ -746,7 +918,7 @@ pub(crate) fn render_print_program(bytes: &[u8]) -> String {
         "#ifdef _WIN32\n",
         "    if (_setmode(_fileno(stdout), _O_BINARY) == -1) return 1;\n",
         "#endif\n",
-        "    static const unsigned char sao2_text[] = {",
+        "    static const unsigned char sao2_text_0[] = {",
     ));
 
     if bytes.is_empty() {
@@ -762,7 +934,7 @@ pub(crate) fn render_print_program(bytes: &[u8]) -> String {
 
     write!(
         output,
-        "}};\n    return fwrite(sao2_text, 1, {}, stdout) == {} ? 0 : 1;\n}}\n",
+        "}};\n    if (fwrite(sao2_text_0, 1, {}, stdout) != {}) return 1;\n    return 0;\n}}\n",
         bytes.len(),
         bytes.len()
     )
@@ -858,9 +1030,10 @@ mod tests {
                 "#ifdef _WIN32\n",
                 "    if (_setmode(_fileno(stdout), _O_BINARY) == -1) return 1;\n",
                 "#endif\n",
-                "    static const unsigned char sao2_text[] = ",
+                "    static const unsigned char sao2_text_0[] = ",
                 "{104, 101, 108, 108, 111};\n",
-                "    return fwrite(sao2_text, 1, 5, stdout) == 5 ? 0 : 1;\n",
+                "    if (fwrite(sao2_text_0, 1, 5, stdout) != 5) return 1;\n",
+                "    return 0;\n",
                 "}\n",
             )
         );
@@ -869,8 +1042,8 @@ mod tests {
     #[test]
     fn emits_standard_c_for_empty_string() {
         let output = render_print_program(b"");
-        assert!(output.contains("sao2_text[] = {0}"));
-        assert!(output.contains("fwrite(sao2_text, 1, 0, stdout) == 0"));
+        assert!(output.contains("sao2_text_0[] = {0}"));
+        assert!(output.contains("fwrite(sao2_text_0, 1, 0, stdout) != 0"));
     }
 
     #[test]
@@ -879,7 +1052,7 @@ mod tests {
         let output = render_print_program(&bytes);
         assert!(output.contains("{0, 1, 2, 3, 4, 5"));
         assert!(output.contains("122, 123, 124, 125, 126, 127}"));
-        assert!(output.contains("fwrite(sao2_text, 1, 128, stdout) == 128"));
+        assert!(output.contains("fwrite(sao2_text_0, 1, 128, stdout) != 128"));
         assert!(!output.contains('"'));
     }
 
@@ -922,6 +1095,7 @@ mod tests {
                 "        sao2_binding_3 = true;\n",
                 "    }\n",
                 "    sao2_binding_1 <<= INT64_C(1);\n",
+                "    return 0;\n",
                 "}\n",
             )
         );
@@ -967,11 +1141,40 @@ mod tests {
     }
 
     #[test]
-    fn keeps_output_separate_from_primitive_statement_emission() {
-        let diagnostic = render_program("fn main() { value := 1; print(\"hello\"); }")
-            .unwrap_err()
-            .to_string();
-        assert!(diagnostic.contains("does not support this expression"), "{diagnostic}");
+    fn emits_multiple_output_calls_in_source_order() {
+        let output = render_program(concat!(
+            "fn main() { value := 7; flag := true; ",
+            "print(\"value=\"); println(value); print(flag); println(\"done\"); println(); }"
+        ))
+        .unwrap();
+        let text = output.find("sao2_text_0[] = {118, 97, 108, 117, 101, 61}").unwrap();
+        let integer = output
+            .find("printf(\"%\" PRId64 \"\\n\", sao2_binding_0)")
+            .unwrap();
+        let boolean = output.find("fputs((sao2_binding_1) ? \"true\" : \"false\"").unwrap();
+        let string_newline = output
+            .find("sao2_text_1[] = {100, 111, 110, 101, 10}")
+            .unwrap();
+        let final_newline = output.rfind("fputc('\\n', stdout)").unwrap();
+        assert!(
+            text < integer
+                && integer < boolean
+                && boolean < string_newline
+                && string_newline < final_newline
+        );
+        assert_eq!(output.matches("fputc('\\n', stdout)").count(), 1);
+    }
+
+    #[test]
+    fn emits_no_value_and_integer_main_results() {
+        assert_eq!(
+            render_program("fn main() {}").unwrap(),
+            "int main(void) {\n    return 0;\n}\n"
+        );
+        let final_value = render_program("fn main() int { 7 }").unwrap();
+        assert!(final_value.contains("return INT64_C(7);"));
+        let explicit = render_program("fn main() int { return 9; }").unwrap();
+        assert!(explicit.contains("return INT64_C(9);"));
     }
 
     #[test]

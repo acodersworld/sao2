@@ -148,9 +148,25 @@ mod tests {
     }
 
     #[test]
-    fn malformed_source_returns_source_diagnostic() {
-        let source = source("fn main() { print(123); }");
-        let build_directory = temporary_directory("malformed");
+    fn output_and_integer_result_write_program_c() {
+        let source = source(concat!(
+            "fn main() int { var value := 2; value *= 3; ",
+            "print(\"value=\"); println(value); println(true); 7 }"
+        ));
+        let build_directory = temporary_directory("output-and-result");
+        let output_path = compile_into(&source, &build_directory).unwrap();
+        let output = fs::read_to_string(&output_path).unwrap();
+        assert!(output.contains("fwrite(sao2_text_0"));
+        assert!(output.contains("printf(\"%\" PRId64 \"\\n\", sao2_binding_0)"));
+        assert!(output.contains("fputs((true) ? \"true\\n\" : \"false\\n\""));
+        assert!(output.contains("return INT64_C(7);"));
+        fs::remove_dir_all(build_directory).unwrap();
+    }
+
+    #[test]
+    fn unsupported_printable_type_returns_source_diagnostic() {
+        let source = source("fn main() { print(1.0); }");
+        let build_directory = temporary_directory("unsupported-output");
         let diagnostic = compile_into(&source, &build_directory)
             .unwrap_err()
             .to_string();
@@ -193,17 +209,20 @@ mod tests {
     #[test]
     fn temporary_backend_rejects_valid_but_unsupported_programs() {
         for (text, expected) in [
-            ("fn main() {}", "at least one primitive statement"),
-            ("fn main() int { 1 }", "does not support this type"),
             (
                 "fn main(args [str]) { print(\"x\"); }",
                 "does not support parameters",
             ),
             (
-                "fn main() { println(\"x\"); }",
-                "only a direct call to 'print'",
+                "fn main() int {}",
+                "requires integer main to have a final value or unconditional return",
             ),
+            ("fn main() { 1 }", "final value in no-value main"),
             ("fn main() { 1; }", "does not support this expression"),
+            (
+                "fn main() { panic(\"stop\"); }",
+                "only direct calls to 'print' and 'println'",
+            ),
             (
                 "type Number(int); fn main() { print(\"x\"); }",
                 "does not support type declaration",
@@ -272,7 +291,7 @@ mod tests {
         let output_path = build_directory.join("program.c");
         fs::write(&output_path, "existing generated C").unwrap();
 
-        let source = source("fn main() { println(\"unsupported\"); }");
+        let source = source("fn main() { print(1.0); }");
         let diagnostic = compile_into(&source, &build_directory)
             .unwrap_err()
             .to_string();

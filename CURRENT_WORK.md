@@ -1,6 +1,6 @@
 # Current Work: Early Primitive C Backend
 
-Status: in progress (Phase 3).
+Status: in progress (Phase 4).
 
 This document expands milestone 4 of `ROADMAP.md`. The objective is to replace
 the one-call string-print lowering with a small direct C emitter over the
@@ -114,6 +114,10 @@ Exit criterion: linear programs can declare, shadow, read, and update primitive
 locals without exposing source identifiers to C.
 
 ## Phase 4: Output and entry-point results
+
+Phase 4 replaces Phase 3's separate compatibility modes with one ordered
+statement emitter. Output calls may be interleaved with primitive computation,
+and the generated C entry point now always receives an explicit result.
 
 - Generalize the retained byte-safe output support so multiple `print` and
   `println` statements can be emitted in evaluation order.
