@@ -1203,6 +1203,13 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
             .expect("every parameter receives a binding identity during the syntax census")
     }
 
+    pub(crate) fn local_binding(&self, statement: &'ast Statement) -> Option<BindingId> {
+        self.bindings.iter().find_map(|record| match record.node {
+            BindingNode::Local(candidate) if std::ptr::eq(candidate, statement) => Some(record.id),
+            _ => None,
+        })
+    }
+
     fn statement_binding(&self, statement: &'ast Statement) -> BindingId {
         self.bindings
             .iter()

@@ -132,6 +132,22 @@ mod tests {
     }
 
     #[test]
+    fn primitive_source_writes_program_c() {
+        let source = source(
+            "fn main() { initial := 2; var value := initial * 3; value += 1; }",
+        );
+        let build_directory = temporary_directory("primitive-c-output");
+        let output_path = compile_into(&source, &build_directory).unwrap();
+        let output = fs::read_to_string(&output_path).unwrap();
+        assert!(output.contains("const int64_t sao2_binding_0 = INT64_C(2);"));
+        assert!(output.contains(
+            "int64_t sao2_binding_1 = (sao2_binding_0 * INT64_C(3));"
+        ));
+        assert!(output.contains("sao2_binding_1 += INT64_C(1);"));
+        fs::remove_dir_all(build_directory).unwrap();
+    }
+
+    #[test]
     fn malformed_source_returns_source_diagnostic() {
         let source = source("fn main() { print(123); }");
         let build_directory = temporary_directory("malformed");
@@ -177,7 +193,7 @@ mod tests {
     #[test]
     fn temporary_backend_rejects_valid_but_unsupported_programs() {
         for (text, expected) in [
-            ("fn main() {}", "exactly one print statement"),
+            ("fn main() {}", "at least one primitive statement"),
             ("fn main() int { 1 }", "does not support this type"),
             (
                 "fn main(args [str]) { print(\"x\"); }",
@@ -186,10 +202,6 @@ mod tests {
             (
                 "fn main() { println(\"x\"); }",
                 "only a direct call to 'print'",
-            ),
-            (
-                "fn main() { value := 1; }",
-                "does not support this statement",
             ),
             ("fn main() { 1; }", "does not support this expression"),
             (

@@ -1,19 +1,20 @@
 //! Temporary direct C emitter over the analyzed AST.
 //!
-//! Its translation-unit path deliberately supports only the walking skeleton's
-//! string `print` program. Phase 2 adds an internal primitive-expression seam;
-//! later milestone-4 phases integrate it, and milestone 6 replaces this emitter
-//! with typed-IR lowering.
+//! It retains the walking skeleton's exact string `print` program and has a
+//! separate primitive-only path for locals, assignments, and lexical blocks.
+//! Output and entry-point results remain separate until Phase 4, and milestone
+//! 6 replaces this emitter with typed-IR lowering.
 
 use std::fmt::Write;
 
 use crate::analysis::{
-    Analysis, CallableId, CallTarget, FunctionSignature, IntrinsicId, LiteralValue, NameResolution,
-    TypeState,
+    Analysis, BindingNode, CallableId, CallTarget, FunctionSignature, IntrinsicId, LiteralValue,
+    NameResolution, TypeState,
 };
 use crate::ast::{
-    ArgumentKind, BinaryOperator, Declaration, Expression, ExpressionKind, PrimitiveType, Program,
-    Statement, StatementKind, Type, UnaryOperator,
+    ArgumentKind, AssignmentOperator, AssignmentTarget, BinaryOperator, Block, Declaration,
+    Expression, ExpressionKind, PrimitiveType, Program, Statement, StatementKind, Type,
+    UnaryOperator,
 };
 use crate::diagnostic::Diagnostic;
 use crate::source::{SourceFile, Span};
@@ -50,9 +51,6 @@ enum CPrimitive {
 }
 
 impl CPrimitive {
-    // Phase 3 will use these spellings and headers when primitive expressions
-    // become part of complete generated translation units.
-    #[allow(dead_code)]
     const fn c_type(self) -> &'static str {
         match self {
             Self::Int => "int64_t",
@@ -60,7 +58,6 @@ impl CPrimitive {
         }
     }
 
-    #[allow(dead_code)]
     const fn required_header(self) -> &'static str {
         match self {
             Self::Int => "<stdint.h>",
@@ -69,31 +66,80 @@ impl CPrimitive {
     }
 }
 
+#[derive(Default)]
+struct PrimitiveUsage {
+    int: bool,
+    boolean: bool,
+}
+
+impl PrimitiveUsage {
+    fn record(&mut self, primitive: CPrimitive) {
+        match primitive {
+            CPrimitive::Int => self.int = true,
+            CPrimitive::Bool => self.boolean = true,
+        }
+    }
+}
+
 impl<'analysis, 'source, 'ast> TemporaryEmitter<'analysis, 'source, 'ast> {
     fn emit(&self) -> Result<String, Diagnostic> {
-        let bytes = self.validate_subset()?;
-        Ok(render_print_program(bytes))
-    }
-
-    fn validate_subset(&self) -> Result<&'analysis [u8], Diagnostic> {
         self.validate_declarations()?;
         self.validate_main_signature()?;
 
+        if let Some(bytes) = self.legacy_print_bytes()? {
+            return Ok(render_print_program(bytes));
+        }
+        self.emit_primitive_program()
+    }
+
+    fn legacy_print_bytes(&self) -> Result<Option<&'analysis [u8]>, Diagnostic> {
+        let body = &self.main.node.body;
+        let [statement] = body.statements.as_slice() else {
+            return Ok(None);
+        };
+        if body.value.is_some()
+            || !matches!(&statement.kind, StatementKind::Expression(Expression {
+                kind: ExpressionKind::Call { .. },
+                ..
+            }))
+        {
+            return Ok(None);
+        }
+        self.validate_print_statement(statement).map(Some)
+    }
+
+    fn emit_primitive_program(&self) -> Result<String, Diagnostic> {
         let body = &self.main.node.body;
         if let Some(value) = &body.value {
             return Err(self.unsupported_expression(value));
         }
-        let [statement] = body.statements.as_slice() else {
-            let span = body
-                .statements
-                .get(1)
-                .map_or(body.span, |statement| statement.span);
+        if body.statements.is_empty() {
             return Err(self.unsupported_statement(
-                span,
-                "temporary backend requires main to contain exactly one print statement",
+                body.span,
+                "temporary backend requires at least one primitive statement",
             ));
-        };
-        self.validate_print_statement(statement)
+        }
+
+        let mut statements = String::new();
+        let mut usage = PrimitiveUsage::default();
+        self.render_block_contents(body, 1, &mut statements, &mut usage)?;
+
+        let mut output = String::new();
+        if usage.boolean {
+            writeln!(output, "#include {}", CPrimitive::Bool.required_header())
+                .expect("writing to a String cannot fail");
+        }
+        if usage.int {
+            writeln!(output, "#include {}", CPrimitive::Int.required_header())
+                .expect("writing to a String cannot fail");
+        }
+        if usage.boolean || usage.int {
+            output.push('\n');
+        }
+        output.push_str("int main(void) {\n");
+        output.push_str(&statements);
+        output.push_str("}\n");
+        Ok(output)
     }
 
     fn validate_declarations(&self) -> Result<(), Diagnostic> {
@@ -188,10 +234,208 @@ impl<'analysis, 'source, 'ast> TemporaryEmitter<'analysis, 'source, 'ast> {
         }
     }
 
+    fn render_block_contents(
+        &self,
+        block: &'ast Block,
+        indentation: usize,
+        output: &mut String,
+        usage: &mut PrimitiveUsage,
+    ) -> Result<(), Diagnostic> {
+        if let Some(value) = &block.value {
+            return Err(self.unsupported_expression(value));
+        }
+        for statement in &block.statements {
+            self.render_statement(statement, indentation, output, usage)?;
+        }
+        Ok(())
+    }
+
+    fn render_statement(
+        &self,
+        statement: &'ast Statement,
+        indentation: usize,
+        output: &mut String,
+        usage: &mut PrimitiveUsage,
+    ) -> Result<(), Diagnostic> {
+        match &statement.kind {
+            StatementKind::Local {
+                mutable,
+                name,
+                initializer,
+            } => {
+                let Some(binding) = self.analysis.local_binding(statement) else {
+                    return Err(Diagnostic::compiler(
+                        "temporary backend received a local without a binding identity",
+                    ));
+                };
+                let record = self.analysis.binding(binding);
+                if !matches!(
+                    record.node,
+                    BindingNode::Local(node) if std::ptr::eq(node, statement)
+                ) || record.mutable != *mutable
+                {
+                    return Err(Diagnostic::compiler(
+                        "temporary backend received an inconsistent local binding record",
+                    ));
+                }
+                let binding_type = self.primitive_state(
+                    self.analysis.binding_type(binding),
+                    name.span,
+                    "local binding",
+                )?;
+                let initializer_type = self.primitive_expression_type(initializer)?;
+                if binding_type != initializer_type {
+                    return Err(self.inconsistent_expression_type(initializer));
+                }
+                usage.record(binding_type);
+
+                Self::write_indentation(output, indentation);
+                if !mutable {
+                    output.push_str("const ");
+                }
+                writeln!(
+                    output,
+                    "{} sao2_binding_{} = {};",
+                    binding_type.c_type(),
+                    binding.index(),
+                    self.render_expression(initializer)?
+                )
+                .expect("writing to a String cannot fail");
+                Ok(())
+            }
+            StatementKind::Assignment {
+                target,
+                operator,
+                value,
+                ..
+            } => self.render_assignment(target, *operator, value, indentation, output, usage),
+            StatementKind::Block(block) => {
+                Self::write_indentation(output, indentation);
+                output.push_str("{\n");
+                self.render_block_contents(block, indentation + 1, output, usage)?;
+                Self::write_indentation(output, indentation);
+                output.push_str("}\n");
+                Ok(())
+            }
+            StatementKind::Expression(expression) => Err(self.unsupported_expression(expression)),
+            _ => Err(self.unsupported_statement(
+                statement.span,
+                "temporary backend does not support this statement",
+            )),
+        }
+    }
+
+    fn render_assignment(
+        &self,
+        target: &'ast AssignmentTarget,
+        operator: AssignmentOperator,
+        value: &'ast Expression,
+        indentation: usize,
+        output: &mut String,
+        usage: &mut PrimitiveUsage,
+    ) -> Result<(), Diagnostic> {
+        if let Some(suffix) = target.suffixes.first() {
+            return Err(self.unsupported(
+                suffix.span,
+                "temporary backend supports only direct local assignment",
+            ));
+        }
+        let Some(name_use) = self.analysis.name_use(&target.root) else {
+            return Err(Diagnostic::compiler(
+                "temporary backend received an assignment without name resolution",
+            ));
+        };
+        let NameResolution::Binding(binding) = name_use.resolution else {
+            return Err(Diagnostic::compiler(
+                "temporary backend received a non-binding assignment target",
+            ));
+        };
+        let record = self.analysis.binding(binding);
+        if !matches!(record.node, BindingNode::Local(_)) {
+            return Err(self.unsupported(
+                target.root.span,
+                "temporary backend supports assignment only to local bindings",
+            ));
+        }
+        if !record.mutable {
+            return Err(self.unsupported(
+                target.root.span,
+                "temporary backend supports assignment only to mutable local bindings",
+            ));
+        }
+
+        let Some(annotation) = self.analysis.assignment_target(target) else {
+            return Err(Diagnostic::compiler(
+                "temporary backend received an assignment target without a type annotation",
+            ));
+        };
+        let target_type = self.primitive_state(annotation.state, target.span, "assignment target")?;
+        let binding_type = self.primitive_state(
+            self.analysis.binding_type(binding),
+            target.root.span,
+            "local binding",
+        )?;
+        let value_type = self.primitive_expression_type(value)?;
+        let valid = match operator {
+            AssignmentOperator::Assign => {
+                target_type == binding_type && value_type == target_type
+            }
+            AssignmentOperator::Add
+            | AssignmentOperator::Subtract
+            | AssignmentOperator::Multiply
+            | AssignmentOperator::Divide
+            | AssignmentOperator::Remainder
+            | AssignmentOperator::BitwiseAnd
+            | AssignmentOperator::BitwiseOr
+            | AssignmentOperator::BitwiseXor
+            | AssignmentOperator::ShiftLeft
+            | AssignmentOperator::ShiftRight => {
+                target_type == CPrimitive::Int
+                    && binding_type == CPrimitive::Int
+                    && value_type == CPrimitive::Int
+            }
+        };
+        if !valid {
+            return Err(Diagnostic::compiler(
+                "temporary backend received inconsistent analyzed assignment types",
+            ));
+        }
+        usage.record(target_type);
+
+        let symbol = match operator {
+            AssignmentOperator::Assign => "=",
+            AssignmentOperator::Add => "+=",
+            AssignmentOperator::Subtract => "-=",
+            AssignmentOperator::Multiply => "*=",
+            AssignmentOperator::Divide => "/=",
+            AssignmentOperator::Remainder => "%=",
+            AssignmentOperator::BitwiseAnd => "&=",
+            AssignmentOperator::BitwiseOr => "|=",
+            AssignmentOperator::BitwiseXor => "^=",
+            AssignmentOperator::ShiftLeft => "<<=",
+            AssignmentOperator::ShiftRight => ">>=",
+        };
+        Self::write_indentation(output, indentation);
+        writeln!(
+            output,
+            "sao2_binding_{} {symbol} {};",
+            binding.index(),
+            self.render_expression(value)?
+        )
+        .expect("writing to a String cannot fail");
+        Ok(())
+    }
+
+    fn write_indentation(output: &mut String, indentation: usize) {
+        for _ in 0..indentation {
+            output.push_str("    ");
+        }
+    }
+
     fn render_expression(&self, expression: &'ast Expression) -> Result<String, Diagnostic> {
         match &expression.kind {
             ExpressionKind::Identifier(identifier) => {
-                self.primitive_expression_type(expression)?;
+                let expression_type = self.primitive_expression_type(expression)?;
                 let Some(name_use) = self.analysis.name_use(identifier) else {
                     return Err(Diagnostic::compiler(
                         "temporary backend received a binding read without name resolution",
@@ -202,6 +446,14 @@ impl<'analysis, 'source, 'ast> TemporaryEmitter<'analysis, 'source, 'ast> {
                         "temporary backend received a non-binding identifier expression",
                     ));
                 };
+                let binding_type = self.primitive_state(
+                    self.analysis.binding_type(binding),
+                    identifier.span,
+                    "local binding",
+                )?;
+                if expression_type != binding_type {
+                    return Err(self.inconsistent_expression_type(expression));
+                }
                 Ok(format!("sao2_binding_{}", binding.index()))
             }
             ExpressionKind::Integer => {
@@ -409,6 +661,41 @@ impl<'analysis, 'source, 'ast> TemporaryEmitter<'analysis, 'source, 'ast> {
         }
     }
 
+    fn primitive_state(
+        &self,
+        state: TypeState,
+        span: Span,
+        subject: &str,
+    ) -> Result<CPrimitive, Diagnostic> {
+        match state {
+            TypeState::Resolved(ty)
+                if ty == self.analysis.types.primitive(PrimitiveType::Int) =>
+            {
+                Ok(CPrimitive::Int)
+            }
+            TypeState::Resolved(ty)
+                if ty == self.analysis.types.primitive(PrimitiveType::Bool) =>
+            {
+                Ok(CPrimitive::Bool)
+            }
+            TypeState::Resolved(_) => Err(self.unsupported(
+                span,
+                format!("temporary backend does not support this {subject} type"),
+            )),
+            TypeState::Deferred(_) => Err(self.unsupported(
+                span,
+                format!("temporary backend does not support flow-dependent {subject} types"),
+            )),
+            TypeState::NoValue | TypeState::Never => Err(self.unsupported(
+                span,
+                format!("temporary backend requires {subject} to produce a value"),
+            )),
+            TypeState::Error => Err(Diagnostic::compiler(format!(
+                "temporary backend received {subject} with an analysis error"
+            ))),
+        }
+    }
+
     fn inconsistent_expression_type(&self, expression: &Expression) -> Diagnostic {
         Diagnostic::compiler(format!(
             "temporary backend received inconsistent analyzed types for expression at byte {}",
@@ -493,6 +780,46 @@ mod tests {
         SourceFile::new(PathBuf::from("test.sao2"), text.to_owned())
     }
 
+    fn render_program(text: &str) -> Result<String, Diagnostic> {
+        let source = source(text);
+        let program = parser::parse(&source).unwrap();
+        let analysis = analysis::analyze(&source, &program);
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "{}",
+            analysis.diagnostics
+        );
+        let main = analysis.function_signature(analysis.function_by_name("main").unwrap());
+        emit(&source, &program, &analysis, main)
+    }
+
+    fn render_statement_at(text: &str, statement_index: usize) -> Result<String, Diagnostic> {
+        let source = source(text);
+        let program = parser::parse(&source).unwrap();
+        let analysis = analysis::analyze(&source, &program);
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "{}",
+            analysis.diagnostics
+        );
+        let main = analysis.function_signature(analysis.function_by_name("main").unwrap());
+        let mut output = String::new();
+        let mut usage = PrimitiveUsage::default();
+        TemporaryEmitter {
+            source: &source,
+            program: &program,
+            analysis: &analysis,
+            main,
+        }
+        .render_statement(
+            &main.node.body.statements[statement_index],
+            1,
+            &mut output,
+            &mut usage,
+        )?;
+        Ok(output)
+    }
+
     fn render_initializer(text: &str, statement_index: usize) -> Result<String, Diagnostic> {
         let source = source(text);
         let program = parser::parse(&source).unwrap();
@@ -560,6 +887,91 @@ mod tests {
     fn output_is_deterministic() {
         let bytes = b"quotes: \"; slash: \\; newline: \n; nul: \0";
         assert_eq!(render_print_program(bytes), render_print_program(bytes));
+    }
+
+    #[test]
+    fn retains_the_exact_legacy_print_translation() {
+        assert_eq!(
+            render_program("fn main() { print(\"hello\"); }").unwrap(),
+            render_print_program(b"hello")
+        );
+    }
+
+    #[test]
+    fn emits_primitive_locals_scopes_shadowing_and_assignment() {
+        let output = render_program(concat!(
+            "fn main() { ",
+            "base := 1; var total := base + 2; ",
+            "{ flag := true; total += 3; var flag := false; flag = true; } ",
+            "total <<= 1; ",
+            "}"
+        ))
+        .unwrap();
+        assert_eq!(
+            output,
+            concat!(
+                "#include <stdbool.h>\n",
+                "#include <stdint.h>\n\n",
+                "int main(void) {\n",
+                "    const int64_t sao2_binding_0 = INT64_C(1);\n",
+                "    int64_t sao2_binding_1 = (sao2_binding_0 + INT64_C(2));\n",
+                "    {\n",
+                "        const bool sao2_binding_2 = true;\n",
+                "        sao2_binding_1 += INT64_C(3);\n",
+                "        bool sao2_binding_3 = false;\n",
+                "        sao2_binding_3 = true;\n",
+                "    }\n",
+                "    sao2_binding_1 <<= INT64_C(1);\n",
+                "}\n",
+            )
+        );
+    }
+
+    #[test]
+    fn emits_every_supported_compound_assignment() {
+        for operator in ["+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="] {
+            let text = format!("fn main() {{ var value := 8; value {operator} 1; }}");
+            let output = render_program(&text).unwrap();
+            assert!(
+                output.contains(&format!("sao2_binding_0 {operator} INT64_C(1);")),
+                "{operator}: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn emits_only_headers_required_by_primitive_locals() {
+        let integers = render_program("fn main() { value := 1; }").unwrap();
+        assert!(integers.contains("#include <stdint.h>"));
+        assert!(!integers.contains("#include <stdbool.h>"));
+
+        let booleans = render_program("fn main() { value := true; }").unwrap();
+        assert!(booleans.contains("#include <stdbool.h>"));
+        assert!(!booleans.contains("#include <stdint.h>"));
+    }
+
+    #[test]
+    fn rejects_immutable_and_indirect_assignment() {
+        let immutable = render_program("fn main() { value := 1; value = 2; }")
+            .unwrap_err()
+            .to_string();
+        assert!(immutable.contains("only to mutable local bindings"), "{immutable}");
+
+        let indirect = render_statement_at(
+            "fn main() { var values := [1]; values[0] = 2; }",
+            1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(indirect.contains("only direct local assignment"), "{indirect}");
+    }
+
+    #[test]
+    fn keeps_output_separate_from_primitive_statement_emission() {
+        let diagnostic = render_program("fn main() { value := 1; print(\"hello\"); }")
+            .unwrap_err()
+            .to_string();
+        assert!(diagnostic.contains("does not support this expression"), "{diagnostic}");
     }
 
     #[test]

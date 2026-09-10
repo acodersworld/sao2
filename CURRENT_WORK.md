@@ -1,6 +1,6 @@
 # Current Work: Early Primitive C Backend
 
-Status: in progress (Phase 2).
+Status: in progress (Phase 3).
 
 This document expands milestone 4 of `ROADMAP.md`. The objective is to replace
 the one-call string-print lowering with a small direct C emitter over the
@@ -92,6 +92,10 @@ deterministically from resolved analysis facts in emitter unit tests, including
 identity-based binding reads, while the hello regression remains unchanged.
 
 ## Phase 3: Bindings, scopes, and assignments
+
+During this phase, the exact one-statement string `print` program remains a
+separate compatibility path. Primitive-only bodies may contain the constructs
+below, but combining computation with output remains Phase 4 work.
 
 - Emit primitive local declarations with generated names based on `BindingId`.
 - Initialize locals in source evaluation order and preserve lexical block
