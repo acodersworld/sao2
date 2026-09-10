@@ -1,6 +1,6 @@
 # Current Work: Early Primitive C Backend
 
-Status: in progress (Phase 1).
+Status: in progress (Phase 2).
 
 This document expands milestone 4 of `ROADMAP.md`. The objective is to replace
 the one-call string-print lowering with a small direct C emitter over the
@@ -63,6 +63,13 @@ while analyzed but unsupported programs fail before output creation.
 
 ## Phase 2: Primitive values and expressions
 
+This phase builds an internal analyzed-expression rendering seam. Binding reads
+receive their final identity-based C names, but Phase 3 remains responsible for
+emitting the declarations that make those names usable in a translation unit.
+Consequently, the existing string-literal `print` program remains the only
+CLI-accepted backend subset during this phase and its generated C remains
+unchanged.
+
 - Add explicit temporary C representations for SAO2 `int` and `bool`, using
   fixed-width integer and boolean C types.
 - Emit converted integer and boolean literals from analysis annotations rather
@@ -81,7 +88,8 @@ shift counts, and other cases for which the roadmap permits temporary host-C
 behavior. Runtime checks belong to typed-IR lowering in milestone 6.
 
 Exit criterion: pure in-range integer and boolean expressions lower
-deterministically from resolved analysis facts.
+deterministically from resolved analysis facts in emitter unit tests, including
+identity-based binding reads, while the hello regression remains unchanged.
 
 ## Phase 3: Bindings, scopes, and assignments
 

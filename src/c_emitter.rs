@@ -1,16 +1,19 @@
 //! Temporary direct C emitter over the analyzed AST.
 //!
-//! This deliberately supports only the walking skeleton's string `print` program.
-//! Later milestone-4 phases expand the accepted subset; milestone 6 replaces this
-//! emitter with typed-IR lowering.
+//! Its translation-unit path deliberately supports only the walking skeleton's
+//! string `print` program. Phase 2 adds an internal primitive-expression seam;
+//! later milestone-4 phases integrate it, and milestone 6 replaces this emitter
+//! with typed-IR lowering.
 
 use std::fmt::Write;
 
 use crate::analysis::{
-    Analysis, CallableId, CallTarget, FunctionSignature, IntrinsicId, LiteralValue, TypeState,
+    Analysis, CallableId, CallTarget, FunctionSignature, IntrinsicId, LiteralValue, NameResolution,
+    TypeState,
 };
 use crate::ast::{
-    ArgumentKind, Declaration, Expression, ExpressionKind, Program, Statement, StatementKind, Type,
+    ArgumentKind, BinaryOperator, Declaration, Expression, ExpressionKind, PrimitiveType, Program,
+    Statement, StatementKind, Type, UnaryOperator,
 };
 use crate::diagnostic::Diagnostic;
 use crate::source::{SourceFile, Span};
@@ -38,6 +41,32 @@ struct TemporaryEmitter<'analysis, 'source, 'ast> {
     program: &'ast Program,
     analysis: &'analysis Analysis<'source, 'ast>,
     main: &'analysis FunctionSignature<'ast>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CPrimitive {
+    Int,
+    Bool,
+}
+
+impl CPrimitive {
+    // Phase 3 will use these spellings and headers when primitive expressions
+    // become part of complete generated translation units.
+    #[allow(dead_code)]
+    const fn c_type(self) -> &'static str {
+        match self {
+            Self::Int => "int64_t",
+            Self::Bool => "bool",
+        }
+    }
+
+    #[allow(dead_code)]
+    const fn required_header(self) -> &'static str {
+        match self {
+            Self::Int => "<stdint.h>",
+            Self::Bool => "<stdbool.h>",
+        }
+    }
 }
 
 impl<'analysis, 'source, 'ast> TemporaryEmitter<'analysis, 'source, 'ast> {
@@ -159,6 +188,234 @@ impl<'analysis, 'source, 'ast> TemporaryEmitter<'analysis, 'source, 'ast> {
         }
     }
 
+    fn render_expression(&self, expression: &'ast Expression) -> Result<String, Diagnostic> {
+        match &expression.kind {
+            ExpressionKind::Identifier(identifier) => {
+                self.primitive_expression_type(expression)?;
+                let Some(name_use) = self.analysis.name_use(identifier) else {
+                    return Err(Diagnostic::compiler(
+                        "temporary backend received a binding read without name resolution",
+                    ));
+                };
+                let NameResolution::Binding(binding) = name_use.resolution else {
+                    return Err(Diagnostic::compiler(
+                        "temporary backend received a non-binding identifier expression",
+                    ));
+                };
+                Ok(format!("sao2_binding_{}", binding.index()))
+            }
+            ExpressionKind::Integer => {
+                if self.primitive_expression_type(expression)? != CPrimitive::Int {
+                    return Err(self.inconsistent_expression_type(expression));
+                }
+                self.render_integer_literal(expression)
+            }
+            ExpressionKind::Boolean(_) => {
+                if self.primitive_expression_type(expression)? != CPrimitive::Bool {
+                    return Err(self.inconsistent_expression_type(expression));
+                }
+                self.render_boolean_literal(expression)
+            }
+            ExpressionKind::Parenthesized(inner) => {
+                self.primitive_expression_type(expression)?;
+                Ok(format!("({})", self.render_expression(inner)?))
+            }
+            ExpressionKind::Unary {
+                operator, operand, ..
+            } => self.render_unary(expression, *operator, operand),
+            ExpressionKind::Binary {
+                left,
+                operator,
+                operator_span,
+                right,
+            } => self.render_binary(expression, left, *operator, *operator_span, right),
+            _ => Err(self.unsupported_expression(expression)),
+        }
+    }
+
+    fn render_integer_literal(&self, expression: &'ast Expression) -> Result<String, Diagnostic> {
+        match self.analysis.literal(expression) {
+            Some(LiteralValue::Integer(value)) if *value <= i64::MAX as u64 => {
+                Ok(format!("INT64_C({value})"))
+            }
+            Some(LiteralValue::Integer(_)) => Err(Diagnostic::compiler(
+                "temporary backend received an out-of-range positive integer literal",
+            )),
+            _ => Err(Diagnostic::compiler(
+                "temporary backend received an integer expression without a converted literal",
+            )),
+        }
+    }
+
+    fn render_boolean_literal(&self, expression: &'ast Expression) -> Result<String, Diagnostic> {
+        match self.analysis.literal(expression) {
+            Some(LiteralValue::Boolean(true)) => Ok("true".to_owned()),
+            Some(LiteralValue::Boolean(false)) => Ok("false".to_owned()),
+            _ => Err(Diagnostic::compiler(
+                "temporary backend received a boolean expression without a converted literal",
+            )),
+        }
+    }
+
+    fn render_unary(
+        &self,
+        expression: &'ast Expression,
+        operator: UnaryOperator,
+        operand: &'ast Expression,
+    ) -> Result<String, Diagnostic> {
+        let result_type = self.primitive_expression_type(expression)?;
+        let operand_type = self.primitive_expression_type(operand)?;
+        let valid = match operator {
+            UnaryOperator::LogicalNot => {
+                result_type == CPrimitive::Bool && operand_type == CPrimitive::Bool
+            }
+            UnaryOperator::BitwiseNot | UnaryOperator::Plus | UnaryOperator::Minus => {
+                result_type == CPrimitive::Int && operand_type == CPrimitive::Int
+            }
+        };
+        if !valid {
+            return Err(self.inconsistent_expression_type(expression));
+        }
+
+        if operator == UnaryOperator::Minus
+            && matches!(&operand.kind, ExpressionKind::Integer)
+            && matches!(
+                self.analysis.literal(operand),
+                Some(LiteralValue::Integer(value)) if *value == (i64::MAX as u64) + 1
+            )
+        {
+            return Ok("INT64_MIN".to_owned());
+        }
+
+        let symbol = match operator {
+            UnaryOperator::LogicalNot => "!",
+            UnaryOperator::BitwiseNot => "~",
+            UnaryOperator::Plus => "+",
+            UnaryOperator::Minus => "-",
+        };
+        Ok(format!("({symbol}{})", self.render_expression(operand)?))
+    }
+
+    fn render_binary(
+        &self,
+        expression: &'ast Expression,
+        left: &'ast Expression,
+        operator: BinaryOperator,
+        operator_span: Span,
+        right: &'ast Expression,
+    ) -> Result<String, Diagnostic> {
+        let result_type = self.primitive_expression_type(expression)?;
+        let left_type = self.primitive_expression_type(left)?;
+        let right_type = self.primitive_expression_type(right)?;
+        let (symbol, valid) = match operator {
+            BinaryOperator::LogicalOr => (
+                "||",
+                left_type == CPrimitive::Bool
+                    && right_type == CPrimitive::Bool
+                    && result_type == CPrimitive::Bool,
+            ),
+            BinaryOperator::LogicalAnd => (
+                "&&",
+                left_type == CPrimitive::Bool
+                    && right_type == CPrimitive::Bool
+                    && result_type == CPrimitive::Bool,
+            ),
+            BinaryOperator::BitwiseOr => ("|", self.all_int(left_type, right_type, result_type)),
+            BinaryOperator::BitwiseXor => ("^", self.all_int(left_type, right_type, result_type)),
+            BinaryOperator::BitwiseAnd => ("&", self.all_int(left_type, right_type, result_type)),
+            BinaryOperator::ShiftLeft => ("<<", self.all_int(left_type, right_type, result_type)),
+            BinaryOperator::ShiftRight => (">>", self.all_int(left_type, right_type, result_type)),
+            BinaryOperator::Add => ("+", self.all_int(left_type, right_type, result_type)),
+            BinaryOperator::Subtract => ("-", self.all_int(left_type, right_type, result_type)),
+            BinaryOperator::Multiply => ("*", self.all_int(left_type, right_type, result_type)),
+            BinaryOperator::Divide => ("/", self.all_int(left_type, right_type, result_type)),
+            BinaryOperator::Remainder => ("%", self.all_int(left_type, right_type, result_type)),
+            BinaryOperator::Equal => (
+                "==",
+                left_type == right_type && result_type == CPrimitive::Bool,
+            ),
+            BinaryOperator::NotEqual => (
+                "!=",
+                left_type == right_type && result_type == CPrimitive::Bool,
+            ),
+            BinaryOperator::Less => ("<", self.int_comparison(left_type, right_type, result_type)),
+            BinaryOperator::LessEqual => {
+                ("<=", self.int_comparison(left_type, right_type, result_type))
+            }
+            BinaryOperator::Greater => {
+                (">", self.int_comparison(left_type, right_type, result_type))
+            }
+            BinaryOperator::GreaterEqual => {
+                (">=", self.int_comparison(left_type, right_type, result_type))
+            }
+            BinaryOperator::In => {
+                return Err(self.unsupported(
+                    operator_span,
+                    "temporary backend does not support this binary operator",
+                ));
+            }
+        };
+        if !valid {
+            return Err(self.inconsistent_expression_type(expression));
+        }
+
+        Ok(format!(
+            "({} {symbol} {})",
+            self.render_expression(left)?,
+            self.render_expression(right)?
+        ))
+    }
+
+    fn all_int(&self, left: CPrimitive, right: CPrimitive, result: CPrimitive) -> bool {
+        left == CPrimitive::Int && right == CPrimitive::Int && result == CPrimitive::Int
+    }
+
+    fn int_comparison(&self, left: CPrimitive, right: CPrimitive, result: CPrimitive) -> bool {
+        left == CPrimitive::Int && right == CPrimitive::Int && result == CPrimitive::Bool
+    }
+
+    fn primitive_expression_type(
+        &self,
+        expression: &'ast Expression,
+    ) -> Result<CPrimitive, Diagnostic> {
+        let Some(annotation) = self.analysis.expression_annotation(expression) else {
+            return Err(Diagnostic::compiler(
+                "temporary backend received an expression without an analysis annotation",
+            ));
+        };
+        match annotation.state {
+            TypeState::Resolved(ty)
+                if ty == self.analysis.types.primitive(PrimitiveType::Int) =>
+            {
+                Ok(CPrimitive::Int)
+            }
+            TypeState::Resolved(ty)
+                if ty == self.analysis.types.primitive(PrimitiveType::Bool) =>
+            {
+                Ok(CPrimitive::Bool)
+            }
+            TypeState::Resolved(_) => Err(self.unsupported(
+                expression.span,
+                "temporary backend does not support this expression type",
+            )),
+            TypeState::Deferred(_) => Err(self.unsupported(
+                expression.span,
+                "temporary backend does not support flow-dependent expressions",
+            )),
+            TypeState::NoValue | TypeState::Never => Err(self.unsupported_expression(expression)),
+            TypeState::Error => Err(Diagnostic::compiler(
+                "temporary backend received an expression with an analysis error",
+            )),
+        }
+    }
+
+    fn inconsistent_expression_type(&self, expression: &Expression) -> Diagnostic {
+        Diagnostic::compiler(format!(
+            "temporary backend received inconsistent analyzed types for expression at byte {}",
+            expression.span.start
+        ))
+    }
+
     fn unsupported_statement(&self, span: Span, message: &str) -> Diagnostic {
         self.unsupported(span, message)
     }
@@ -229,6 +486,36 @@ pub(crate) fn render_print_program(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{analysis, parser};
+    use std::path::PathBuf;
+
+    fn source(text: &str) -> SourceFile {
+        SourceFile::new(PathBuf::from("test.sao2"), text.to_owned())
+    }
+
+    fn render_initializer(text: &str, statement_index: usize) -> Result<String, Diagnostic> {
+        let source = source(text);
+        let program = parser::parse(&source).unwrap();
+        let analysis = analysis::analyze(&source, &program);
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "{}",
+            analysis.diagnostics
+        );
+        let main = analysis.function_signature(analysis.function_by_name("main").unwrap());
+        let StatementKind::Local { initializer, .. } =
+            &main.node.body.statements[statement_index].kind
+        else {
+            panic!("expected local statement");
+        };
+        TemporaryEmitter {
+            source: &source,
+            program: &program,
+            analysis: &analysis,
+            main,
+        }
+        .render_expression(initializer)
+    }
 
     #[test]
     fn emits_hello_snapshot() {
@@ -273,5 +560,142 @@ mod tests {
     fn output_is_deterministic() {
         let bytes = b"quotes: \"; slash: \\; newline: \n; nul: \0";
         assert_eq!(render_print_program(bytes), render_print_program(bytes));
+    }
+
+    #[test]
+    fn records_primitive_c_representations() {
+        assert_eq!(CPrimitive::Int.c_type(), "int64_t");
+        assert_eq!(CPrimitive::Int.required_header(), "<stdint.h>");
+        assert_eq!(CPrimitive::Bool.c_type(), "bool");
+        assert_eq!(CPrimitive::Bool.required_header(), "<stdbool.h>");
+    }
+
+    #[test]
+    fn renders_converted_integer_and_boolean_literals() {
+        for (expression, expected) in [
+            ("1_000", "INT64_C(1000)"),
+            ("0xff", "INT64_C(255)"),
+            ("0b1010", "INT64_C(10)"),
+            ("true", "true"),
+            ("false", "false"),
+            ("-9_223_372_036_854_775_808", "INT64_MIN"),
+        ] {
+            let text = format!("fn main() {{ value := {expression}; }}");
+            assert_eq!(render_initializer(&text, 0).unwrap(), expected, "{expression}");
+        }
+    }
+
+    #[test]
+    fn renders_every_supported_unary_and_binary_operator() {
+        for (expression, expected) in [
+            ("+1", "(+INT64_C(1))"),
+            ("-1", "(-INT64_C(1))"),
+            ("~1", "(~INT64_C(1))"),
+            ("!false", "(!false)"),
+            ("1 + 2", "(INT64_C(1) + INT64_C(2))"),
+            ("3 - 2", "(INT64_C(3) - INT64_C(2))"),
+            ("2 * 3", "(INT64_C(2) * INT64_C(3))"),
+            ("6 / 2", "(INT64_C(6) / INT64_C(2))"),
+            ("7 % 3", "(INT64_C(7) % INT64_C(3))"),
+            ("1 | 2", "(INT64_C(1) | INT64_C(2))"),
+            ("1 ^ 2", "(INT64_C(1) ^ INT64_C(2))"),
+            ("1 & 2", "(INT64_C(1) & INT64_C(2))"),
+            ("1 << 2", "(INT64_C(1) << INT64_C(2))"),
+            ("4 >> 1", "(INT64_C(4) >> INT64_C(1))"),
+            ("1 == 2", "(INT64_C(1) == INT64_C(2))"),
+            ("true != false", "(true != false)"),
+            ("1 < 2", "(INT64_C(1) < INT64_C(2))"),
+            ("1 <= 2", "(INT64_C(1) <= INT64_C(2))"),
+            ("2 > 1", "(INT64_C(2) > INT64_C(1))"),
+            ("2 >= 1", "(INT64_C(2) >= INT64_C(1))"),
+            ("true && false", "(true && false)"),
+            ("true || false", "(true || false)"),
+        ] {
+            let text = format!("fn main() {{ value := {expression}; }}");
+            assert_eq!(render_initializer(&text, 0).unwrap(), expected, "{expression}");
+        }
+    }
+
+    #[test]
+    fn preserves_ast_grouping_with_deliberate_parentheses() {
+        assert_eq!(
+            render_initializer("fn main() { value := 1 + 2 * 3; }", 0).unwrap(),
+            "(INT64_C(1) + (INT64_C(2) * INT64_C(3)))"
+        );
+        assert_eq!(
+            render_initializer("fn main() { value := (1 + 2) * 3; }", 0).unwrap(),
+            "(((INT64_C(1) + INT64_C(2))) * INT64_C(3))"
+        );
+        assert_eq!(
+            render_initializer("fn main() { value := true || false && !false; }", 0).unwrap(),
+            "(true || (false && (!false)))"
+        );
+    }
+
+    #[test]
+    fn renders_binding_reads_from_stable_identities() {
+        let text = concat!(
+            "fn main() { ",
+            "value := 1; first := value; value := 2; second := value; ",
+            "}"
+        );
+        assert_eq!(render_initializer(text, 1).unwrap(), "sao2_binding_0");
+        assert_eq!(render_initializer(text, 3).unwrap(), "sao2_binding_2");
+    }
+
+    #[test]
+    fn rejects_unsupported_expression_forms_and_types() {
+        for (text, expected) in [
+            (
+                "fn main() { value := 1.0; result := value; }",
+                "does not support this expression type",
+            ),
+            (
+                "fn main() { value := [1, 2]; }",
+                "does not support this expression",
+            ),
+            (
+                "fn helper() int { 1 } fn main() { value := helper(); }",
+                "does not support this expression",
+            ),
+        ] {
+            let statement_index = if text.contains("result") { 1 } else { 0 };
+            let diagnostic = render_initializer(text, statement_index)
+                .unwrap_err()
+                .to_string();
+            assert!(diagnostic.contains(expected), "{diagnostic}");
+        }
+    }
+
+    #[test]
+    fn reports_missing_analysis_facts_as_compiler_invariants() {
+        let source = source("fn main() { print(\"hello\"); }");
+        let program = parser::parse(&source).unwrap();
+        let unannotated = Expression {
+            kind: ExpressionKind::Integer,
+            span: Span::empty(0),
+        };
+        let analysis = analysis::analyze(&source, &program);
+        let main = analysis.function_signature(analysis.function_by_name("main").unwrap());
+        let emitter = TemporaryEmitter {
+            source: &source,
+            program: &program,
+            analysis: &analysis,
+            main,
+        };
+
+        let annotation = emitter
+            .render_expression(&unannotated)
+            .unwrap_err()
+            .to_string();
+        assert!(annotation.contains("compiler error"), "{annotation}");
+        assert!(annotation.contains("without an analysis annotation"), "{annotation}");
+
+        let literal = emitter
+            .render_integer_literal(&unannotated)
+            .unwrap_err()
+            .to_string();
+        assert!(literal.contains("compiler error"), "{literal}");
+        assert!(literal.contains("without a converted literal"), "{literal}");
     }
 }

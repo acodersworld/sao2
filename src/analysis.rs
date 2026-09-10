@@ -30,6 +30,12 @@ pub(crate) enum DeclarationId {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct BindingId(usize);
 
+impl BindingId {
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct TypeId(usize);
 
