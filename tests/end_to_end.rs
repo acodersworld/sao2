@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -46,6 +47,115 @@ fn run_source(directory: &TestDirectory, source: &[u8]) -> Output {
 
 fn compiler_is_missing(output: &Output) -> bool {
     String::from_utf8_lossy(&output.stderr).contains("no supported C compiler found")
+}
+
+struct FuzzRng(u64);
+
+impl FuzzRng {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.0
+    }
+
+    fn below(&mut self, limit: u64) -> u64 {
+        self.next() % limit
+    }
+}
+
+fn fuzz_seeds() -> Vec<u64> {
+    match std::env::var("SAO2_FUZZ_SEED") {
+        Ok(seed) => vec![seed
+            .parse()
+            .expect("SAO2_FUZZ_SEED must be an unsigned decimal integer")],
+        Err(_) => vec![
+            0x243f_6a88_85a3_08d3,
+            0x1319_8a2e_0370_7344,
+            0xa409_3822_299f_31d0,
+        ],
+    }
+}
+
+fn fuzzy_primitive_program(seed: u64) -> (String, Vec<u8>) {
+    let mut rng = FuzzRng(seed);
+    let mut value = (rng.below(1_000) + 1) as i64;
+    let mut source = format!("fn main() {{ var value := {value}; println(value); ");
+    let mut expected = format!("{value}\n");
+
+    // Operands are nonzero where required, shifts are small, and normalization
+    // keeps every operation far inside the signed 64-bit range.
+    for _ in 0..64 {
+        match rng.below(11) {
+            0 => {
+                let operand = rng.below(101) as i64;
+                writeln!(source, "value += {operand};").unwrap();
+                value += operand;
+            }
+            1 => {
+                let operand = rng.below((value + 1) as u64) as i64;
+                writeln!(source, "value -= {operand};").unwrap();
+                value -= operand;
+            }
+            2 => {
+                let operand = rng.below(101) as i64;
+                writeln!(source, "value = value + {operand};").unwrap();
+                value += operand;
+            }
+            3 => {
+                let operand = (rng.below(3) + 1) as i64;
+                writeln!(source, "value *= {operand};").unwrap();
+                value *= operand;
+            }
+            4 => {
+                let operand = (rng.below(9) + 1) as i64;
+                writeln!(source, "value /= {operand};").unwrap();
+                value /= operand;
+            }
+            5 => {
+                let operand = (rng.below(97) + 1) as i64;
+                writeln!(source, "value %= {operand};").unwrap();
+                value %= operand;
+            }
+            6 => {
+                let operand = rng.below(1 << 17) as i64;
+                writeln!(source, "value ^= {operand};").unwrap();
+                value ^= operand;
+            }
+            7 => {
+                let operand = rng.below(1 << 17) as i64;
+                writeln!(source, "value &= {operand};").unwrap();
+                value &= operand;
+            }
+            8 => {
+                let operand = rng.below(1 << 17) as i64;
+                writeln!(source, "value |= {operand};").unwrap();
+                value |= operand;
+            }
+            9 => {
+                let operand = rng.below(4);
+                writeln!(source, "value <<= {operand};").unwrap();
+                value <<= operand;
+            }
+            _ => {
+                let operand = rng.below(4);
+                writeln!(source, "value >>= {operand};").unwrap();
+                value >>= operand;
+            }
+        }
+        source.push_str("value %= 100000; println(value); ");
+        value %= 100_000;
+        writeln!(expected, "{value}").unwrap();
+
+        let threshold = rng.below(100_000) as i64;
+        writeln!(source, "println(value >= {threshold});").unwrap();
+        expected.push_str(if value >= threshold { "true\n" } else { "false\n" });
+    }
+
+    source.push_str("println(\"done\"); }");
+    expected.push_str("done\n");
+    (source, expected.into_bytes())
 }
 
 #[test]
@@ -139,4 +249,75 @@ fn runs_an_empty_string_when_a_compiler_is_available() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn runs_primitive_computation_mutation_and_shadowing_when_a_compiler_is_available() {
+    let directory = TestDirectory::new("primitive computation");
+    let source = br#"fn main() {
+        base := 6;
+        var value := base * 7;
+        value += 1;
+        print("value=");
+        println(value);
+        println(value > 40);
+        {
+            value := value >> 1;
+            print("shadow=");
+            println(value);
+        }
+        println(value);
+    }"#;
+    let output = run_source(&directory, source);
+    if compiler_is_missing(&output) {
+        eprintln!("skipping native end-to-end assertions: no C compiler available");
+        return;
+    }
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"value=43\ntrue\nshadow=21\n43\n");
+}
+
+#[test]
+fn returns_integer_main_result_when_a_compiler_is_available() {
+    let directory = TestDirectory::new("integer result");
+    let output = run_source(&directory, b"fn main() int { 23 }");
+    if compiler_is_missing(&output) {
+        eprintln!("skipping native end-to-end assertions: no C compiler available");
+        return;
+    }
+    assert_eq!(
+        output.status.code(),
+        Some(23),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn fuzzes_safe_primitive_programs_with_reproducible_seeds() {
+    let directory = TestDirectory::new("primitive fuzz");
+    for seed in fuzz_seeds() {
+        eprintln!("SAO2_FUZZ_SEED={seed}");
+        let (source, expected) = fuzzy_primitive_program(seed);
+        let output = run_source(&directory, source.as_bytes());
+        if compiler_is_missing(&output) {
+            eprintln!("skipping native fuzz assertions: no C compiler available");
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "SAO2_FUZZ_SEED={seed}\nsource:\n{source}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.stdout,
+            expected,
+            "SAO2_FUZZ_SEED={seed}\nsource:\n{source}"
+        );
+    }
 }

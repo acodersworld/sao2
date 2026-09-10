@@ -175,10 +175,37 @@ Phase 7 runs analysis immediately after parsing and before any temporary
 backend checks. Analysis diagnostics stop compilation without creating an
 output file, including diagnostics from declarations outside the backend's
 current executable subset. The compiler boundary uses the analyzed entry-point
-classification rather than repeating signature resolution. The retained
-string-print lowering consumes the resolved intrinsic target, expression
-states, and decoded string literal from `Analysis`; it treats an unresolved
-emitted expression or missing decoded literal as a compiler invariant failure.
+classification rather than repeating signature resolution.
+
+## Temporary resolved-AST C emitter
+
+Milestone 4's temporary emitter consumes the analyzed no-argument `main`
+signature and traverses its body in source order. Primitive declarations use
+the binding identity attached to their statement, identifier reads use their
+recorded `NameResolution`, and assignments use both their root binding and
+latest `AssignmentTargetAnnotation`. Generated C names depend only on
+`BindingId`, never source spelling.
+
+Integer and boolean expressions use their latest resolved expression state.
+Integer and boolean literals use decoded `LiteralValue` annotations, including
+the separately admitted signed minimum magnitude. Direct `print` and `println`
+statements use the recorded intrinsic `CallTarget`; string output additionally
+requires a direct decoded string literal. No emitted construct reparses source
+text or repeats frontend lookup or inference.
+
+The emitter accepts only primitive locals, lexical blocks, direct assignment
+to mutable locals, supported primitive expressions, ordered output statements,
+and the structurally evident results of `main`. Unsupported resolved syntax is
+a source diagnostic, while a missing or contradictory analysis fact is a
+compiler invariant failure. C is generated fully in memory before filesystem
+output, so frontend or capability errors cannot create or truncate generated
+source.
+
+This boundary is deliberately temporary. Milestone 5 remains responsible for
+complete mutability and return-path validation, unreachable and loop-context
+checks, narrowing, switch coverage, and resolving flow-dependent expressions.
+Milestone 6 will replace direct AST emission with typed IR that makes control
+flow, evaluation order, runtime checks, and source locations explicit.
 
 The handoff is intentionally a resolved-AST interface rather than a typed IR.
 Milestone 4 may consume the stable declaration and binding identities, type

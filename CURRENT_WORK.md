@@ -1,6 +1,6 @@
 # Current Work: Early Primitive C Backend
 
-Status: in progress (Phase 4).
+Status: in progress (Phase 5).
 
 This document expands milestone 4 of `ROADMAP.md`. The objective is to replace
 the one-call string-print lowering with a small direct C emitter over the
@@ -136,6 +136,10 @@ Exit criterion: an analyzed program can compute primitive values, print its
 observable result, and return a small integer exit status through generated C.
 
 ## Phase 5: Integration, tests, and handoff
+
+The native primitive stress test uses deterministic pseudo-random programs.
+Every run reports its seed, and `SAO2_FUZZ_SEED` selects one seed for exact
+reproduction without adding a compiler dependency.
 
 - Add emitter unit tests for stable generated C, identity-based names,
   precedence preservation, multiple output operations, and unsupported-node
