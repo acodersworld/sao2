@@ -65,10 +65,10 @@ Outcome: declarations and expressions have resolved, statically known types.
 
 ## 4. Early primitive C backend
 
-Status: current.
+Status: complete.
 
-The phase breakdown for this milestone is in
-[Current Work: Early Primitive C Backend](CURRENT_WORK.md).
+This milestone is complete. Its resolved-AST emitter handoff is documented in
+`AST.md`.
 
 - Replace the print-only lowering with a deliberately limited direct emitter
   over the resolved syntax tree.
@@ -89,6 +89,11 @@ Outcome: a small, well-defined primitive subset performs useful arithmetic and
 runs through generated C immediately after name and type resolution.
 
 ## 5. Semantic analysis
+
+Status: current.
+
+The phase breakdown for this milestone is in
+[Current Work: Semantic Analysis](CURRENT_WORK.md).
 
 - Type-check expressions, calls, assignments, and returns.
 - Enforce constant, `var`, transitive mutability, and tuple immutability rules.

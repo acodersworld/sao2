@@ -1,203 +1,239 @@
-# Current Work: Early Primitive C Backend
+# Current Work: Semantic Analysis
 
-Status: in progress (Phase 5).
+Status: planned.
 
-This document expands milestone 4 of `ROADMAP.md`. The objective is to replace
-the one-call string-print lowering with a small direct C emitter over the
-resolved AST produced by milestone 3. The source-to-executable path must remain
-working after every phase.
+This document expands milestone 5 of `ROADMAP.md`. The objective is to turn
+milestone 3's resolved names and types into a complete semantic proof before
+milestone 4's temporary C emitter or milestone 6's typed-IR lowering sees a
+program. The source-to-executable path must remain working after every phase.
 
-The milestone deliberately implements only a primitive, side-effect-limited
-subset. Programs outside that subset remain valid SAO2 where analysis permits
-them, but receive a clear temporary-backend source diagnostic. Backend limits
-must not be reported before parser or analysis diagnostics.
+Milestone 4 is complete. Its resolved-AST emitter remains deliberately limited
+to primitive programs and is not expanded here. Semantic errors must precede
+temporary-backend capability diagnostics, warnings must not stop compilation,
+and no generated C file may be created or truncated after a semantic failure.
 
-## Supported subset and boundary
+## Semantic boundary
 
-This milestone targets a no-argument `main` with linear primitive computation:
+The existing name-and-type analysis already owns declaration identities,
+lexical binding resolution, static types, constructor selection, expected-type
+propagation, assignment target types, and explicit deferred records. This
+milestone adds a flow-sensitive semantic pass over those facts. It must not
+repeat source name lookup, literal decoding, constructor selection, or ordinary
+type inference.
 
-- signed 64-bit integer and boolean literals and values;
-- parenthesized expressions and the analyzed integer and boolean unary
-  operators;
-- integer arithmetic, remainder, bitwise operations, shifts, comparisons, and
-  boolean operations;
-- primitive local bindings, lexical blocks, identifier reads, direct
-  assignment, and compound assignment;
-- direct `print` and `println` calls for string literals, integers, and booleans;
-- an implicit successful result for `fn main()`, and an integer result for
-  `fn main() int` through a final value or an unconditional `return` supported
-  by the emitter.
+The completed handoff must establish that:
 
-The emitter consumes `Analysis` identities, expression types, converted
-literals, binding records, assignment targets, and intrinsic call targets. It
-does not repeat source name lookup, numeric parsing, or type inference. C names
-are generated from stable identities rather than source spellings, so SAO2
-shadowing and C keywords cannot collide.
+- every binding access is permitted by constant, `var`, transitive mutability,
+  and tuple immutability rules;
+- every return agrees with its function and every reachable path through a
+  value-returning function produces a value or does not return;
+- `break` and `continue` occur only inside a lexically enclosing loop;
+- every union test and switch label selects one concrete alternative;
+- switch coverage is exhaustive unless an `else` arm is present;
+- narrowed binding uses have final payload types within their branch or arm;
+- every postfix `?` has a resolved success type and propagation action; and
+- no diagnostic-free result retains an unresolved deferred record.
 
-String values remain limited to the existing direct literal-output path.
-Floats, characters, string locals, user function calls, parameters, control
-flow, constructors, containers, members, indexing, unions, `panic`, and
-flow-dependent expressions remain unsupported by this backend.
+Semantic facts remain separate from the parser AST. New records must retain
+direct AST references, stable semantic identities, and source spans needed by
+typed-IR lowering. A missing or contradictory prerequisite annotation is a
+compiler invariant failure, not a source-language error.
 
-Milestone 5 still owns full semantic validity. Until then, the emitter accepts
-only structurally safe cases it can lower without relying on missing
-mutability, return-path, loop-context, or narrowing checks. In particular,
-assignment lowering is limited to mutable local bindings and no expression in
-an emitted construct may have `Error` or `Deferred` state.
+## Design decisions to record
 
-## Phase 1: Analyzed emitter boundary
+Phase 1 updates `DESIGN.md` with these decisions before implementing behavior:
 
-- Replace the specialized print-only lowering with a temporary emitter object
-  that receives `SourceFile`, `Program`, `Analysis`, and the analyzed `main`.
-- Separate subset validation from filesystem output so unsupported programs do
-  not create or truncate `build/program.c`.
-- Centralize source diagnostics for unsupported declarations, signatures,
-  statements, expressions, calls, and types.
-- Generate a complete deterministic C translation unit in memory before the
-  compiler writes it.
-- Preserve the exact existing `print("...")` C output behavior, including
-  embedded NUL bytes and Windows binary stdout handling.
+- Statically unreachable source is valid. The compiler emits a source warning
+  and continues compilation.
+- Reachability is structural during this milestone. Do not infer that a loop is
+  non-terminating from a literal condition or perform general constant folding.
+- Emit one warning at the first construct in each contiguous unreachable region.
+- Postfix `?` removes the top-level `Error` alternative. One remaining success
+  alternative produces its payload type directly; multiple remaining success
+  alternatives produce their union while preserving their tags and nesting.
+- Successful `build` and `run` commands render source warnings to standard error
+  without changing their normal exit status.
 
-Exit criterion: the hello regression travels through the new emitter boundary,
-while analyzed but unsupported programs fail before output creation.
+## Phase 1: Pass boundary, diagnostics, and entry points
 
-## Phase 2: Primitive values and expressions
+- Add a distinct semantic pass after existing name-and-type analysis and before
+  temporary backend validation.
+- Keep fatal source diagnostics separate from non-fatal source warnings. Render
+  both with filenames, byte-derived line and column information, source lines,
+  and carets; warnings use the `source warning` category.
+- Bound warnings independently from errors and retain deterministic source
+  ordering within each collection.
+- Return successful compilation output together with warnings so the CLI can
+  print warnings to standard error before invoking the host compiler.
+- Move missing, duplicate, and invalid executable-entry-point diagnostics into
+  semantic validation. The compiler boundary consumes the validated
+  `EntryPoint` and does not repeat signature rules.
+- Stop before semantic analysis when earlier name/type diagnostics exist, and
+  stop before C emission when semantic errors exist.
 
-This phase builds an internal analyzed-expression rendering seam. Binding reads
-receive their final identity-based C names, but Phase 3 remains responsible for
-emitting the declarations that make those names usable in a translation unit.
-Consequently, the existing string-literal `print` program remains the only
-CLI-accepted backend subset during this phase and its generated C remains
-unchanged.
+Exit criterion: a valid primitive program reaches the unchanged emitter,
+entry-point failures are semantic source diagnostics, and a synthetic semantic
+warning is visible without failing compilation.
 
-- Add explicit temporary C representations for SAO2 `int` and `bool`, using
-  fixed-width integer and boolean C types.
-- Emit converted integer and boolean literals from analysis annotations rather
-  than reparsing source text.
-- Emit binding reads, parentheses, unary `+`, unary `-`, `~`, and `!` according
-  to their resolved operand types.
-- Emit integer arithmetic, remainder, bitwise operators, shifts, integer
-  comparisons, equality, and short-circuit boolean operators.
-- Parenthesize generated expressions deliberately so correctness does not
-  depend on matching the C precedence table.
-- Reject every expression form or resolved type not explicitly supported.
+## Phase 2: Mutability and assignability
 
-During this milestone, generated signed C operations are intentionally
-unchecked. Tests must avoid overflow, division or remainder by zero, invalid
-shift counts, and other cases for which the roadmap permits temporary host-C
-behavior. Runtime checks belong to typed-IR lowering in milestone 6.
+- Classify assignment and receiver paths from their recorded root `BindingId`,
+  access kind, target annotation, and resolved types.
+- Require `var` to reassign primitive, string, tuple, and union bindings. Preserve
+  the language rule that both constant and `var` object references may be
+  rebound, while only `var` grants mutation of the referred object.
+- Require `var` for struct-field replacement, list or map index assignment, and
+  mutating list or map methods. Propagate that permission through referenced and
+  inline struct fields and through object references reachable from composite
+  values.
+- Reject replacement of tuple members regardless of the root qualifier. A
+  mutable root may still mutate an object reached through a tuple member; it may
+  not replace that tuple slot. Strings remain immutable and have no mutating
+  element operation.
+- Validate compound assignment as both a read and a write after ordinary operand
+  typing has succeeded.
+- For a `var` parameter, require a mutable argument only when the parameter type
+  can transitively reach mutable objects. Primitive and object-free tuple values
+  are copied and therefore do not require a mutable caller binding.
+- Reject mutation-capable calls on temporaries or other expressions without a
+  mutable binding root.
 
-Exit criterion: pure in-range integer and boolean expressions lower
-deterministically from resolved analysis facts in emitter unit tests, including
-identity-based binding reads, while the hello regression remains unchanged.
+Exit criterion: every recorded write, read-write, mutation, and receiver
+mutation is either authorized by one explicit rule or has a source diagnostic.
 
-## Phase 3: Bindings, scopes, and assignments
+## Phase 3: Returns, loops, and reachability
 
-During this phase, the exact one-statement string `print` program remains a
-separate compatibility path. Primitive-only bodies may contain the constructs
-below, but combining computation with output remains Phase 4 work.
+- Compute a conservative control-flow summary for blocks, statement bodies,
+  conditional branches, switches, loops, return statements, and non-returning
+  expressions. Distinguish fallthrough, function return, loop break, and loop
+  continue while analyzing nested constructs.
+- Validate bare returns only in no-value functions and valued returns only in
+  value-returning functions. Reuse expected-type and union-injection annotations
+  when checking returned values.
+- Treat a reachable final function-body expression as the implicit result. Reject
+  a final value in a no-value function and reject every reachable value-function
+  path that reaches the closing brace without a value.
+- Count `panic` and other `Never` expressions as terminating paths. Treat `while`
+  and `for` as capable of falling through even when their bodies always
+  terminate.
+- Validate `break` and `continue` using lexical loop depth; a switch does not
+  establish a loop context.
+- Continue fully checking unreachable constructs for semantic errors. Warn only
+  at the first statement or final block value in each contiguous unreachable
+  region, then resume normal warning detection inside independently reachable
+  nested bodies.
 
-- Emit primitive local declarations with generated names based on `BindingId`.
-- Initialize locals in source evaluation order and preserve lexical block
-  structure and same-scope shadowing.
-- Resolve identifier reads exclusively through recorded `NameResolution`.
-- Lower direct assignments through `AssignmentTargetAnnotation`; do not add
-  member or index assignment support.
-- Lower the supported compound assignments only when analysis gives both sides
-  the required primitive type.
-- Accept assignment only to mutable local bindings until milestone 5 installs
-  complete mutability validation.
-- Reject no-value, non-returning, error, or deferred initializers and operands
-  instead of manufacturing C values.
+Exit criterion: value-returning functions have proven result paths, loop-control
+statements have valid targets, and unreachable code remains valid with stable
+warnings.
 
-Exit criterion: linear programs can declare, shadow, read, and update primitive
-locals without exposing source identifiers to C.
+## Phase 4: Union tests, narrowing, and switches
 
-## Phase 4: Output and entry-point results
+- Resolve `is` and switch labels contextually against the tested union. Bare
+  identifiers select tags in tagged unions, `Error` selects the error
+  alternative, and ordinary type labels select alternatives in untagged unions.
+- Diagnose a non-union operand, a label absent from the union, a tag/type form
+  inappropriate for the union style, and duplicate switch alternatives.
+- Record the selected union, alternative, payload type, and tested binding when
+  one exists. Later stages must not repeat contextual label lookup.
+- Narrow only an exact binding operand in the selected `if` branch or switch arm.
+  Parentheses around that binding may be ignored, but negated tests, combined
+  boolean conditions, aliases, and prior failed branches do not introduce
+  narrowing. An `else` body is not narrowed.
+- Apply narrowing to reads, member/index receivers, calls, and indirect mutation
+  inside the body. Direct reassignment of the tested binding continues to use
+  its declared union type.
+- Require each union alternative exactly once when no `else` arm exists. An
+  `else` makes a partial switch exhaustive; if explicit arms already cover all
+  alternatives, retain the valid switch and warn that its `else` is unreachable.
+- Use exhaustive switch-arm flow summaries when proving function return paths.
 
-Phase 4 replaces Phase 3's separate compatibility modes with one ordered
-statement emitter. Output calls may be interleaved with primitive computation,
-and the generated C entry point now always receives an explicit result.
+Exit criterion: all `is` expressions and switches have concrete alternative
+records, branch-local expressions have final types, and switch coverage is
+proven.
 
-- Generalize the retained byte-safe output support so multiple `print` and
-  `println` statements can be emitted in evaluation order.
-- Preserve exact string-literal byte output and add decimal integer and
-  `true`/`false` boolean output needed by executable arithmetic tests.
-- Check C library output results and return a nonzero status on output failure,
-  retaining the walking skeleton's current behavior.
-- Emit `fn main()` with an implicit successful result.
-- Emit supported `fn main() int` final values and unconditional integer returns
-  through C `main`; keep native exit-code fixtures within the portable test
-  range.
-- Keep `main(args [str])` valid at the language boundary but explicitly
-  unsupported by this milestone's no-argument backend.
+## Phase 5: Postfix `?`
 
-Exit criterion: an analyzed program can compute primitive values, print its
-observable result, and return a small integer exit status through generated C.
+- Require the operand's top-level type to be a union containing exactly one
+  `Error` alternative. Do not flatten explicitly nested unions while searching.
+- Compute the successful result by removing `Error`: unwrap one remaining
+  alternative to its payload type, or intern the union of multiple remaining
+  alternatives with their existing tags and structure.
+- Outside `main`, require the enclosing function result to contain a compatible
+  top-level `Error` alternative and record an early-return propagation action.
+- In either valid form of `main`, record an action that converts the error case
+  into the language's required runtime panic rather than an ordinary return.
+- Diagnose `?` on non-unions, unions without exactly one `Error`, and functions
+  whose result cannot propagate that error.
+- Recompute expressions whose only deferred input was a newly resolved test,
+  narrowed use, switch, or try expression. Mark each completed deferred record
+  resolved exactly once.
 
-## Phase 5: Integration, tests, and handoff
+Exit criterion: every postfix `?` has a final expression type, selected error
+alternative, and explicit propagate-or-panic action.
 
-The native primitive stress test uses deterministic pseudo-random programs.
-Every run reports its seed, and `SAO2_FUZZ_SEED` selects one seed for exact
-reproduction without adding a compiler dependency.
+## Phase 6: Integration, tests, and handoff
 
-- Add emitter unit tests for stable generated C, identity-based names,
-  precedence preservation, multiple output operations, and unsupported-node
-  diagnostics.
-- Add compiler tests proving parser and analysis errors still precede backend
-  capability errors and no C file is written on failure.
-- Add native end-to-end fixtures for arithmetic, comparisons, boolean output,
-  local mutation and shadowing, string-print regression, and integer exit
-  status; skip only native assertions when no supported C compiler is present.
-- Keep test arithmetic inside the temporary unchecked domain documented above.
-- Update `AST.md` with the exact analyzed-AST facts consumed by the emitter and
-  the capability obligations handed to milestone 5.
-- Mark this emitter as temporary and avoid designing APIs that milestone 6's
-  typed IR would be forced to preserve.
+- Add a final invariant check: if semantic errors are absent, every expression,
+  assignment target, union operation, and deferred record needed by lowering has
+  a final annotation. Report contradictions as compiler errors.
+- Add semantic unit tests for all rules below and compiler tests for diagnostic
+  ordering, warning behavior, and no-output-on-error behavior.
+- Preserve all milestone 4 generated-C snapshots and native tests unchanged.
+  Programs valid under semantic analysis but outside the primitive backend must
+  continue to receive temporary-backend diagnostics.
+- Update `AST.md` with control-flow, mutability, narrowing, switch, and try facts
+  available to milestone 6. Keep the milestone 4 direct-emitter handoff visibly
+  temporary.
+- Mark milestone 5 complete only after the full suite passes under the required
+  Rust toolchain and native C tests pass when a supported compiler is available.
 
-Exit criterion: the milestone's complete primitive subset builds and executes
-through the existing CLI, unsupported valid programs receive stable source
-diagnostics, and milestone 5 can add semantic validation without undoing the
-backend boundary.
+Exit criterion: every accepted source program is semantically valid and ready
+for typed-IR lowering, while warnings remain non-fatal and the walking skeleton
+continues to execute its primitive subset.
 
 ## Implementation constraints
 
 - Keep the compiler dependency-free.
-- Invoke the host compiler with argument lists through the existing toolchain
-  boundary; generated source never becomes a shell command.
-- Keep generated artifacts under `build/` and preserve current CLI paths and
-  source, compiler/toolchain, and program error categories.
-- Consume decoded literals and stable semantic identities from `Analysis`.
-- Emit only expressions whose latest analysis state is resolved or explicitly
-  no-value where the surrounding statement permits it.
-- Preserve left-to-right observable evaluation. The supported expression
-  subset is otherwise side-effect free, so direct C operators cannot reorder
-  visible operations.
-- Do not add runtime arithmetic checks during this milestone.
+- Preserve the immutable parser AST and store semantic results in analysis-owned
+  side tables.
+- Use stable declaration and binding identities rather than source spellings
+  after contextual union-label resolution.
+- Preserve byte-oriented source locations and source/program/toolchain failure
+  categories.
+- Do not create generated files until parsing, name/type analysis, semantic
+  validation, and temporary-backend capability validation all succeed.
+- Do not add typed IR, runtime arithmetic checks, new C emission, or runtime
+  layouts during this milestone.
 
 ## Non-goals
 
-- Floats, characters, general string values, or primitive conversions
-- User-defined function emission or calls
-- Parameters or command-line argument decoding
-- `if`, loops, `switch`, short-circuit expressions with side-effecting calls,
-  or general control-flow validation
-- Structs, tuples, unions, errors, lists, maps, members, or indexing
-- Full mutability, return-path, unreachable-code, or loop-context validation
-- Checked arithmetic, bounds checks, runtime source locations, or typed IR
-- Runtime layouts, allocation, escape analysis, or garbage collection
+- Expanding the temporary C backend beyond milestone 4's primitive subset
+- Lowering control flow or postfix `?` into C
+- Runtime overflow, shift, bounds, division, missing-key, or source-location checks
+- Escape analysis, storage placement, garbage collection, or runtime type layouts
+- Constant propagation or proof of non-terminating loops
+- General warning policy beyond statically unreachable source
 
 ## Test requirements
 
-- The exact string-print and empty-string regressions
-- Integer literal boundaries used within portable emitted operations
-- Unary, arithmetic, remainder, bitwise, shift, comparison, and boolean cases
-- Parenthesized combinations whose SAO2 and C precedence could otherwise differ
-- Mutable locals, direct and compound assignment, nested blocks, and shadowing
-- Multiple `print`/`println` calls with string, integer, and boolean output
-- No-value `main`, integer final value, and unconditional integer return
-- Analysis failure in an otherwise backend-unsupported program
-- Clear rejection of every excluded declaration, signature, statement,
-  expression, call, assignment target, and primitive type encountered by the
-  emitter
-- No generated file on parser, analysis, or backend-capability failure
+- Constant and `var` direct assignment across primitive, tuple, union, struct,
+  list, map, and string bindings
+- Struct member and container mutation through direct, inline, referenced, tuple,
+  and union-narrowed paths
+- Mutating methods and transitive `var` function arguments, including temporaries
+- Bare, valued, implicit, incompatible, partial, exhaustive, and panicking return
+  paths
+- Valid and invalid nested `break` and `continue`
+- One source warning per contiguous unreachable region, warning source rendering,
+  successful CLI continuation, and independent error/warning bounds
+- Tagged, untagged, `Error`, nested, unknown, duplicate, partial, exhaustive, and
+  redundant-`else` union switches
+- Branch-local narrowing for statements and expressions without leakage into
+  later branches or following statements
+- Postfix `?` with one success, multiple successes, incompatible errors, missing
+  errors, nested errors, and both valid `main` forms
+- Parser and name/type failures preceding semantic work; semantic failures and
+  warnings preceding temporary-backend diagnostics
+- No generated file creation or truncation after any fatal frontend failure
+- No unresolved deferred records in a diagnostic-free completed analysis
