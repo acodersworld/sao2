@@ -239,6 +239,12 @@ immediately returns its `Error`, as in Rust. The enclosing function must return
 a union with a compatible `Error` alternative. `main` is the exception: using
 `?` on an error in `main` causes a runtime panic.
 
+Postfix `?` removes the top-level `Error` alternative from the expression's
+type. If exactly one success alternative remains, the expression has that
+alternative's payload type directly. If multiple success alternatives remain,
+the expression has their union, preserving the alternatives' tags and explicit
+nesting.
+
 ## Functions
 
 Function parameters and non-empty return types are explicit:
@@ -716,13 +722,21 @@ numbers. Tabs expand to four columns when diagnostics are rendered. A
 compiler-generated node inherits the span of the source construct that caused
 it.
 
-Compile-time diagnostics show the source filename, line, column, relevant
-source line, and a caret marking the primary span. Related spans may identify
-previous declarations or conflicting types. Diagnostics are sorted by source
-position. The compiler recovers at safe boundaries such as semicolons and
-closing braces to report multiple errors, but stops after 20 errors to limit
-cascades. There are no warnings initially; every diagnostic represents a
-definite problem.
+Compile-time source errors and warnings show the source filename, line, column,
+relevant source line, and a caret marking the primary span. Related spans may
+identify previous declarations or conflicting types. Errors and warnings are
+kept in separate collections, each limited independently to 20 entries. Each
+collection is sorted stably by source byte position, preserving insertion order
+for equal spans. The compiler recovers at safe boundaries such as semicolons
+and closing braces to report multiple errors.
+
+In v0, only statically unreachable source produces a warning. Such warnings are
+non-fatal: successful `build` and `run` commands print them to standard error
+without changing their normal status. Reachability is structural; the compiler
+does not infer non-termination from literal loop conditions or perform general
+constant folding for this purpose. The first construct in each contiguous
+unreachable region produces one warning. Warning policy beyond unreachable
+source is out of scope for v0.
 
 Runtime checks receive a compact location identifier. A generated table maps
 each identifier to its SAO2 source location and function. A panic reports the

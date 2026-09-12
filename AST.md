@@ -60,8 +60,8 @@ boundaries, and diagnostics are capped at 20.
 
 Milestone 3 may rely on the structural invariants above. Name and type analysis
 in milestone 3 and semantic analysis in milestone 5 together own contextual
-validation; CURRENT_WORK.md defines the current phase boundaries. Analysis
-remains responsible for:
+validation; CURRENT_WORK.md defines the current phase boundaries. Together the
+two analysis passes remain responsible for:
 
 - declaration and member uniqueness, name lookup, and type-name resolution;
 - struct-versus-tuple member consistency and union alternative validity;
@@ -70,9 +70,7 @@ remains responsible for:
 - argument form and arity, operator operand types, and collection types;
 - mutability and assignment validity beyond the syntactic target shape;
 - condition types, return-path checking, and compatible branch values;
-- loop context for `break` and `continue`, and switch coverage;
-- the remaining executable-entry-point validation currently performed at the
-  compiler boundary.
+- loop context for `break` and `continue`, and switch coverage.
 
 ## Name-and-type analysis handoff
 
@@ -94,8 +92,9 @@ Phase 2 adds source-order-independent top-level collection with separate type
 and value namespaces. It resolves every function parameter and return type
 against the complete type namespace, records parameter binding identities, and
 registers `print`, `println`, and `panic` with explicit intrinsic rules. The
-result also classifies the existing four-form executable entry point and can
-distinguish function, constructor, and intrinsic names in call position.
+result can distinguish function, constructor, and intrinsic names in call
+position. Executable entry-point validation belongs to the semantic-analysis
+boundary.
 
 Name collisions follow the rule recorded in `DESIGN.md`: intrinsic names are
 reserved in the value namespace, while a call matching both a type and a value
@@ -171,11 +170,12 @@ untagged union is represented by a separate union-injection annotation rather
 than hidden in its expression type. Completed expected-type and constructor
 deferred records are marked resolved; only flow-sensitive work remains active.
 
-Phase 7 runs analysis immediately after parsing and before any temporary
-backend checks. Analysis diagnostics stop compilation without creating an
+Name-and-type analysis runs immediately after parsing and before semantic or
+temporary-backend checks. Its diagnostics stop compilation without creating an
 output file, including diagnostics from declarations outside the backend's
-current executable subset. The compiler boundary uses the analyzed entry-point
-classification rather than repeating signature resolution.
+current executable subset. Semantic analysis then validates the executable
+entry point from the resolved function namespace and signature and hands its
+stable function identity to downstream stages.
 
 ## Temporary resolved-AST C emitter
 
@@ -201,9 +201,10 @@ compiler invariant failure. C is generated fully in memory before filesystem
 output, so frontend or capability errors cannot create or truncate generated
 source.
 
-This boundary is deliberately temporary. Milestone 5 remains responsible for
-complete mutability and return-path validation, unreachable and loop-context
-checks, narrowing, switch coverage, and resolving flow-dependent expressions.
+This boundary is deliberately temporary. Later milestone 5 phases remain
+responsible for complete mutability and return-path validation, unreachable and
+loop-context checks, narrowing, switch coverage, and resolving flow-dependent
+expressions.
 Milestone 6 will replace direct AST emission with typed IR that makes control
 flow, evaluation order, runtime checks, and source locations explicit.
 

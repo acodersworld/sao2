@@ -3,12 +3,14 @@ use std::fmt;
 use std::path::PathBuf;
 
 pub const MAX_SOURCE_ERRORS: usize = 20;
+pub const MAX_SOURCE_WARNINGS: usize = 20;
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum DiagnosticKind {
     Usage,
     Input,
     Source,
+    SourceWarning,
     Compiler,
     Program,
 }
@@ -45,9 +47,26 @@ impl Diagnostic {
     }
 
     pub fn source(source: &SourceFile, span: Span, message: impl Into<String>) -> Self {
+        Self::source_with_kind(source, span, DiagnosticKind::Source, message)
+    }
+
+    pub fn source_warning(
+        source: &SourceFile,
+        span: Span,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::source_with_kind(source, span, DiagnosticKind::SourceWarning, message)
+    }
+
+    fn source_with_kind(
+        source: &SourceFile,
+        span: Span,
+        kind: DiagnosticKind,
+        message: impl Into<String>,
+    ) -> Self {
         let (line, column, source_line, caret_width) = source.diagnostic_excerpt(span);
         Self {
-            kind: DiagnosticKind::Source,
+            kind,
             message: message.into(),
             primary: Some(PrimarySpan {
                 path: source.path.clone(),
@@ -75,6 +94,7 @@ impl Diagnostic {
     pub fn exit_code(&self) -> i32 {
         match self.kind {
             DiagnosticKind::Usage => 2,
+            DiagnosticKind::SourceWarning => 0,
             DiagnosticKind::Input
             | DiagnosticKind::Source
             | DiagnosticKind::Compiler
@@ -89,6 +109,7 @@ impl fmt::Display for Diagnostic {
             DiagnosticKind::Usage => "usage error",
             DiagnosticKind::Input => "input error",
             DiagnosticKind::Source => "source error",
+            DiagnosticKind::SourceWarning => "source warning",
             DiagnosticKind::Compiler => "compiler error",
             DiagnosticKind::Program => "program error",
         };
@@ -152,7 +173,7 @@ impl Diagnostics {
     #[cfg(test)]
     pub fn into_sorted(mut self) -> Vec<Diagnostic> {
         self.entries
-            .sort_by_key(|diagnostic| diagnostic.primary_span().map(|span| span.start));
+            .sort_by_key(|diagnostic| diagnostic.primary_span());
         self.entries
     }
 }
@@ -160,12 +181,58 @@ impl Diagnostics {
 impl fmt::Display for Diagnostics {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut diagnostics: Vec<&Diagnostic> = self.entries.iter().collect();
-        diagnostics.sort_by_key(|diagnostic| diagnostic.primary_span().map(|span| span.start));
+        diagnostics.sort_by_key(|diagnostic| diagnostic.primary_span());
         for (index, diagnostic) in diagnostics.into_iter().enumerate() {
             if index > 0 {
                 writeln!(formatter)?;
             }
             write!(formatter, "{diagnostic}")?;
+        }
+        Ok(())
+    }
+}
+
+/// A source-ordered warning collection with a limit independent of errors.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct Warnings {
+    entries: Vec<Diagnostic>,
+}
+
+impl Warnings {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn push(&mut self, warning: Diagnostic) {
+        if self.entries.len() < MAX_SOURCE_WARNINGS {
+            self.entries.push(warning);
+        }
+    }
+    pub fn is_full(&self) -> bool {
+        self.entries.len() == MAX_SOURCE_WARNINGS
+    }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    #[cfg(test)]
+    pub fn into_sorted(mut self) -> Vec<Diagnostic> {
+        self.entries
+            .sort_by_key(|diagnostic| diagnostic.primary_span());
+        self.entries
+    }
+}
+
+impl fmt::Display for Warnings {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut warnings: Vec<&Diagnostic> = self.entries.iter().collect();
+        warnings.sort_by_key(|diagnostic| diagnostic.primary_span());
+        for (index, warning) in warnings.into_iter().enumerate() {
+            if index > 0 {
+                writeln!(formatter)?;
+            }
+            write!(formatter, "{warning}")?;
         }
         Ok(())
     }
@@ -228,6 +295,61 @@ mod tests {
         diagnostics.push(Diagnostic::source(&source, Span::new(0, 3), "first"));
 
         let rendered = diagnostics.to_string();
+        assert!(rendered.find("first").unwrap() < rendered.find("second").unwrap());
+    }
+
+    #[test]
+    fn source_warning_uses_the_source_excerpt_renderer() {
+        let source = source("first\n\tunused");
+        let warning = Diagnostic::source_warning(&source, Span::new(7, 13), "unreachable source");
+        assert_eq!(
+            warning.to_string(),
+            "sao2: source warning: test.sao2:2:5: unreachable source\n  |\n2 |     unused\n  |     ^^^^^^"
+        );
+        assert_eq!(warning.exit_code(), 0);
+    }
+
+    #[test]
+    fn errors_and_warnings_have_independent_limits_and_stable_ordering() {
+        let source = source("0123456789");
+        let mut errors = Diagnostics::new();
+        let mut warnings = Warnings::new();
+        for index in 0..25 {
+            errors.push(Diagnostic::source(&source, Span::empty(5), format!("error {index}")));
+            warnings.push(Diagnostic::source_warning(
+                &source,
+                Span::empty(5),
+                format!("warning {index}"),
+            ));
+        }
+        assert!(errors.is_full());
+        assert!(warnings.is_full());
+        assert_eq!(errors.len(), MAX_SOURCE_ERRORS);
+        assert_eq!(warnings.len(), MAX_SOURCE_WARNINGS);
+        let errors = errors.into_sorted();
+        let warnings = warnings.into_sorted();
+        assert!(errors[0].to_string().contains("error 0"));
+        assert!(errors[19].to_string().contains("error 19"));
+        assert!(warnings[0].to_string().contains("warning 0"));
+        assert!(warnings[19].to_string().contains("warning 19"));
+    }
+
+    #[test]
+    fn warning_collection_renders_in_source_order() {
+        let source = source("one two");
+        let mut warnings = Warnings::new();
+        warnings.push(Diagnostic::source_warning(
+            &source,
+            Span::new(4, 7),
+            "second",
+        ));
+        warnings.push(Diagnostic::source_warning(
+            &source,
+            Span::new(0, 3),
+            "first",
+        ));
+
+        let rendered = warnings.to_string();
         assert!(rendered.find("first").unwrap() < rendered.find("second").unwrap());
     }
 }

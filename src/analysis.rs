@@ -406,17 +406,6 @@ pub(crate) struct FunctionName {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EntryPoint {
-    Missing,
-    Valid(FunctionId),
-    Invalid(FunctionId),
-    Duplicate {
-        first: FunctionId,
-        duplicate: FunctionId,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DeferredReason {
     FlowDependentType,
     ExpectedType,
@@ -510,7 +499,6 @@ pub(crate) struct Analysis<'source, 'ast> {
     pub(crate) type_definitions: Vec<TypeDefinition<'ast>>,
     pub(crate) function_signatures: Vec<FunctionSignature<'ast>>,
     pub(crate) intrinsic_signatures: Vec<IntrinsicSignature>,
-    pub(crate) entry_point: EntryPoint,
     pub(crate) deferred: Vec<DeferredAnalysis<'ast>>,
     pub(crate) diagnostics: Diagnostics,
     pending_map_keys: Vec<PendingMapKey<'ast>>,
@@ -1281,51 +1269,7 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
         }
     }
 
-    fn classify_entry_point(&self) -> EntryPoint {
-        let mut mains = self.function_signatures.iter().filter(|signature| {
-            self.identifier_text(signature.node.name.span) == "main"
-        });
-        let Some(first) = mains.next() else {
-            return EntryPoint::Missing;
-        };
-        if let Some(duplicate) = mains.next() {
-            return EntryPoint::Duplicate {
-                first: first.id,
-                duplicate: duplicate.id,
-            };
-        }
-        if self.valid_main_signature(first) {
-            EntryPoint::Valid(first.id)
-        } else {
-            EntryPoint::Invalid(first.id)
-        }
-    }
-
-    fn valid_main_signature(&self, signature: &FunctionSignature<'_>) -> bool {
-        let parameters_valid = match signature.parameters.as_slice() {
-            [] => true,
-            [parameter] => {
-                !parameter.node.mutable
-                    && self.identifier_text(parameter.node.name.span) == "args"
-                    && matches!(
-                        parameter.ty,
-                        TypeState::Resolved(ty)
-                            if matches!(
-                                self.types.get(ty),
-                                ResolvedType::List(element)
-                                    if *element == self.types.primitive(PrimitiveType::Str)
-                            )
-                    )
-            }
-            _ => false,
-        };
-        let result_valid = signature.result == TypeState::NoValue
-            || signature.result
-                == TypeState::Resolved(self.types.primitive(PrimitiveType::Int));
-        parameters_valid && result_valid
-    }
-
-    fn identifier_text(&self, span: Span) -> &str {
+    pub(crate) fn identifier_text(&self, span: Span) -> &str {
         &self.source.text[span.start..span.end]
     }
 }
@@ -4609,7 +4553,6 @@ pub(crate) fn analyze<'source, 'ast>(
                 result: TypeState::Never,
             },
         ],
-        entry_point: EntryPoint::Missing,
         deferred: Vec::new(),
         diagnostics: Diagnostics::new(),
         pending_map_keys: Vec::new(),
@@ -4623,7 +4566,6 @@ pub(crate) fn analyze<'source, 'ast>(
     analysis.resolve_function_bodies();
     analysis.infer_function_bodies();
     analysis.resolve_expected_types();
-    analysis.entry_point = analysis.classify_entry_point();
     analysis
 }
 
@@ -5685,42 +5627,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn classifies_all_supported_entry_point_signatures() {
-        for text in [
-            "fn main() {}",
-            "fn main() int {}",
-            "fn main(args [str]) {}",
-            "fn main(args [str]) int {}",
-        ] {
-            let source = source(text);
-            let program = parser::parse(&source).unwrap();
-            let analysis = analyze(&source, &program);
-            assert!(matches!(analysis.entry_point, EntryPoint::Valid(_)), "{text}");
-        }
-
-        for text in ["fn main(value str) {}", "fn main() str {}"] {
-            let source = source(text);
-            let program = parser::parse(&source).unwrap();
-            let analysis = analyze(&source, &program);
-            assert!(
-                matches!(analysis.entry_point, EntryPoint::Invalid(_)),
-                "{text}"
-            );
-        }
-
-        let helper_source = source("fn helper() {}");
-        let program = parser::parse(&helper_source).unwrap();
-        assert_eq!(
-            analyze(&helper_source, &program).entry_point,
-            EntryPoint::Missing
-        );
-
-        let duplicate_source = source("fn main() {} fn main() {}");
-        let program = parser::parse(&duplicate_source).unwrap();
-        assert!(matches!(
-            analyze(&duplicate_source, &program).entry_point,
-            EntryPoint::Duplicate { .. }
-        ));
-    }
 }

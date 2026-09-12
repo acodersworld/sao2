@@ -2,11 +2,18 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::analysis::{self, Analysis, EntryPoint, FunctionId};
+use crate::analysis::{self, Analysis};
 use crate::c_emitter;
-use crate::diagnostic::{Diagnostic, Diagnostics};
+use crate::diagnostic::{Diagnostic, Diagnostics, Warnings};
 use crate::parser;
-use crate::source::{SourceFile, Span};
+use crate::semantic::{self, SemanticResult};
+use crate::source::SourceFile;
+
+#[derive(Debug)]
+pub(crate) struct CompileOutput {
+    pub(crate) generated_c: PathBuf,
+    pub(crate) warnings: Warnings,
+}
 
 #[derive(Debug)]
 pub enum CompileError {
@@ -38,29 +45,42 @@ impl fmt::Display for CompileError {
     }
 }
 
-/// Stable orchestration boundary from loaded SAO2 source through parsing and
-/// name-and-type analysis to generated C. The analyzed-AST-to-C subset remains
-/// temporary until the typed backend replaces it.
-pub fn compile(source: &SourceFile) -> Result<PathBuf, CompileError> {
+/// Stable orchestration boundary from loaded SAO2 source through parsing,
+/// name-and-type analysis, and semantic analysis to generated C. The
+/// analyzed-AST-to-C subset remains temporary until the typed backend replaces
+/// it.
+pub(crate) fn compile(source: &SourceFile) -> Result<CompileOutput, CompileError> {
     compile_into(source, Path::new("build"))
 }
 
-fn compile_into(source: &SourceFile, build_directory: &Path) -> Result<PathBuf, CompileError> {
+fn compile_into(
+    source: &SourceFile,
+    build_directory: &Path,
+) -> Result<CompileOutput, CompileError> {
+    compile_into_with_semantic(source, build_directory, semantic::analyze)
+}
+
+fn compile_into_with_semantic<F>(
+    source: &SourceFile,
+    build_directory: &Path,
+    semantic_analyzer: F,
+) -> Result<CompileOutput, CompileError>
+where
+    F: FnOnce(&mut Analysis<'_, '_>) -> SemanticResult,
+{
     let program = parser::parse(source).map_err(CompileError::SourceDiagnostics)?;
     let mut analysis = analysis::analyze(source, &program);
-    let main = match validate_main(source, &analysis) {
-        Ok(main) => Some(main),
-        Err(diagnostic) => {
-            analysis.diagnostics.push(diagnostic);
-            None
-        }
-    };
     if !analysis.diagnostics.is_empty() {
         return Err(CompileError::SourceDiagnostics(analysis.diagnostics));
     }
-    let main = analysis.function_signature(
-        main.expect("a diagnostic-free analysis has a valid entry point"),
-    );
+    let semantic = semantic_analyzer(&mut analysis);
+    if !semantic.diagnostics.is_empty() {
+        return Err(CompileError::SourceDiagnostics(semantic.diagnostics));
+    }
+    let entry_point = semantic
+        .entry_point
+        .expect("a diagnostic-free semantic result has a valid entry point");
+    let main = analysis.function_signature(entry_point.function_id());
     let generated_c = c_emitter::emit(source, &program, &analysis, main)?;
 
     fs::create_dir_all(build_directory).map_err(|error| {
@@ -76,36 +96,29 @@ fn compile_into(source: &SourceFile, build_directory: &Path) -> Result<PathBuf, 
             output_path.display()
         ))
     })?;
-    Ok(output_path)
+    Ok(CompileOutput {
+        generated_c: output_path,
+        warnings: semantic.warnings,
+    })
 }
 
-fn validate_main(
+#[cfg(test)]
+fn compile_into_with_semantic_result(
     source: &SourceFile,
-    analysis: &Analysis<'_, '_>,
-) -> Result<FunctionId, Diagnostic> {
-    match analysis.entry_point {
-        EntryPoint::Missing => Err(Diagnostic::source(
-            source,
-            Span::empty(source.text.len()),
-            "executable program requires one 'main' function",
-        )),
-        EntryPoint::Duplicate { duplicate, .. } => Err(Diagnostic::source(
-            source,
-            analysis.function_signature(duplicate).node.name.span,
-            "duplicate 'main' function",
-        )),
-        EntryPoint::Invalid(main) => Err(Diagnostic::source(
-            source,
-            analysis.function_signature(main).node.name.span,
-            "invalid 'main' signature; expected main(), main() int, main(args [str]), or main(args [str]) int",
-        )),
-        EntryPoint::Valid(main) => Ok(main),
-    }
+    build_directory: &Path,
+    inject: impl FnOnce(&mut SemanticResult),
+) -> Result<CompileOutput, CompileError> {
+    compile_into_with_semantic(source, build_directory, |analysis| {
+        let mut result = semantic::analyze(analysis);
+        inject(&mut result);
+        result
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::Span;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn source(text: &str) -> SourceFile {
@@ -123,7 +136,7 @@ mod tests {
     fn valid_source_writes_program_c() {
         let source = source("fn main() { print(\"hello\"); }");
         let build_directory = temporary_directory("c-output");
-        let output_path = compile_into(&source, &build_directory).unwrap();
+        let output_path = compile_into(&source, &build_directory).unwrap().generated_c;
         assert_eq!(
             fs::read_to_string(&output_path).unwrap(),
             c_emitter::render_print_program(b"hello")
@@ -137,7 +150,7 @@ mod tests {
             "fn main() { initial := 2; var value := initial * 3; value += 1; }",
         );
         let build_directory = temporary_directory("primitive-c-output");
-        let output_path = compile_into(&source, &build_directory).unwrap();
+        let output_path = compile_into(&source, &build_directory).unwrap().generated_c;
         let output = fs::read_to_string(&output_path).unwrap();
         assert!(output.contains("const int64_t sao2_binding_0 = INT64_C(2);"));
         assert!(output.contains(
@@ -154,7 +167,7 @@ mod tests {
             "print(\"value=\"); println(value); println(true); 7 }"
         ));
         let build_directory = temporary_directory("output-and-result");
-        let output_path = compile_into(&source, &build_directory).unwrap();
+        let output_path = compile_into(&source, &build_directory).unwrap().generated_c;
         let output = fs::read_to_string(&output_path).unwrap();
         assert!(output.contains("fwrite(sao2_text_0"));
         assert!(output.contains("printf(\"%\" PRId64 \"\\n\", sao2_binding_0)"));
@@ -172,38 +185,6 @@ mod tests {
             .to_string();
         assert!(diagnostic.contains("temporary backend"));
         assert!(!build_directory.exists());
-    }
-
-    #[test]
-    fn validates_all_four_main_signatures() {
-        for text in [
-            "fn main() {}",
-            "fn main() int {}",
-            "fn main(args [str]) {}",
-            "fn main(args [str]) int {}",
-        ] {
-            let source = source(text);
-            let program = parser::parse(&source).unwrap();
-            let analysis = analysis::analyze(&source, &program);
-            assert!(validate_main(&source, &analysis).is_ok(), "{text}");
-        }
-    }
-
-    #[test]
-    fn rejects_missing_duplicate_and_invalid_main() {
-        for (text, expected) in [
-            ("fn helper() {}", "requires one 'main'"),
-            ("fn main() {} fn main() {}", "duplicate 'main'"),
-            ("fn main(value str) {}", "invalid 'main' signature"),
-            ("fn main(var args [str]) {}", "invalid 'main' signature"),
-            ("fn main() str {}", "invalid 'main' signature"),
-        ] {
-            let source = source(text);
-            let program = parser::parse(&source).unwrap();
-            let analysis = analysis::analyze(&source, &program);
-            let diagnostic = validate_main(&source, &analysis).unwrap_err().to_string();
-            assert!(diagnostic.contains(expected), "{text}: {diagnostic}");
-        }
     }
 
     #[test]
@@ -276,7 +257,9 @@ mod tests {
         let build_directory = temporary_directory("overwrite");
         compile_into(&first_source, &build_directory).unwrap();
         let second_source = source("fn main() { print(\"second\"); }");
-        let output_path = compile_into(&second_source, &build_directory).unwrap();
+        let output_path = compile_into(&second_source, &build_directory)
+            .unwrap()
+            .generated_c;
         assert_eq!(
             fs::read_to_string(output_path).unwrap(),
             c_emitter::render_print_program(b"second")
@@ -298,6 +281,68 @@ mod tests {
 
         assert!(diagnostic.contains("temporary backend"));
         assert_eq!(fs::read_to_string(output_path).unwrap(), "existing generated C");
+        fs::remove_dir_all(build_directory).unwrap();
+    }
+
+    #[test]
+    fn semantic_errors_precede_backend_validation_and_preserve_output() {
+        for existing in [false, true] {
+            let build_directory = temporary_directory("semantic-error");
+            let output_path = build_directory.join("program.c");
+            if existing {
+                fs::create_dir(&build_directory).unwrap();
+                fs::write(&output_path, "existing generated C").unwrap();
+            }
+
+            let source = source("type Number(int); fn helper() {}");
+            let diagnostic = compile_into(&source, &build_directory)
+                .unwrap_err()
+                .to_string();
+
+            assert!(diagnostic.contains("requires one 'main'"), "{diagnostic}");
+            assert!(!diagnostic.contains("temporary backend"), "{diagnostic}");
+            if existing {
+                assert_eq!(
+                    fs::read_to_string(&output_path).unwrap(),
+                    "existing generated C"
+                );
+                fs::remove_dir_all(&build_directory).unwrap();
+            } else {
+                assert!(!build_directory.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn name_errors_prevent_semantic_invocation() {
+        let source = source("fn main() {} fn main() {}");
+        let called = std::cell::Cell::new(false);
+        let result = compile_into_with_semantic_result(
+            &source,
+            &temporary_directory("semantic-not-called"),
+            |_| {
+                called.set(true);
+            },
+        );
+        assert!(result.is_err());
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn semantic_result_injection_carries_nonfatal_warnings() {
+        let source = source("fn main() { print(\"hello\"); }");
+        let build_directory = temporary_directory("injected-warning");
+        let output = compile_into_with_semantic_result(&source, &build_directory, |result| {
+            result.warnings.push(Diagnostic::source_warning(
+                &source,
+                Span::empty(0),
+                "synthetic warning",
+            ));
+        })
+        .unwrap();
+
+        assert!(output.warnings.to_string().contains("synthetic warning"));
+        assert!(output.generated_c.exists());
         fs::remove_dir_all(build_directory).unwrap();
     }
 }
