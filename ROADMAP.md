@@ -137,29 +137,36 @@ and observable output.
 ## 9. Struct layout and escape analysis
 
 - Generate layouts for inline and referenced struct members.
-- Add stable GC timestamps to every struct and inline subobject.
-- Generate field-copy routines that preserve destination GC metadata.
+- Define the 8-byte packed `owner_ptr` and `member_ptr` reference-struct ABI.
+- Reserve a 4-GiB virtual-address arena and reconstruct native pointers by
+  adding either reference field to its global base.
+- Give proven non-escaping arena allocations scoped lifetimes.
+- Generate field-copy routines that preserve destination slot identity.
 - Produce context-insensitive escape summaries for functions.
 - Process summaries with the direct-callee dependency queue.
-- Conservatively heap-allocate recursive and unresolved cases.
+- Conservatively give recursive and unresolved cases GC lifetimes.
 
-Outcome: safe stack allocation works where locally proven, including programs
-that pass or return references to inline structs.
+Outcome: safe scoped allocation works where locally proven, including programs
+that pass references to inline structs without letting them escape.
 
 ## 10. Garbage collector
 
 - Implement a non-moving, stop-the-world mark-and-sweep heap.
 - Register generated type and allocation-layout descriptors.
 - Enumerate precise global, stack, temporary, and container roots.
-- Mark exact referenced structs and recursively trace reachable values.
-- Retain a root allocation when any contained struct has the current timestamp.
+- Allocate GC-managed storage within the reserved 4-GiB arena.
+- Mark each referenced object's owning allocation and trace from its exact
+  `member_ptr`.
+- Deduplicate tracing by `owner_ptr`, `member_ptr`, and referenced layout.
+- Retain an allocation when any reference identifies it as its owner.
 - Sweep unreachable allocations and handle collection-epoch rollover safely.
 
 Outcome: cyclic object graphs and escaping interior references are reclaimed
 safely without exposing allocation placement to programs.
 
-The subobject-marking and allocation-sweeping mechanism should also receive an
-early isolated prototype before the full runtime depends on it.
+The reserved arena, packed-reference, and exact-interior-tracing mechanism
+should also receive an early isolated prototype before the full runtime depends
+on it.
 
 ## 11. Containers
 

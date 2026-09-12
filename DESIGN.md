@@ -132,9 +132,8 @@ Access syntax is identical for inline and referenced members. Accessing an
 inline struct member produces a reference to its stable embedded slot, which
 may be passed or returned like any other struct reference. Assigning a struct
 to an inline member copies its language-visible fields into that slot while
-preserving the slot's identity and collector timestamp. Referenced members are
-rebound instead. Copies preserve the collector metadata of every destination
-inline subobject and share any referenced objects.
+preserving the slot's identity. Referenced members are rebound instead. Copies
+share any referenced objects.
 
 ### Unions
 
@@ -506,9 +505,44 @@ expression as its value. A statement-form `if` does not require an `else`.
 ## Memory management
 
 Memory is managed automatically by a garbage collector. Primitive and tuple
-values are conceptually stored inline. Objects are allocated on the
-garbage-collected heap unless escape analysis proves that they do not outlive
-the current function, in which case they are allocated on the stack.
+values are conceptually stored inline. Referenceable objects are allocated in
+a contiguous virtual-address arena. They have garbage-collected lifetimes
+unless escape analysis proves that they do not outlive the current function, in
+which case their arena storage has a scoped lifetime and is reclaimed when the
+function returns. A compiler may instead use the native C stack when it proves
+that no packed reference to the object must be materialized.
+
+On a 64-bit target, the runtime reserves one contiguous 4-GiB virtual-address
+arena without initially committing physical storage for the whole arena. Its
+allocator commits and manages storage within that arena on demand. Runtime
+bookkeeping and storage used by the generated program or host C implementation
+outside the arena are not part of the limit. An allocation first permits the
+collector to reclaim unreachable storage; if satisfying it would still exceed
+the arena's capacity, the program panics.
+
+An object reference is an 8-byte packed struct rather than a native C pointer.
+Its representation is equivalent to:
+
+```c
+struct ref {
+    uint32_t owner_ptr;
+    uint32_t member_ptr;
+};
+```
+
+Both fields are byte offsets from the global arena base. `owner_ptr` identifies
+the root of the complete enclosing allocation, not merely the referenced
+object's immediate inline parent. `member_ptr` identifies the exact referenced
+object and equals `owner_ptr` for a reference to the allocation's root object.
+For an interior reference it instead identifies the stable embedded slot.
+
+Generated C derives temporary raw pointers independently from the two fields:
+the enclosing allocation is at `heap_base + owner_ptr`, and the referenced
+object is at `heap_base + member_ptr`. Neither raw pointer is stored as the
+language reference. Allocation metadata reachable from the owner pointer
+records the allocation's size, generated layout, lifetime class, and collector
+timestamp. The runtime rejects any individual allocation or arena position
+that cannot be represented by these 32-bit offsets.
 
 The compiler performs conservative, context-insensitive escape analysis one
 function at a time. For each function it records only the functions called
@@ -521,34 +555,42 @@ including parameters whose value or inline member may be returned.
 
 A caller trusts the callee's summary without reconsidering it based on how the
 caller uses the result. Passing an object to a parameter classified as escaping
-therefore causes the complete object allocation to use the garbage-collected
-heap, even when a more context-sensitive analysis could prove stack allocation
-safe. Functions left unresolved after the queue is exhausted are conservatively
+therefore gives the complete object allocation a garbage-collected lifetime,
+even when a more context-sensitive analysis could prove scoped allocation safe.
+Functions left unresolved after the queue is exhausted are conservatively
 treated as escaping because they are recursive or depend on recursion. Whenever
-safety cannot be proven, allocation uses the GC heap.
+safety cannot be proven, allocation uses a garbage-collected lifetime.
 
-The collector is non-moving, stop-the-world, and mark-and-sweep. Every
-struct contains a mark timestamp, including a struct embedded within another
-struct. Each root heap allocation records its complete generated layout,
-including the locations and layouts of embedded structs, and participates in
-the collector's allocation list.
+The collector is non-moving, stop-the-world, and mark-and-sweep. Each
+garbage-collected arena allocation records one mark timestamp and participates
+in the collector's allocation list. Struct values, including inline
+subobjects, contain no collector mark field.
 
 At the start of collection, the runtime advances a global collection timestamp.
-A typed root reference marks the exact struct it references with that timestamp
-and recursively traces values reachable from that struct. Referencing an outer
-struct makes its embedded structs reachable; referencing only an embedded
-struct does not make its parent or siblings reachable.
+A typed root reference resolves its owner from `owner_ptr`, marks that
+allocation with the current timestamp when it has a garbage-collected lifetime,
+and recursively traces values reachable from the exact object identified by
+`member_ptr`. Referencing an outer struct makes its embedded structs reachable;
+referencing only an embedded struct does not make its parent or siblings
+reachable. Marking the owner retains their shared backing storage, but does not
+by itself trace references held by an unreachable parent or sibling.
 
-During sweeping, the collector walks each root allocation and recursively
-checks the timestamps of all structs described by its layout. The allocation is
-retained if its root or any embedded struct was marked during the current
-collection. It is freed only when none were marked. This permits an ordinary
-interior pointer to keep its complete enclosing allocation alive without first
-recovering the allocation's root address.
+The trace uses a collection-local visited set keyed by `owner_ptr`, `member_ptr`,
+and referenced layout. This prevents cycles without conflating distinct
+reachable subobjects in the same allocation. In particular, finding one
+interior reference must not prevent the collector from tracing another interior
+reference into that allocation.
+
+During sweeping, a garbage-collected allocation is retained when its
+allocation-level timestamp was marked during the current collection and is
+freed otherwise. `owner_ptr` already identifies the complete enclosing
+allocation, so retaining an interior reference requires neither a search for
+its root address nor collector metadata in each inline struct.
 
 If a reference to an embedded struct escapes a function, escape analysis places
-the complete enclosing allocation on the heap. Replacing an embedded struct
-updates its language-visible fields but preserves its collector metadata.
+the complete enclosing allocation under garbage-collected lifetime. Replacing
+an embedded struct updates its language-visible fields without changing the
+slot's identity or any existing reference to that slot.
 
 ## Static analysis
 
