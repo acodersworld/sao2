@@ -347,29 +347,114 @@ changing the mutability boundary.
 
 ## Phase 3: Returns, loops, and reachability
 
-- Compute a conservative control-flow summary for blocks, statement bodies,
-  conditional branches, switches, loops, return statements, and non-returning
-  expressions. Distinguish fallthrough, function return, loop break, and loop
-  continue while analyzing nested constructs.
-- Validate bare returns only in no-value functions and valued returns only in
-  value-returning functions. Reuse expected-type and union-injection annotations
-  when checking returned values.
-- Treat a reachable final function-body expression as the implicit result. Reject
-  a final value in a no-value function and reject every reachable value-function
-  path that reaches the closing brace without a value.
-- Count `panic` and other `Never` expressions as terminating paths. Treat `while`
-  and `for` as capable of falling through even when their bodies always
-  terminate.
-- Validate `break` and `continue` using lexical loop depth; a switch does not
-  establish a loop context.
-- Continue fully checking unreachable constructs for semantic errors. Warn only
-  at the first statement or final block value in each contiguous unreachable
-  region, then resume normal warning detection inside independently reachable
-  nested bodies.
+Implement return validation, loop-control resolution, structural reachability,
+and unreachable-source warnings as one semantic-analysis change. Do not split
+this phase into independently completed sub-phases: its flow facts and warning
+behavior form one handoff to union analysis in Phase 4.
 
-Exit criterion: value-returning functions have proven result paths, loop-control
-statements have valid targets, and unreachable code remains valid with stable
-warnings.
+- Add dependency-free control-flow flags for fallthrough, function return, loop
+  break, loop continue, and divergence. Record summaries for blocks,
+  statements, statement bodies, expressions, and expression bodies using direct
+  AST references.
+- Compose sequential flow by passing only fallthrough paths into the next
+  construct while retaining terminal exits. Store the completed summaries in
+  `SemanticResult` for later semantic phases and typed-IR lowering.
+- Summarize expression evaluation in language order, including collection
+  elements, map keys and values, callees, arguments, receivers, and indices.
+  Derive block and `if` expression flow from their nested constructs instead of
+  relying only on the expression's final `TypeState`.
+- Treat a reached `panic` or other genuinely non-returning call as divergence.
+  Continue visiting later source for semantic diagnostics even when it cannot
+  be evaluated at runtime.
+- Model `&&` and `||` structurally: their right operand may be skipped, so a
+  divergent right operand cannot make the complete expression unconditionally
+  divergent. Correct the name/type result to `bool` when the left operand is
+  boolean and normal short-circuit completion remains possible; a divergent
+  left operand still makes the expression divergent.
+- Treat postfix `?` provisionally as capable of successful fallthrough. Phase 5
+  adds its early-return or main-panic exit after resolving the propagation
+  action.
+- Validate bare `return;` only in no-value functions and valued returns only in
+  value-returning functions. Reuse the expression state, expected-type
+  propagation, and union-injection records already produced by name/type
+  analysis rather than repeating compatibility checks.
+- Record every valid explicit return with its statement, enclosing `FunctionId`,
+  optional value, and value state. Continue checking invalid return forms even
+  when their statements are unreachable.
+- Treat a reachable final expression in the outer function body as an implicit
+  return when it has a resolved value. Reject a resolved final value in a
+  no-value function, but permit final `NoValue` and `Never` expressions because
+  they do not produce a value.
+- Accept a value-returning function only when every reachable path explicitly
+  returns, implicitly returns, or diverges. Diagnose definite fallthrough at the
+  function body's closing brace.
+- Maintain a lexical stack of enclosing `while` and `for` statements. Resolve
+  each valid `break` and `continue` to the nearest loop and retain both AST
+  references in a loop-control record. Diagnose either statement when the stack
+  is empty.
+- Do not push a loop target for `switch`. A `break` or `continue` inside a switch
+  may still target an enclosing loop. At a loop boundary, consume body break and
+  continue exits while propagating function returns and divergence.
+- Treat every `while` and `for` as structurally capable of falling through,
+  regardless of a literal condition, the absence of `break`, or a body that
+  always terminates. Do not add constant folding or non-termination proofs.
+- Retain a flow summary for every switch arm. A switch with an `else` is
+  structurally exhaustive; a switch without one includes possible unmatched
+  fallthrough until Phase 4 resolves its labels and coverage.
+- Diagnose function fallthrough in this phase only when it remains possible if
+  every unresolved switch is assumed exhaustive. When switch coverage is the
+  only unknown, retain a deferred return-flow obligation for Phase 4 rather than
+  reporting a premature error.
+- Likewise, keep source after a non-`else` switch conservatively reachable when
+  its reachability depends on exhaustiveness. Phase 4 recomposes the stored arm
+  summaries and resolves any deferred return or unreachable-source obligation.
+- Emit `source warning: unreachable source` at the first unreachable statement
+  or final block expression in each contiguous region. Do not warn on individual
+  operands, arguments, or other expression children.
+- Continue full semantic validation throughout unreachable regions. Analyze each
+  nested branch, loop body, switch arm, and block as independently entered for
+  its own internal warning regions even when its enclosing construct is already
+  unreachable.
+- Preserve the independent 20-warning limit and stable source ordering already
+  established in Phase 1. Unreachable source remains valid and warnings never
+  determine an exit status.
+- Update `DESIGN.md` so `build` and `run` print semantic warnings on both success
+  and failure. On failure, render warnings first and then the fatal diagnostic;
+  the fatal diagnostic alone determines the command's nonzero status.
+- Add `CompileFailure { error, warnings }` while retaining the successful
+  `CompileOutput { generated_c, warnings }`. Preserve warnings produced beside
+  semantic errors and warnings produced before a temporary-backend failure.
+  Parser and name/type failures naturally carry no semantic warnings because
+  semantic analysis did not run.
+- Keep the temporary emitter's accepted subset and generated C unchanged. Its
+  existing structural return handling remains lowering logic rather than the
+  source of semantic validity.
+- Add semantic tests for bare, valued, implicit, incompatible, missing,
+  branching, nested, and panicking return paths. Include definite and
+  switch-dependent fallthrough and both resolved and deferred function results.
+- Test valid and invalid `break` and `continue`, nearest-loop selection, nested
+  loops, switches outside loops, and switches nested within loops.
+- Test ordered expression flow, nested block returns, and short-circuit
+  expressions whose right operand diverges while the complete expression can
+  still return `bool`.
+- Test one warning per contiguous unreachable region after return, divergence,
+  break, and continue. Cover unreachable final block values, independently
+  reachable nested bodies, the 20-warning bound, and semantic errors inside
+  unreachable source.
+- Test switches with `else`, conservative non-`else` reachability, and the exact
+  deferred facts handed to Phase 4.
+- Add compiler and CLI coverage using a backend-supported primitive program to
+  prove real warnings are non-fatal. Also prove warnings precede semantic and
+  temporary-backend errors without replacing their exit codes or creating or
+  truncating generated output.
+- Preserve all Phase 1 and Phase 2 semantic tests and all milestone 4
+  generated-C assertions unchanged.
+
+Exit criterion: every definite function path, explicit return, and loop-control
+statement is validated; structurally unreachable regions produce stable
+warnings; switch-dependent conclusions are explicitly deferred to Phase 4; and
+warnings survive both successful and failed compilation without changing the
+temporary backend.
 
 ## Phase 4: Union tests, narrowing, and switches
 
