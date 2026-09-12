@@ -185,29 +185,165 @@ pipeline redesign.
 
 ## Phase 2: Mutability and assignability
 
-- Classify assignment and receiver paths from their recorded root `BindingId`,
-  access kind, target annotation, and resolved types.
-- Require `var` to reassign primitive, string, tuple, and union bindings. Preserve
-  the language rule that both constant and `var` object references may be
-  rebound, while only `var` grants mutation of the referred object.
-- Require `var` for struct-field replacement, list or map index assignment, and
-  mutating list or map methods. Propagate that permission through referenced and
-  inline struct fields and through object references reachable from composite
-  values.
-- Reject replacement of tuple members regardless of the root qualifier. A
-  mutable root may still mutate an object reached through a tuple member; it may
-  not replace that tuple slot. Strings remain immutable and have no mutating
-  element operation.
-- Validate compound assignment as both a read and a write after ordinary operand
-  typing has succeeded.
-- For a `var` parameter, require a mutable argument only when the parameter type
-  can transitively reach mutable objects. Primitive and object-free tuple values
-  are copied and therefore do not require a mutable caller binding.
-- Reject mutation-capable calls on temporaries or other expressions without a
-  mutable binding root.
+This phase proves that each write or mutation is permitted without changing
+the parser AST or repeating type inference. It extends the Phase 1 semantic
+result with successful authorization records and explicit obligations for
+paths whose types remain deferred until union narrowing. The temporary emitter
+continues to consume its existing primitive subset and must not become the
+owner of these rules.
 
-Exit criterion: every recorded write, read-write, mutation, and receiver
-mutation is either authorized by one explicit rule or has a source diagnostic.
+### Phase 2.1: Record resolved access paths
+
+- Extend assignment-target analysis to retain the resolved root `BindingId`,
+  final target state, and ordered typed path steps. Distinguish struct members,
+  tuple members, list indices, and map indices; struct steps also retain the
+  declaration member and inline-or-referenced storage selection.
+- Produce these path steps while name-and-type analysis already resolves the
+  target. Semantic validation must not repeat root lookup, member selection,
+  tuple-index parsing, index compatibility, or target type inference.
+- Add mutability resolutions to the semantic result. Each resolution retains a
+  direct reference to its assignment target, method receiver, or call argument,
+  its root `BindingId`, the recorded `BindingAccess`, and the operation that was
+  authorized.
+- Add an internal place classifier for receiver and argument expressions. Accept
+  identifiers followed by member or index access and ignore parentheses around
+  any such path. Use the existing name, expression-type, call-target, and member
+  facts to classify it; constructors, calls, conditionals, block values, and
+  other computed expressions have no mutable binding root.
+- Treat a missing root, path step, resolved type, or call target as a compiler
+  invariant failure when the corresponding name/type work is not explicitly
+  deferred.
+
+Exit criterion: every non-deferred assignment target and every expression that
+can serve as a mutable place has one identity-based path description, with no
+source lookup left for semantic validation or lowering.
+
+### Phase 2.2: Validate assignment
+
+Apply this permission table after name/type compatibility has succeeded:
+
+| Operation | Permission |
+| --- | --- |
+| Rebind a primitive, string, tuple, or union binding | The root binding must be `var`. |
+| Rebind a direct struct, list, or map reference | Either a constant or `var` binding may be rebound. |
+| Replace a struct field | The root binding must be `var`. |
+| Replace a list or map element | The root binding must be `var`. |
+| Replace a tuple member | Always reject the assignment. |
+| Mutate an object reached through a tuple member | Permit when the root binding is `var`. |
+| Perform compound assignment | Require both read access and the permission applicable to the write. |
+
+- Apply direct-binding rules equally to locals and parameters. Determine whether
+  a nominal value is a struct object, tuple value, or union value from its
+  resolved definition rather than treating all nominal types alike.
+- Classify the final path operation separately from intermediate traversal. A
+  tuple step forbids replacing that tuple slot but does not prevent mutation of
+  a struct, list, or map subsequently reached through it. Inline and referenced
+  struct steps use the same root permission.
+- Require a mutable root for every indirect replacement, including a referenced
+  struct field that is being rebound. A constant object reference grants
+  read-only access to the object even though the direct reference itself may be
+  rebound.
+- Keep strings immutable. Name/type analysis continues to reject string index
+  assignment before the mutability pass.
+- Report a missing-`var` diagnostic at the root binding use, tuple replacement at
+  the final tuple-member suffix, and an unrooted operation at the complete
+  operation span. Add a successful resolution only after all applicable rules
+  pass.
+
+Exit criterion: every resolved simple or compound assignment is either recorded
+as an authorized rebind or mutation or produces one focused source diagnostic.
+
+### Phase 2.3: Validate mutation-capable calls
+
+- Classify list `append` and `removeIndex` and map `removeKey` as mutating
+  receiver calls from their recorded `BuiltinMethod`. Treat list, map, and
+  string `len`, indexing reads, membership, and ordinary calls as non-mutating.
+- Require a mutating receiver to be a place rooted in a `var` binding. Permit
+  member and index traversal through inline fields, referenced fields,
+  containers, and tuple members; reject literals, constructors, function
+  results, conditional or block results, and other unrooted temporaries.
+- Pair each positional user-function argument with its resolved
+  `ParameterSignature`. A `var` parameter requires a mutable rooted argument
+  only when its declared type can transitively reach a mutable object.
+- Define mutable objects as structs, lists, and maps. Recursively inspect tuple
+  and union payloads, including anonymous and nominal unions, and use a visited
+  set or memoized tri-state result so recursive nominal types terminate. Treat
+  primitives and strings as object-free.
+- Permit any compatible expression for a `var` parameter whose value is copied
+  and cannot reach a mutable object. This includes primitive temporaries and
+  object-free tuple or union values. When the type can reach an object, require
+  a place rooted in `var`, even though tuple or union copying leaves nested
+  object references shared.
+- Retain the call expression, argument node, callee parameter binding, and caller
+  root binding in each successful mutable-argument resolution. Constructors,
+  intrinsics, and built-in methods do not use user-parameter rules.
+- Diagnose a constant receiver or argument at its root binding use and an
+  unrooted temporary at the receiver or argument expression.
+
+Exit criterion: every mutation-capable built-in call and every object-reaching
+`var` argument has a mutable caller root and a recorded authorization; copied
+object-free `var` arguments remain unrestricted.
+
+### Phase 2.4: Traverse and defer safely
+
+- Walk all function bodies, statement bodies, block values, and nested
+  expressions in deterministic source order. Visit unreachable-looking source
+  normally because Phase 3 has not yet established reachability.
+- Consume the existing `Write`, `ReadWrite`, `Mutate`, and `ReadMutate`
+  classifications for assignment roots. Derive method-receiver and mutable-
+  argument operations from resolved call records rather than changing ordinary
+  read uses into mutations retroactively.
+- If an assignment, receiver, or argument path depends on a
+  `FlowDependentType`, retain a deferred mutability obligation tied to its AST
+  node, root when known, and existing `DeferredId`. Do not guess a union
+  alternative or reject the operation before narrowing.
+- Phase 4 must revisit each deferred mutability obligation after it resolves the
+  narrowed path. Diagnostic-free completion in Phase 6 requires every such
+  obligation to become either an authorization or a source diagnostic.
+- Stop before temporary-backend validation when this phase reports a semantic
+  error. Do not create or truncate generated C, and retain semantic diagnostics
+  ahead of backend capability diagnostics.
+- Keep the temporary emitter unchanged. Its direct mutable-primitive-local
+  checks remain defensive subset validation and must agree with, but do not
+  replace, the semantic authorization.
+
+Exit criterion: all non-flow-dependent writes and mutations are decided in
+source order, while every narrowing-dependent case is represented by one
+explicit obligation for Phase 4.
+
+### Phase 2.5: Tests and handoff
+
+- Test direct reassignment of constant and `var` primitive, string, tuple,
+  union, struct, list, and map bindings, including both local and parameter
+  roots.
+- Test struct-field and list/map-element replacement through direct paths,
+  nested inline and referenced fields, container elements, and tuple members.
+- Prove that no root qualifier permits tuple-slot replacement, while a `var`
+  root permits mutation of an object reached through a tuple slot.
+- Test every mutating built-in on direct, nested, indexed, parenthesized,
+  constant, mutable, and temporary receivers; prove that all `len` forms remain
+  read-only.
+- Test `var` calls with primitives, strings, object-free tuples and unions,
+  structs, containers, and composite types that contain or can select an object.
+  Include literals and constructors to distinguish permitted copied temporaries
+  from rejected object-reaching temporaries.
+- Assert the source spans and ordering of missing-`var`, immutable-tuple-member,
+  and unrooted-mutation diagnostics, and avoid duplicate diagnostics for one
+  failed operation.
+- Test the cycle-safe object-reachability predicate with direct objects, nested
+  tuples and unions, and recursive nominal definitions that cross valid object
+  references.
+- Test that union-narrowed assignment and mutation create deferred obligations
+  rather than premature diagnostics, ready for Phase 4 to resolve.
+- Add compiler coverage proving a Phase 2 error precedes a temporary-backend
+  rejection and leaves a missing or pre-existing generated C file untouched.
+- Preserve all Phase 1 diagnostics and entry-point tests and all milestone 4
+  generated-C assertions unchanged.
+
+Exit criterion: every immediately decidable write, receiver mutation, and
+object-reaching `var` argument is proven or diagnosed; all remaining cases are
+explicitly narrowing-dependent, and Phase 3 can add flow analysis without
+changing the mutability boundary.
 
 ## Phase 3: Returns, loops, and reachability
 
