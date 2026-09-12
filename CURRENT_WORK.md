@@ -1,6 +1,6 @@
 # Current Work: Semantic Analysis
 
-Status: Phase 1 complete; Phase 2 not started.
+Status: Phases 1–2 complete; Phase 3 not started.
 
 This document expands milestone 5 of `ROADMAP.md`. The objective is to turn
 milestone 3's resolved names and types into a complete semantic proof before

@@ -260,10 +260,41 @@ pub(crate) struct BindingTypeAnnotation {
     pub(crate) state: TypeState,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct AssignmentTargetAnnotation<'ast> {
     pub(crate) node: &'ast AssignmentTarget,
+    pub(crate) root: Option<BindingId>,
+    pub(crate) steps: Box<[AccessPathStep<'ast>]>,
     pub(crate) state: TypeState,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AccessPathStep<'ast> {
+    StructMember {
+        suffix: &'ast crate::ast::AssignmentTargetSuffix,
+        declaration: TypeDeclarationId,
+        member: &'ast TypeMember,
+        storage: MemberStorage,
+        state: TypeState,
+    },
+    TupleMember {
+        suffix: &'ast crate::ast::AssignmentTargetSuffix,
+        declaration: TypeDeclarationId,
+        member: &'ast TypeMember,
+        position: usize,
+        state: TypeState,
+    },
+    ListIndex {
+        suffix: &'ast crate::ast::AssignmentTargetSuffix,
+        element: TypeId,
+        state: TypeState,
+    },
+    MapIndex {
+        suffix: &'ast crate::ast::AssignmentTargetSuffix,
+        key: TypeId,
+        value: TypeId,
+        state: TypeState,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -625,6 +656,108 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
             .find(|annotation| std::ptr::eq(annotation.node, node))
     }
 
+    fn assignment_target_annotation(
+        &self,
+        node: &'ast AssignmentTarget,
+        state: TypeState,
+    ) -> AssignmentTargetAnnotation<'ast> {
+        let root = self.name_use(&node.root).and_then(|name_use| match name_use.resolution {
+            NameResolution::Binding(binding) => Some(binding),
+            _ => None,
+        });
+        let mut current = root.map_or(TypeState::Error, |binding| self.binding_type(binding));
+        let mut steps = Vec::with_capacity(node.suffixes.len());
+        for suffix in &node.suffixes {
+            let TypeState::Resolved(receiver) = current else {
+                break;
+            };
+            let step = match (self.types.get(receiver), &suffix.kind) {
+                (ResolvedType::List(element), AssignmentTargetSuffixKind::Index(_)) => {
+                    current = TypeState::Resolved(*element);
+                    AccessPathStep::ListIndex {
+                        suffix,
+                        element: *element,
+                        state: current,
+                    }
+                }
+                (
+                    ResolvedType::Map { key, value },
+                    AssignmentTargetSuffixKind::Index(_),
+                ) => {
+                    current = TypeState::Resolved(*value);
+                    AccessPathStep::MapIndex {
+                        suffix,
+                        key: *key,
+                        value: *value,
+                        state: current,
+                    }
+                }
+                (
+                    ResolvedType::Nominal(declaration),
+                    AssignmentTargetSuffixKind::Member(Member::Named(name)),
+                ) => {
+                    let TypeDefinitionKind::Struct(members) =
+                        &self.type_definition(*declaration).kind
+                    else {
+                        break;
+                    };
+                    let spelling = self.identifier_text(name.span);
+                    let Some(member) = members
+                        .iter()
+                        .find(|member| self.identifier_text(member.name.span) == spelling)
+                    else {
+                        break;
+                    };
+                    current = member.ty;
+                    AccessPathStep::StructMember {
+                        suffix,
+                        declaration: *declaration,
+                        member: member.node,
+                        storage: member.storage,
+                        state: current,
+                    }
+                }
+                (
+                    ResolvedType::Nominal(declaration),
+                    AssignmentTargetSuffixKind::Member(Member::TupleIndex(span)),
+                ) => {
+                    let TypeDefinitionKind::Tuple(members) =
+                        &self.type_definition(*declaration).kind
+                    else {
+                        break;
+                    };
+                    let Some(position) = self
+                        .identifier_text(*span)
+                        .replace('_', "")
+                        .parse::<usize>()
+                        .ok()
+                    else {
+                        break;
+                    };
+                    let Some(member) = members.get(position) else {
+                        break;
+                    };
+                    current = member.ty;
+                    AccessPathStep::TupleMember {
+                        suffix,
+                        declaration: *declaration,
+                        member: member.node,
+                        position,
+                        state: current,
+                    }
+                }
+                _ => break,
+            };
+            steps.push(step);
+        }
+        AssignmentTargetAnnotation {
+            node,
+            root,
+            steps: steps.into_boxed_slice(),
+            state,
+        }
+    }
+
     pub(crate) fn callable_by_name(&self, name: &str) -> CallableResolution {
         let value = self
             .function_by_name(name)
@@ -641,6 +774,64 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
             }
             (None, None) => CallableResolution::Unknown,
         }
+    }
+
+    fn finalize_call_targets(&mut self) {
+        let targets = self
+            .calls
+            .iter()
+            .map(|call| self.final_call_target(*call))
+            .collect::<Vec<_>>();
+        for (call, target) in self.calls.iter_mut().zip(targets) {
+            call.target = target;
+        }
+    }
+
+    fn final_call_target(&self, call: CallResolution<'ast>) -> CallTarget {
+        match call.target {
+            CallTarget::Callable(CallableId::Function(_)) | CallTarget::Builtin(_) => {
+                return call.target;
+            }
+            _ => {}
+        }
+        if let ExpressionKind::Identifier(identifier) = &call.callee.kind
+            && let Some(NameResolution::Callable(CallableId::Function(function))) =
+                self.name_use(identifier).map(|name_use| name_use.resolution)
+        {
+            return CallTarget::Callable(CallableId::Function(function));
+        }
+        let ExpressionKind::Member {
+            value: receiver,
+            member: Member::Named(name),
+        } = &call.callee.kind
+        else {
+            return call.target;
+        };
+        let Some(TypeState::Resolved(receiver)) = self
+            .expression_annotation(receiver)
+            .map(|annotation| annotation.state)
+        else {
+            return call.target;
+        };
+        let spelling = self.identifier_text(name.span);
+        let method = match self.types.get(receiver) {
+            ResolvedType::List(_) => match spelling {
+                "append" => Some(BuiltinMethod::ListAppend),
+                "removeIndex" => Some(BuiltinMethod::ListRemoveIndex),
+                "len" => Some(BuiltinMethod::ListLen),
+                _ => None,
+            },
+            ResolvedType::Map { .. } => match spelling {
+                "removeKey" => Some(BuiltinMethod::MapRemoveKey),
+                "len" => Some(BuiltinMethod::MapLen),
+                _ => None,
+            },
+            ResolvedType::Primitive(PrimitiveType::Str) if spelling == "len" => {
+                Some(BuiltinMethod::StrLen)
+            }
+            _ => None,
+        };
+        method.map_or(call.target, CallTarget::Builtin)
     }
 
     fn collect_top_level_names(&mut self) {
@@ -1792,10 +1983,8 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
                 }
             };
         }
-        self.analysis.assignment_targets.push(AssignmentTargetAnnotation {
-            node: target,
-            state,
-        });
+        let annotation = self.analysis.assignment_target_annotation(target, state);
+        self.analysis.assignment_targets.push(annotation);
         state
     }
 
@@ -2418,6 +2607,9 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
         let TypeState::Resolved(receiver_type) = receiver_state else {
             return self.non_value_operand(expression, receiver_state);
         };
+        if self.is_union_type(receiver_type) {
+            return self.defer_expression(expression, DeferredReason::FlowDependentType);
+        }
         let Member::Named(name) = member else {
             return self.analysis.error(expression.span, "tuple member is not callable");
         };
@@ -3132,10 +3324,8 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
                 }
             }
         }
-        self.analysis.assignment_targets.push(AssignmentTargetAnnotation {
-            node: target,
-            state,
-        });
+        let annotation = self.analysis.assignment_target_annotation(target, state);
+        self.analysis.assignment_targets.push(annotation);
         state
     }
 
@@ -3267,8 +3457,20 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
                 self.resolve_expression(value, None);
                 self.coerce(expression, current, expected)
             }
-            ExpressionKind::Identifier(_)
-            | ExpressionKind::Integer
+            ExpressionKind::Identifier(identifier) => {
+                let state = match self
+                    .analysis
+                    .name_use(identifier)
+                    .map(|name_use| name_use.resolution)
+                {
+                    Some(NameResolution::Binding(binding)) => {
+                        self.analysis.binding_type(binding)
+                    }
+                    _ => current,
+                };
+                self.coerce(expression, state, expected)
+            }
+            ExpressionKind::Integer
             | ExpressionKind::Float
             | ExpressionKind::String(_)
             | ExpressionKind::Character(_)
@@ -3834,6 +4036,20 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
                 .map_or(TypeState::Error, |annotation| annotation.state);
             return self.operand_state(expression, receiver, current);
         };
+        if !self.union_alternatives(receiver).is_empty() {
+            for argument in arguments {
+                self.resolve_argument(argument, None);
+            }
+            let current = self
+                .analysis
+                .expression_annotation(expression)
+                .map_or(TypeState::Error, |annotation| annotation.state);
+            assert!(
+                matches!(current, TypeState::Deferred(_)),
+                "flow-dependent method call lacks a deferred type annotation"
+            );
+            return current;
+        }
         let Member::Named(name) = member else {
             for argument in arguments {
                 self.resolve_argument(argument, None);
@@ -4566,6 +4782,7 @@ pub(crate) fn analyze<'source, 'ast>(
     analysis.resolve_function_bodies();
     analysis.infer_function_bodies();
     analysis.resolve_expected_types();
+    analysis.finalize_call_targets();
     analysis
 }
 
@@ -4930,6 +5147,80 @@ mod tests {
         let diagnostics = analysis.diagnostics.to_string();
         assert_eq!(diagnostics.matches("unknown value 'missing'").count(), 2);
         assert_eq!(diagnostics.matches("unknown value 'Build'").count(), 1);
+    }
+
+    #[test]
+    fn records_identity_based_typed_assignment_paths() {
+        let source = source(concat!(
+            "type Inner(value int); type Pair(Inner, int); ",
+            "type Outer(inline Inner, shared &Inner, pair Pair, values [int], table {int: int}); ",
+            "fn main() { var root := Outer(inline = Inner(value = 1), shared = Inner(value = 2), ",
+            "pair = Pair(Inner(value = 3), 4), values = [5], table = {6: 7}); ",
+            "root.inline.value = 8; root.shared.value = 9; root.pair.0.value = 10; ",
+            "root.values[0] = 11; root.table[6] = 12; }"
+        ));
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        assert!(analysis.diagnostics.is_empty(), "{}", analysis.diagnostics);
+        let root = binding_named(&analysis, &source, "root");
+        let Declaration::Function(function) = &program.declarations[3] else {
+            unreachable!()
+        };
+        let targets = function
+            .body
+            .statements
+            .iter()
+            .filter_map(|statement| match &statement.kind {
+                StatementKind::Assignment { target, .. } => {
+                    Some(analysis.assignment_target(target).unwrap())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(targets.len(), 5);
+        assert!(targets.iter().all(|target| target.root == Some(root)));
+        assert!(matches!(
+            targets[0].steps.as_ref(),
+            [AccessPathStep::StructMember { storage: MemberStorage::Inline, .. }, AccessPathStep::StructMember { .. }]
+        ));
+        assert!(matches!(
+            targets[1].steps.as_ref(),
+            [AccessPathStep::StructMember { storage: MemberStorage::Referenced, .. }, AccessPathStep::StructMember { .. }]
+        ));
+        assert!(matches!(
+            targets[2].steps.as_ref(),
+            [AccessPathStep::StructMember { .. }, AccessPathStep::TupleMember { position: 0, .. }, AccessPathStep::StructMember { .. }]
+        ));
+        assert!(matches!(
+            targets[3].steps.last(),
+            Some(AccessPathStep::ListIndex { .. })
+        ));
+        assert!(matches!(
+            targets[4].steps.last(),
+            Some(AccessPathStep::MapIndex { .. })
+        ));
+    }
+
+    #[test]
+    fn finalizes_call_targets_after_expected_type_resolution() {
+        let source = source(concat!(
+            "type Box(value int); fn touch(var value Box) {} ",
+            "fn main() { value := Box(value = 1); values := [1]; ",
+            "touch(value); values.append(2); values.len(); }"
+        ));
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        assert!(analysis.diagnostics.is_empty(), "{}", analysis.diagnostics);
+        let touch = analysis.function_by_name("touch").unwrap();
+        assert!(analysis.calls.iter().any(|call| {
+            call.target == CallTarget::Callable(CallableId::Function(touch))
+        }));
+        assert!(analysis.calls.iter().any(|call| {
+            call.target == CallTarget::Builtin(BuiltinMethod::ListAppend)
+        }));
+        assert!(analysis.calls.iter().any(|call| {
+            call.target == CallTarget::Builtin(BuiltinMethod::ListLen)
+        }));
     }
 
     #[test]

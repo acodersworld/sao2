@@ -2,7 +2,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::analysis::{self, Analysis};
+use crate::analysis;
 use crate::c_emitter;
 use crate::diagnostic::{Diagnostic, Diagnostics, Warnings};
 use crate::parser;
@@ -57,23 +57,21 @@ fn compile_into(
     source: &SourceFile,
     build_directory: &Path,
 ) -> Result<CompileOutput, CompileError> {
-    compile_into_with_semantic(source, build_directory, semantic::analyze)
+    compile_into_with_semantic(source, build_directory, |_| {})
 }
 
-fn compile_into_with_semantic<F>(
+fn compile_into_with_semantic(
     source: &SourceFile,
     build_directory: &Path,
-    semantic_analyzer: F,
-) -> Result<CompileOutput, CompileError>
-where
-    F: FnOnce(&mut Analysis<'_, '_>) -> SemanticResult,
-{
+    inject: impl for<'ast> FnOnce(&mut SemanticResult<'ast>),
+) -> Result<CompileOutput, CompileError> {
     let program = parser::parse(source).map_err(CompileError::SourceDiagnostics)?;
     let mut analysis = analysis::analyze(source, &program);
     if !analysis.diagnostics.is_empty() {
         return Err(CompileError::SourceDiagnostics(analysis.diagnostics));
     }
-    let semantic = semantic_analyzer(&mut analysis);
+    let mut semantic = semantic::analyze(&mut analysis);
+    inject(&mut semantic);
     if !semantic.diagnostics.is_empty() {
         return Err(CompileError::SourceDiagnostics(semantic.diagnostics));
     }
@@ -106,13 +104,9 @@ where
 fn compile_into_with_semantic_result(
     source: &SourceFile,
     build_directory: &Path,
-    inject: impl FnOnce(&mut SemanticResult),
+    inject: impl for<'ast> FnOnce(&mut SemanticResult<'ast>),
 ) -> Result<CompileOutput, CompileError> {
-    compile_into_with_semantic(source, build_directory, |analysis| {
-        let mut result = semantic::analyze(analysis);
-        inject(&mut result);
-        result
-    })
+    compile_into_with_semantic(source, build_directory, inject)
 }
 
 #[cfg(test)]
@@ -300,6 +294,35 @@ mod tests {
                 .to_string();
 
             assert!(diagnostic.contains("requires one 'main'"), "{diagnostic}");
+            assert!(!diagnostic.contains("temporary backend"), "{diagnostic}");
+            if existing {
+                assert_eq!(
+                    fs::read_to_string(&output_path).unwrap(),
+                    "existing generated C"
+                );
+                fs::remove_dir_all(&build_directory).unwrap();
+            } else {
+                assert!(!build_directory.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn mutability_errors_precede_backend_validation_and_preserve_output() {
+        for existing in [false, true] {
+            let build_directory = temporary_directory("mutability-error");
+            let output_path = build_directory.join("program.c");
+            if existing {
+                fs::create_dir(&build_directory).unwrap();
+                fs::write(&output_path, "existing generated C").unwrap();
+            }
+
+            let source = source("fn main() { values := [1]; values.append(2); }");
+            let diagnostic = compile_into(&source, &build_directory)
+                .unwrap_err()
+                .to_string();
+
+            assert!(diagnostic.contains("must be declared 'var'"), "{diagnostic}");
             assert!(!diagnostic.contains("temporary backend"), "{diagnostic}");
             if existing {
                 assert_eq!(

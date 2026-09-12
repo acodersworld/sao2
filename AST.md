@@ -211,7 +211,23 @@ flow, evaluation order, runtime checks, and source locations explicit.
 The handoff is intentionally a resolved-AST interface rather than a typed IR.
 Milestone 4 may consume the stable declaration and binding identities, type
 table, expression and assignment annotations, constructor selections, union
-injections, literal values, and call targets directly. Milestone 5 still owns
+injections, literal values, and call targets directly. Semantic analysis owns
 mutability enforcement, loop-context and return-path validation, exhaustive
 switch checking, union narrowing, postfix `?`, and completion of explicitly
 flow-dependent records. Such deferred expressions cannot enter C generation.
+
+## Semantic mutability handoff
+
+Semantic Phase 2 augments assignment annotations with the resolved root
+`BindingId`, final target state, and ordered typed access steps. Struct steps
+identify the declaration member and its inline or referenced storage; tuple
+steps identify the declaration member and position; list and map steps retain
+their resolved element, key, and value types.
+
+The semantic result separately records each authorized rebind, field or element
+replacement, mutating built-in receiver, and object-reaching `var` argument.
+Every record keeps its AST subject, caller root, `BindingAccess`, operation, and
+typed path. Paths whose member or receiver type depends on union narrowing are
+retained as explicit deferred mutability obligations associated with the
+existing `DeferredId`; Phase 4 must resolve those obligations. The temporary C
+emitter remains unchanged and does not own these permissions.
