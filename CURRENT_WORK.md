@@ -686,23 +686,128 @@ contradiction or try-dependent deferred record remains.
 
 ## Phase 6: Integration, tests, and handoff
 
-- Add a final invariant check: if semantic errors are absent, every expression,
-  assignment target, union operation, and deferred record needed by lowering has
-  a final annotation. Report contradictions as compiler errors.
-- Add semantic unit tests for all rules below and compiler tests for diagnostic
-  ordering, warning behavior, and no-output-on-error behavior.
-- Preserve all milestone 4 generated-C snapshots and native tests unchanged.
-  Programs valid under semantic analysis but outside the primitive backend must
-  continue to receive temporary-backend diagnostics.
-- Update `AST.md` with control-flow, mutability, narrowing, switch, and try facts
-  available to milestone 6. Keep the milestone 4 direct-emitter handoff visibly
-  temporary.
-- Mark milestone 5 complete only after the full suite passes under the required
-  Rust toolchain and native C tests pass when a supported compiler is available.
+This phase is one integration change. It turns the completed semantic passes
+into a checked lowering boundary, fills only the remaining test-coverage gaps,
+and records the exact contract consumed by milestone 6. Do not split invariant
+validation, pipeline integration, tests, and handoff documentation into
+separate stages: milestone 5 is complete only when they describe and verify the
+same result.
 
-Exit criterion: every accepted source program is semantically valid and ready
-for typed-IR lowering, while warnings remain non-fatal and the walking skeleton
-continues to execute its primitive subset.
+- Add one explicit semantic-handoff validator over the completed `Analysis` and
+  `SemanticResult`. Invoke it only after name/type and semantic source
+  diagnostics are empty, and before the compiler extracts `main` or calls the
+  temporary emitter. Retain it as the mandatory gate that milestone 6 typed-IR
+  lowering must use rather than relying on debug-only assertions.
+- Return a `Diagnostic::compiler` when a diagnostic-free semantic result
+  violates its internal contract. Do not panic, turn the contradiction into a
+  source error, continue into backend capability checks, or write generated
+  output. Preserve already collected source warnings on this compiler-failure
+  path exactly as for semantic and temporary-backend failures.
+- Traverse the immutable program once to establish the subjects expected at the
+  handoff. Require every declaration, binding, type node, expression, assignment
+  target, call, constructor, and implicit or explicit union injection needed by
+  lowering to have its corresponding stable identity and latest annotation.
+  Permit only resolved value types or `Never` as final expression states; a
+  diagnostic-free handoff containing `Error` or `Deferred` is a compiler
+  invariant failure. Assignment targets which can execute must have concrete
+  resolved paths and types.
+- Require all `DeferredAnalysis` records to be resolved and both deferred
+  mutability and deferred flow collections to be empty. Replace the current
+  unconditional assertions for these properties with the handoff validator's
+  recoverable compiler diagnostic, while retaining narrow internal assertions
+  for conditions which cannot be reached through the compiler boundary.
+- Validate the entry-point fact against the resolved function namespace and
+  accepted `main` signature. Its `FunctionId` must identify the unique source
+  declaration already classified by semantic analysis; omitted and explicit
+  unit results are equivalent, and the integer forms retain their existing
+  meaning.
+- Check semantic record coverage and uniqueness by AST subject. Every applicable
+  `is` expression, switch, and reachable postfix `?` must have exactly one
+  contextual resolution; a `Never` try operand remains the documented
+  exception. Every explicit return, implicit unit completion, `break`, and
+  `continue` must have its matching function or loop fact. Every block,
+  statement, statement body, expression, expression body, and switch arm must
+  have one final flow summary.
+- Check each semantic record internally without re-performing source-language
+  analysis. Declaration, function, binding, type, and deferred identifiers must
+  be in range; retained AST references must belong to the current program;
+  recorded types must agree with the latest annotations; selected union
+  alternatives must belong directly to their recorded union; switch coverage
+  must agree with its unique arms and `else`; and try source/destination errors,
+  success type, and propagate-or-panic action must agree with the enclosing
+  function.
+- Require every mutation subject classified by the semantic pass to end in one
+  concrete authorization record. Its root binding, access classification,
+  operation, storage/member identity, and final typed path must agree with the
+  corresponding name and assignment annotations. Use coverage facts retained
+  during mutability validation so the handoff check does not repeat
+  assignability or transitive-mutability decisions.
+- Validate return and flow consistency. Explicit and synthesized unit returns
+  must agree with their enclosing function and recorded union injection;
+  closing-brace completions must exist exactly where fallthrough supplies unit;
+  loop controls must target their nearest recorded loop; exhaustive switches
+  must have no unmatched fallthrough; and try flow must contain success plus the
+  recorded return or divergence action. Flow summaries may contain multiple
+  exit flags but no unresolved switch dependency.
+- Keep compiler orchestration ordered as parse, name/type analysis, semantic
+  analysis, handoff validation, temporary-backend capability validation,
+  in-memory C generation, and only then filesystem output. Source diagnostics
+  stop before the handoff check, handoff contradictions stop before the backend,
+  and valid programs outside the primitive subset continue to receive the
+  existing temporary-backend source diagnostic.
+- Audit the Phase 1–5 unit tests against this document's consolidated test
+  requirements instead of duplicating already-covered cases. Add focused gaps
+  for unit completion and injection, mutability coverage, return and loop facts,
+  narrowing invalidation, switch coverage and recomposed flow, printable union
+  classification, exact error propagation, `main` panic actions, warning
+  coexistence, and final resolution of all deferred records.
+- Add handoff-validator tests which deliberately remove, duplicate, corrupt, or
+  cross-link each category of required fact. Cover a missing entry point, stale
+  or deferred latest annotations, unresolved obligations, invalid identities,
+  foreign AST subjects, missing union/switch/try records, contradictory
+  alternatives and actions, absent mutation authorization, invalid loop
+  targets, and incomplete flow coverage. Each case must produce a compiler
+  diagnostic rather than a panic, source diagnostic, or temporary-backend
+  message.
+- Add compiler-pipeline tests proving that invariant failures preserve warnings,
+  precede temporary-backend validation, and neither create a build directory nor
+  create, truncate, or replace existing generated output. Retain the existing
+  tests proving parser and name/type failures skip semantic analysis, semantic
+  source errors precede backend limits, and warnings remain non-fatal on both
+  supported and unsupported programs.
+- Preserve every milestone 4 generated-C assertion and native primitive test.
+  Do not broaden the temporary emitter to lower unit values, unions, control
+  flow, narrowing, switches, or postfix `?`; changes to it are limited to
+  consuming the validated entry point and maintaining its current primitive
+  output byte for byte.
+- Rewrite `AST.md` as the completed milestone 5 handoff rather than a sequence
+  of future phase obligations. Document canonical types and latest annotations,
+  declaration and binding identities, literals, calls, constructors, union
+  injections, typed assignment paths, mutation authorizations, explicit and
+  implicit returns, loop targets, flow summaries, narrowing and switch records,
+  try actions, warnings, and the permitted `Never` state. Remove stale text that
+  assigns outstanding work to Phase 4 or Phase 5.
+- State in `AST.md` that milestone 6 may consume these facts but must not repeat
+  source name lookup, literal decoding, type inference, constructor selection,
+  union-label resolution, narrowing, mutability validation, switch coverage,
+  try propagation, or return-path proof. Keep the temporary resolved-AST
+  emitter contract visibly separate from this future typed-IR input.
+- Record the external verification commands required by contributor guidance.
+  Do not mark the phase or milestone complete without supplied evidence that the
+  full test suite passes on Rust 1.90 or newer and native assertions pass when a
+  supported C compiler is selected or found. Until then, report Phase 6 as
+  awaiting external verification rather than claiming an unverified completion.
+- After that evidence is available, set this document to all phases complete,
+  mark milestone 5 complete in `ROADMAP.md`, and leave milestone 6 as the next
+  implementation target. Do not introduce typed IR, runtime checks, C layouts,
+  or additional language behavior as part of this status transition.
+
+Exit criterion: every diagnostic-free frontend result passes the explicit
+handoff validator and contains the complete, internally consistent facts needed
+by typed-IR lowering; contradictions are reported as compiler errors without
+losing warnings or touching output; `AST.md` describes the completed interface;
+external verification has passed; and the primitive walking skeleton remains
+byte-for-byte unchanged.
 
 ## Implementation constraints
 
