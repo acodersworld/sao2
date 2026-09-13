@@ -60,7 +60,7 @@ table[key] = value;
 ```
 
 Lists grow with `append` and remove elements by index. Maps remove entries by
-key. The removal methods do not produce values:
+key. These mutating methods return `()`:
 
 ```text
 items.append(value);
@@ -156,6 +156,10 @@ order does not affect type identity, although `Error` must be written last.
 Explicitly nested unions retain their nested structure and discriminants; they
 are not flattened. An unparenthesized `A | B | C` has three alternatives.
 
+The unit type is written `()` and has exactly one value, also written `()`.
+Unit is immutable and has zero-sized storage. It may be stored, passed, placed
+in containers and unions, compared for equality, and used as a map key.
+
 ## Value construction
 
 Structs are constructed with named members using `=`:
@@ -237,21 +241,32 @@ fn f() int | Error(str) {
 }
 ```
 
+An operation which can fail but has no other result uses unit as its successful
+alternative:
+
+```text
+fn check() () | Error(str) {
+}
+```
+
 `Error` carries a value describing the failure and must always be the last
-alternative in a union. The postfix `?` operator unwraps a successful result or
-immediately returns its `Error`, as in Rust. The enclosing function must return
-a union with a compatible `Error` alternative. `main` is the exception: using
-`?` on an error in `main` causes a runtime panic.
+alternative in a union. `Error(Type)` is not a standalone result type. The
+postfix `?` operator unwraps a successful result or immediately returns its
+`Error`, as in Rust. Outside `main`, the enclosing function must return a union
+whose top-level `Error` alternative has exactly the same resolved payload type.
+There is no widening or union injection between error payloads. `main` is the
+exception: using `?` on an error in `main` causes a runtime panic.
 
 Postfix `?` removes the top-level `Error` alternative from the expression's
 type. If exactly one success alternative remains, the expression has that
 alternative's payload type directly. If multiple success alternatives remain,
 the expression has their union, preserving the alternatives' tags and explicit
-nesting.
+nesting. Consequently, applying `?` to `() | Error(E)` produces `()` on its
+successful path.
 
 ## Functions
 
-Function parameters and non-empty return types are explicit:
+Function parameters and non-unit return types are explicit:
 
 ```text
 fn add(a int, b int) int {
@@ -267,9 +282,10 @@ fn doit(var a int) {
 }
 ```
 
-The return type is omitted when a function returns no value. Parameters are
-constant by default. Prefixing a parameter with `var` permits it to be used to
-modify its value.
+An omitted return type means `()`. Writing `()` explicitly is equivalent.
+Normal fallthrough and bare `return;` return the unit value; `return ();` is the
+explicit form. Parameters are constant by default. Prefixing a parameter with
+`var` permits it to be used to modify its value.
 
 Primitive and tuple parameters are passed by value. Mutating a primitive `var`
 parameter or reassigning a tuple `var` parameter changes only the local
@@ -294,19 +310,21 @@ The special `Error(value)` union constructor participates in call-target
 resolution without ambiguity because `Error` is reserved and cannot be
 declared or bound by user code. Qualified tagged construction remains distinct.
 
-The program entry point has one of four forms:
+The program entry point accepts these equivalent unit and integer-result forms:
 
 ```text
 fn main() {}
+fn main() () {}
 fn main() int {}
 fn main(args [str]) {}
+fn main(args [str]) () {}
 fn main(args [str]) int {}
 ```
 
 Command-line arguments exclude the executable name and retain their original
 order. Every argument must be valid ASCII; otherwise the runtime panics before
-entering `main`. A `main` with no return type exits successfully, while an
-`int` return becomes the process exit code.
+entering `main`. A unit-returning `main` exits successfully, while an `int`
+return becomes the process exit code.
 
 ## Runtime built-ins
 
@@ -318,13 +336,22 @@ println(value);
 println();
 ```
 
-`print` writes without a newline, while `println` appends one. They accept one
-primitive value or an immutable tuple recursively containing printable values;
-the zero-argument `println` writes an empty line. Strings and characters print
-their contents without quotes, integers use decimal, floats use the shortest
-decimal representation that round-trips exactly, and booleans print as `true`
-or `false`. An output failure causes a panic. These operations are compiler
-intrinsics rather than overloaded or variadic user functions.
+`print` writes without a newline, while `println` appends one. They accept unit,
+a primitive value, an immutable tuple recursively containing printable values,
+or a union whose every alternative has a recursively printable payload. The
+zero-argument `println` writes an empty line. Unit prints as `()`. Strings and
+characters print their contents without quotes, integers use decimal, floats
+use the shortest decimal representation that round-trips exactly, and booleans
+print as `true` or `false`.
+
+Union values retain their constructor form when printed. A named untagged union
+prints `Union(payload)`, a named tagged union prints `Union.Tag(payload)`, a
+tagged anonymous union prints `Tag(payload)`, and the special alternative prints
+`Error(payload)`. An anonymous untagged union prints its active payload without
+a wrapper. Nested unions apply these rules recursively, so `() | Error(str)`
+prints either `()` or `Error(message)`. An output failure causes a panic. These
+operations are compiler intrinsics rather than overloaded or variadic user
+functions.
 
 The `panic(message)` intrinsic accepts a `str` and never returns. Standard
 input, files, environment variables, clocks, randomness, and process APIs are
@@ -441,9 +468,10 @@ Every named struct, tuple, or union is a distinct nominal type, even when two
 declarations have the same shape. There are no implicit conversions between
 distinct named types.
 
-Map keys may be `int`, `str`, `bool`, or immutable tuples composed recursively
-only of valid map-key types. Tuple keys use structural equality and hashing.
-No other type may be used as a map key.
+Map keys may be `()`, `int`, `str`, `bool`, or immutable tuples composed
+recursively only of valid map-key types. Unit has one equality class and a
+stable trivial hash; tuple keys use structural equality and hashing. No other
+type may be used as a map key.
 
 ## Control flow
 
@@ -491,8 +519,8 @@ result := {
 };
 ```
 
-A trailing semicolon discards the final expression's value. A block without a
-value cannot be used where a value is required.
+A trailing semicolon discards the final expression's value and makes the block
+produce `()`. A block without a final expression also produces `()`.
 
 An `if` may be used as either a statement or an expression:
 

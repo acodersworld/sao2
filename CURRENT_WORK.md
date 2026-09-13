@@ -115,9 +115,11 @@ source rendering, and introducing warnings changes no existing error output.
   missing prerequisite annotation in such an input is a compiler invariant
   failure rather than a recoverable source diagnostic.
 - Look up `main` through the resolved function namespace and validate its
-  recorded `FunctionSignature`. Accept exactly the four forms in `DESIGN.md` and
-  diagnose a missing function at the empty span at end of file or an invalid
-  signature at the function name.
+  recorded `FunctionSignature`. Accept the four signature shapes defined before
+  unit syntax—no arguments or `args [str]`, each with an omitted or `int`
+  result—and diagnose a missing function at the empty span at end of file or an
+  invalid signature at the function name. Phase 5 later makes omitted and
+  explicit `()` results equivalent.
 - Leave duplicate functions, including duplicate declarations named `main`, in
   name-and-type analysis. Its existing duplicate-function diagnostic stops the
   pipeline before semantic analysis; do not add a second duplicate-entry-point
@@ -562,25 +564,125 @@ related mutability decisions are final; switch coverage is proven or diagnosed;
 dependent return and reachability facts are recomposed without duplicate or
 cascading diagnostics; and only postfix-`?` work remains deferred to Phase 5.
 
-## Phase 5: Postfix `?`
+## Phase 5: Unit type and postfix `?`
 
-- Require the operand's top-level type to be a union containing exactly one
-  `Error` alternative. Do not flatten explicitly nested unions while searching.
-- Compute the successful result by removing `Error`: unwrap one remaining
-  alternative to its payload type, or intern the union of multiple remaining
-  alternatives with their existing tags and structure.
-- Outside `main`, require the enclosing function result to contain a compatible
-  top-level `Error` alternative and record an early-return propagation action.
-- In either valid form of `main`, record an action that converts the error case
-  into the language's required runtime panic rather than an ordinary return.
-- Diagnose `?` on non-unions, unions without exactly one `Error`, and functions
-  whose result cannot propagate that error.
-- Recompute expressions whose only deferred input was a newly resolved test,
-  narrowed use, switch, or try expression. Mark each completed deferred record
-  resolved exactly once.
+This phase is one language and semantic change. It replaces the temporary
+absence-of-value state with the first-class unit type needed to express
+`Result<(), E>` as `() | Error(E)`, then resolves every postfix `?` against that
+model. Do not land unit and try resolution as separate stages: the source and
+destination types of `?`, function completion, and the remaining deferred facts
+must agree at the end of the change.
 
-Exit criterion: every postfix `?` has a final expression type, selected error
-alternative, and explicit propagate-or-panic action.
+- Update `DESIGN.md` and `GRAMMAR.ebnf` before changing behavior. Add `()` as a
+  type and expression with exactly one immutable, zero-sized value. Record that
+  an omitted function result is `()`, bare `return;` returns `()`, and normal
+  function or block completion produces `()`. Keep standalone `Error(Type)`
+  invalid: an operation with only unit success and failure uses
+  `() | Error(Type)`.
+- Give unit ordinary value semantics. It may be stored, passed, returned, used
+  in containers and unions, compared for equality, and used as a map key. Unit
+  is printable as `()`. A union is printable only when every alternative's
+  payload is recursively printable, and it renders the active alternative in
+  constructor form: named untagged `Union(payload)`, named tagged
+  `Union.Tag(payload)`, anonymous tagged `Tag(payload)`, special
+  `Error(payload)`, and an unwrapped payload for an anonymous untagged union.
+  Apply the same rules recursively to nested unions.
+- Extend the parser AST with explicit unit type and unit expression variants and
+  add one canonical unit entry to the resolved type table. Empty parentheses in
+  type or expression position select unit; nonempty parentheses retain their
+  existing grouping behavior. Annotate a unit expression directly with the
+  canonical `TypeId` and preserve its byte span.
+- Remove `TypeState::NoValue`. Resolve omitted function results, blocks without
+  final expressions, zero-result intrinsics, and mutating container methods to
+  the canonical unit type. This deliberately makes formerly discarded results
+  real values: they can be bound or passed wherever `()` is expected. Retain
+  `Never`, `Error`, and `Deferred` as non-value analysis states.
+- Treat `return;` as a synthesized unit value. Accept fallthrough in a function
+  returning `()` or a union with one direct unit alternative, recording an
+  implicit unit injection for the latter. Extend return/completion facts so
+  typed-IR lowering can distinguish an explicit expression, a bare return, and
+  closing-brace fallthrough without requiring a fabricated AST expression.
+  Continue to diagnose fallthrough when the declared result cannot accept
+  unit.
+- Accept explicit `()` results for both parameter forms of `main` as equivalent
+  to an omitted result; preserve the existing `int` forms. Adapt the temporary C
+  emitter's result classification only enough to keep existing omitted-result
+  programs working now that they carry a unit `TypeId`. Do not add general unit,
+  union, control-flow, or postfix-`?` lowering to the temporary backend.
+- Update printable-type and map-key validation for unit. Printing a union must
+  validate every possible payload statically, retain enough resolved union and
+  nominal identity for the constructor-form renderer planned by typed IR, and
+  reject a union if any alternative is not printable. Existing primitive and
+  tuple rendering remains unchanged.
+- Add a `TryResolution` semantic record containing the postfix expression,
+  operand union, selected source `Error` alternative, final success `TypeId`,
+  and its action. Add `TryAction::Propagate`, which records the enclosing
+  `FunctionId`, destination union, and destination `Error` alternative, and
+  `TryAction::Panic`, which records the `main` function. Retain the direct AST
+  reference and operator span needed by diagnostics and later lowering.
+- Resolve a try operand before its postfix operator and inspect only the
+  operand's top-level union. Require exactly one direct `Error` alternative;
+  diagnose a non-union operand or a union without `Error` at the `?` span and do
+  not add a cascading propagation error. Preserve an operand already typed
+  `Never` as `Never` because execution cannot reach the operator. Do not flatten
+  explicitly nested unions while finding `Error`.
+- Remove the selected `Error` to compute the successful result. One remaining
+  alternative produces its payload type directly, including `()` for
+  `() | Error(E)`. Multiple remaining alternatives produce an interned
+  anonymous union containing the original alternatives, tags, payloads, and
+  explicit nesting. Resolve inner tries first so chained `?` operators can
+  successively unwrap explicitly nested result unions.
+- Outside `main`, require the enclosing function result to be a top-level union
+  with one `Error` whose payload has exactly the same resolved `TypeId` as the
+  operand's `Error` payload. Do not use ordinary union injection or structural
+  widening for error compatibility. In every accepted `main` form, record a
+  panic action instead of requiring an error result. If `main` already has an
+  invalid signature, use its declaration identity for panic classification and
+  avoid a secondary propagation diagnostic.
+- Run try resolution after Phase 4 narrowing and before final mutability and
+  flow validation. Refactor the flow-dependent expression retyping shared with
+  Phase 4 into a post-order helper so a completed try recomputes only affected
+  parents, expected-type checks, bindings, assignment targets, calls,
+  collections, block/if results, explicit returns, and final function results.
+  Preserve ordinary successful-alternative union injections and mark every
+  completed deferred record resolved exactly once without repeating name lookup
+  or constructor selection.
+- Revisit try-dependent mutability obligations after their receivers, indices,
+  arguments, and assignment targets become concrete. Move valid operations into
+  the normal authorization records and diagnose invalid ones at their original
+  spans. A diagnostic-free Phase 5 result must contain no deferred mutability
+  obligation whose input was postfix `?`.
+- Make flow validation consume try records in evaluation order. Propagation adds
+  an early-return path while retaining the success fallthrough path; `main`
+  panic adds a diverging path while retaining success fallthrough. Compose these
+  flags through calls, operators, returns, final values, branches, loops, and
+  switches. Resolve Phase 3 facts whose last unknown was a try result without
+  duplicating existing warnings or emitting a missing-return error for a path
+  already explained by a try diagnostic.
+- Add parser and analysis tests for unit syntax, grouping disambiguation,
+  omitted and explicit unit results, bare and explicit unit returns, block
+  completion, binding and passing unit, unit containers, equality, map keys,
+  printing `()`, and recursive constructor-form printing of tagged, untagged,
+  nominal, anonymous, `Error`, and nested unions. Prove that unions with any
+  non-printable payload remain non-printable.
+- Add semantic tests for one and multiple success alternatives, unit success,
+  nominal and anonymous unions, exact and mismatched error payloads,
+  nested-only errors, non-union operands, missing errors, chained tries, and
+  `Never` operands. Cover propagation from explicit returns, bare returns,
+  implicit unit fallthrough, and final values; panic actions for every accepted
+  `main` form; try-dependent parent expressions, mutability, and flow; and the
+  absence of unresolved try records after successful analysis.
+- Preserve diagnostic ordering, warning behavior, no-output-on-error behavior,
+  and the milestone 4 source-to-executable path. Valid unit or try programs
+  beyond the primitive emitter must reach its temporary unsupported-feature
+  diagnostic rather than changing generated-C behavior early.
+
+Exit criterion: `()` is the single value produced by omitted results, bare
+returns, and ordinary empty completion; unit and printable unions have final
+semantic types; every reachable postfix `?` has a selected error, final success
+type, and explicit propagate-or-panic action; all dependent expression,
+return, mutability, and flow facts are concrete; and no unit/no-value
+contradiction or try-dependent deferred record remains.
 
 ## Phase 6: Integration, tests, and handoff
 
