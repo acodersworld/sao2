@@ -8,6 +8,8 @@ mod cli;
 mod compiler;
 mod diagnostic;
 mod host_compiler;
+#[allow(dead_code)]
+mod ir;
 mod lexer;
 mod parser;
 mod program;
