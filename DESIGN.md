@@ -566,6 +566,14 @@ struct ref {
 };
 ```
 
+The all-zero representation is an internal null reference and is not a
+language value. Arena offset zero is permanently reserved, so no allocation or
+embedded object can produce `{ owner_ptr: 0, member_ptr: 0 }`. Generated trace
+code ignores this representation. The zero discriminant is likewise reserved
+as the inactive, non-value state of every runtime union and contains no
+traceable payload. These representations allow root storage to be safely
+zero-initialized before it contains language values.
+
 Both fields are byte offsets from the global arena base. `owner_ptr` identifies
 the root of the complete enclosing allocation, not merely the referenced
 object's immediate inline parent. `member_ptr` identifies the exact referenced
@@ -601,6 +609,26 @@ The collector is non-moving, stop-the-world, and mark-and-sweep. Each
 garbage-collected arena allocation records one mark timestamp and participates
 in the collector's allocation list. Struct values, including inline
 subobjects, contain no collector mark field.
+
+Generated functions use ordinary native C calls. A function with potentially
+traceable parameters, locals, or temporaries also has a compiler-generated
+shadow-frame struct containing those values. Primitive-only values need not be
+members of the shadow frame. Its first member is a common header containing a
+link to the caller's active shadow frame and a function-specific traversal
+callback. Each invocation zero-initializes its frame, installs the callback,
+copies any traceable incoming parameters into it, and links the frame before an
+operation can collect; it unlinks the frame on normal return. A function with
+no traceable values need not link a frame.
+
+The collector walks the shadow-frame chain rather than inspecting the native C
+stack. A frame traversal callback casts the common header to its enclosing
+function-specific struct and invokes generated type traversal for each root
+field. This handles unions and aggregate values directly and requires neither
+a generic offset table nor compiler-generated root push and pop operations.
+Tracing all fields for the lifetime of an invocation is correct because unused
+fields have a zero-safe representation. It may retain a dead value until the
+function returns; clearing dead fields or generating liveness-sensitive
+traversal is an optional optimization.
 
 At the start of collection, the runtime advances a global collection timestamp.
 A typed root reference resolves its owner from `owner_ptr`, marks that

@@ -112,6 +112,9 @@ Status: current.
 - Lower block and `if` values into temporaries and branches.
 - Insert overflow, shift, bounds, missing-key, and division checks.
 - Assign compact source-location IDs to runtime checks.
+- Retain the type and identity of every local and materialized temporary so a
+  later backend can derive precise shadow-frame roots without embedding GC
+  operations or physical C layout in the IR.
 
 Outcome: language semantics no longer depend on source-level syntax or C
 evaluation details.
@@ -142,6 +145,8 @@ and observable output.
 - Define the 8-byte packed `owner_ptr` and `member_ptr` reference-struct ABI.
 - Reserve a 4-GiB virtual-address arena and reconstruct native pointers by
   adding either reference field to its global base.
+- Reserve arena offset zero for the all-zero internal null reference and keep
+  zero-initialized union storage non-traceable.
 - Give proven non-escaping arena allocations scoped lifetimes.
 - Generate field-copy routines that preserve destination slot identity.
 - Produce context-insensitive escape summaries for functions.
@@ -156,6 +161,10 @@ that pass references to inline structs without letting them escape.
 - Implement a non-moving, stop-the-world mark-and-sweep heap.
 - Register generated type and allocation-layout descriptors.
 - Enumerate precise global, stack, temporary, and container roots.
+- Retain native C calls while generating a typed shadow-frame struct and
+  traversal callback for each function that can hold roots.
+- Link zero-initialized shadow frames for active invocations and traverse their
+  generated root fields without inspecting the native C stack.
 - Allocate GC-managed storage within the reserved 4-GiB arena.
 - Mark each referenced object's owning allocation and trace from its exact
   `member_ptr`.
