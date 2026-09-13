@@ -101,12 +101,13 @@ impl<'analysis, 'source, 'ast> TemporaryEmitter<'analysis, 'source, 'ast> {
         let mut usage = PrimitiveUsage::default();
         let returns = self.render_block_contents(body, 1, &mut statements, &mut usage)?;
         let int = self.analysis.types.primitive(PrimitiveType::Int);
+        let unit = self.analysis.types.unit();
         match (self.main.result, &body.value) {
-            (TypeState::NoValue, None) => statements.push_str("    return 0;\n"),
-            (TypeState::NoValue, Some(value)) => {
+            (TypeState::Resolved(result), None) if result == unit => statements.push_str("    return 0;\n"),
+            (TypeState::Resolved(result), Some(value)) if result == unit => {
                 return Err(self.unsupported(
                     value.span,
-                    "temporary backend does not support a final value in no-value main",
+                    "temporary backend does not support a final value in unit-returning main",
                 ));
             }
             (TypeState::Resolved(result), Some(value)) if result == int => {
@@ -198,8 +199,10 @@ impl<'analysis, 'source, 'ast> TemporaryEmitter<'analysis, 'source, 'ast> {
             ));
         }
         let int = self.analysis.types.primitive(PrimitiveType::Int);
+        let unit = self.analysis.types.unit();
         match (&self.main.node.return_type, self.main.result) {
-            (None, TypeState::NoValue) => {}
+            (None, TypeState::Resolved(result)) if result == unit => {}
+            (Some(return_type), TypeState::Resolved(result)) if result == unit && matches!(&return_type.kind, crate::ast::TypeKind::Unit) => {}
             (Some(_), TypeState::Resolved(result)) if result == int => {}
             (Some(return_type), TypeState::Resolved(_)) => {
                 return Err(self.unsupported_type(return_type));
@@ -307,12 +310,18 @@ impl<'analysis, 'source, 'ast> TemporaryEmitter<'analysis, 'source, 'ast> {
             }
             StatementKind::Return(value) => {
                 let TypeState::Resolved(result) = self.main.result else {
+                    return Err(Diagnostic::compiler(
+                        "temporary backend received an unresolved main return type",
+                    ));
+                };
+                let int = self.analysis.types.primitive(PrimitiveType::Int);
+                let unit = self.analysis.types.unit();
+                if result == unit {
                     return Err(self.unsupported_statement(
                         statement.span,
                         "temporary backend supports return only from integer main",
                     ));
-                };
-                let int = self.analysis.types.primitive(PrimitiveType::Int);
+                }
                 if result != int {
                     return Err(Diagnostic::compiler(
                         "temporary backend received an inconsistent main return type",
@@ -366,7 +375,7 @@ impl<'analysis, 'source, 'ast> TemporaryEmitter<'analysis, 'source, 'ast> {
             .analysis
             .expression_annotation(expression)
             .map(|annotation| annotation.state)
-            != Some(TypeState::NoValue)
+            != Some(TypeState::Resolved(self.analysis.types.unit()))
         {
             return Err(Diagnostic::compiler(
                 "temporary backend received an unresolved output call",
@@ -822,7 +831,7 @@ impl<'analysis, 'source, 'ast> TemporaryEmitter<'analysis, 'source, 'ast> {
                 expression.span,
                 "temporary backend does not support flow-dependent expressions",
             )),
-            TypeState::NoValue | TypeState::Never => Err(self.unsupported_expression(expression)),
+            TypeState::Never => Err(self.unsupported_expression(expression)),
             TypeState::Error => Err(Diagnostic::compiler(
                 "temporary backend received an expression with an analysis error",
             )),
@@ -854,7 +863,7 @@ impl<'analysis, 'source, 'ast> TemporaryEmitter<'analysis, 'source, 'ast> {
                 span,
                 format!("temporary backend does not support flow-dependent {subject} types"),
             )),
-            TypeState::NoValue | TypeState::Never => Err(self.unsupported(
+            TypeState::Never => Err(self.unsupported(
                 span,
                 format!("temporary backend requires {subject} to produce a value"),
             )),

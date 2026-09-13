@@ -319,7 +319,7 @@ mod tests {
         for (text, expected) in [
             ("type Number(int); fn helper() {}", "requires one 'main'"),
             ("fn main() int {}", "may fall through without returning a value"),
-            ("fn main() { 1 }", "no-value function cannot have a final value"),
+            ("fn main() { 1 }", "unit-returning function cannot return a non-unit value"),
         ] {
             for existing in [false, true] {
                 let build_directory = temporary_directory("semantic-error");
@@ -426,7 +426,7 @@ mod tests {
         for (text, expected) in [
             (
                 "fn main() { panic(\"stop\"); return 1; }",
-                "cannot return a value",
+                "unit-returning function cannot return a non-unit value",
             ),
             (
                 "fn main() { return; after := 1; }",

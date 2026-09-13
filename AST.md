@@ -24,9 +24,10 @@ spelling are not represented. Source order is preserved throughout the tree.
   type constructor.
 - A union owns a fixed boxed slice of alternatives. Unparenthesized chains are
   represented by one `TypeKind::Union` node.
-- Every explicit pair of type parentheses produces a
-  `TypeKind::Parenthesized` node. Consequently `(A | B) | C` remains distinct
-  from `A | B | C` without later reconstruction from source text.
+- Every explicit nonempty pair of type parentheses produces a
+  `TypeKind::Parenthesized` node; empty `()` is `TypeKind::Unit`. Consequently
+  `(A | B) | C` remains distinct from `A | B | C` without later reconstruction
+  from source text.
 - Tagged alternatives retain both the tag identifier and payload type without
   assuming that their surrounding context is a valid tagged union.
 
@@ -41,6 +42,8 @@ spelling are not represented. Source order is preserved throughout the tree.
 - Parenthesized expressions remain explicit. Postfix operations are nested in
   their source order, making calls, indexing, member access, and `?` chains
   unambiguous.
+- Empty expression parentheses are `ExpressionKind::Unit`; nonempty parentheses
+  remain grouping nodes.
 - Empty braces in expression context are an empty map. Nonempty expression
   braces containing the entry colon are maps; other expression braces are
   block expressions. Braces required by control-flow syntax are always blocks.
@@ -81,12 +84,12 @@ references and spans in its records. Binding identities are assigned in source
 order; they do not imply that a binding is visible before its initializer has
 been analyzed.
 
-Resolved language value types live in a small type table. Primitive types have
-canonical identities and later structural types are interned there. Analysis
-states distinguish a resolved value type from no-value, non-returning, error,
-and explicitly deferred results, so recovery and later flow-sensitive work
-cannot masquerade as successfully typed expressions. Type and expression
-annotations, diagnostics, and deferred obligations are all analysis-owned.
+Resolved language value types live in a small type table. Unit and primitive
+types have canonical identities and later structural types are interned there.
+Analysis states distinguish a resolved value type from non-returning, error,
+and explicitly deferred results. Omitted results and empty completion use the
+canonical unit type. Type and expression annotations, diagnostics, and deferred
+obligations are all analysis-owned.
 
 Phase 2 adds source-order-independent top-level collection with separate type
 and value namespaces. It resolves every function parameter and return type
@@ -114,8 +117,8 @@ and tag uniqueness, tagged-versus-untagged form, and final-position `Error`.
 Referenced storage is accepted only for struct-valued members. A separate
 layout walk follows inline structs, tuples, and union payloads, while referenced
 struct members and containers terminate a layout path. Map keys are restricted
-to `int`, `str`, `bool`, and nominal tuples recursively composed only of those
-valid map-key types.
+to `()`, `int`, `str`, `bool`, and nominal tuples recursively composed only of
+those valid map-key types.
 
 Phase 4 resolves function bodies with lexical binding stacks. Parameters,
 locals, and iteration variables retain stable binding identities and declared
@@ -150,8 +153,8 @@ annotations so Phase 6 can propagate that expected type. Blocks and compatible
 `if` expressions retain their value type; statement-only and non-returning
 results remain distinct from language value types.
 
-Flow-sensitive `is`, `switch`, and postfix `?` work remains explicit through
-deferred records.
+Flow-sensitive `is`, `switch`, and postfix `?` work begins as explicit deferred
+records and is completed by semantic analysis.
 
 Phase 6 propagates expected types from function parameters and results,
 constructor members, assignment targets, and enclosing collections. Nonempty
@@ -201,10 +204,10 @@ compiler invariant failure. C is generated fully in memory before filesystem
 output, so frontend or capability errors cannot create or truncate generated
 source.
 
-This boundary is deliberately temporary. Completed milestone 5 phases now own
-mutability, structural return-path validation, unreachable warnings, and loop
-control resolution. Later phases remain responsible for narrowing, switch
-coverage, postfix `?`, and resolving flow-dependent expressions.
+This boundary is deliberately temporary. Completed milestone 5 phases own
+mutability, structural return-path validation, unreachable warnings, loop
+control resolution, narrowing, switch coverage, postfix `?`, and recomputation
+of affected flow-dependent expressions.
 Milestone 6 will replace direct AST emission with typed IR that makes control
 flow, evaluation order, runtime checks, and source locations explicit.
 
@@ -242,10 +245,20 @@ reachable paths, while nested bodies are still analyzed independently so their
 own unreachable regions and semantic errors are preserved.
 
 Valid explicit returns retain their statement, enclosing `FunctionId`, optional
-value expression, and resolved or deferred value state. Valid `break` and
+value expression, final value state, and any unit-union injection. Closing-brace
+unit completions are separate records, also retaining an optional injection.
+Valid `break` and
 `continue` statements retain the nearest lexically enclosing loop statement.
 Non-`else` switches whose unmatched path is the only remaining fallthrough
 produce explicit return-flow or reachability obligations for Phase 4 rather
 than premature diagnostics or warnings. A deferred outer function value also
 retains its function, block, expression, and declared result so Phase 4 can
-finish implicit-return or no-value validation after narrowing.
+finish implicit-return validation after narrowing.
+
+Semantic Phase 5 records every reachable postfix `?` with its AST expression,
+operator span, operand union, selected direct `Error` alternative, final success
+type, and either an enclosing-function propagation action or a `main` panic
+action. Multiple successful alternatives retain their tags and nesting in an
+interned anonymous union. Try flow retains both its success fallthrough and its
+early return or divergence path. A diagnostic-free result has no unresolved
+analysis, mutability, or flow obligation.

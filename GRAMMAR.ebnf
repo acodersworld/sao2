@@ -45,6 +45,7 @@ type                = union-type ;
 union-type          = type-atom, { "|", type-atom } ;
 
 type-atom           = primitive-type
+                    | unit-type
                     | identifier
                     | list-type
                     | map-type
@@ -52,6 +53,7 @@ type-atom           = primitive-type
                     | "(", type, ")" ;
 
 primitive-type      = "int" | "float" | "str" | "bool" | "char" ;
+unit-type           = "(", ")" ;
 list-type           = "[", type, "]" ;
 map-type            = "{", type, ":", type, "}" ;
 tagged-alternative  = identifier, "(", type, ")" ;
@@ -183,6 +185,7 @@ primary-expression  = identifier
                     | string-literal
                     | character-literal
                     | boolean-literal
+                    | unit-expression
                     | parenthesized-expression
                     | list-literal
                     | map-literal
@@ -193,6 +196,7 @@ primary-expression  = identifier
 
 parenthesized-expression
                     = "(", expression, ")" ;
+unit-expression     = "(", ")" ;
 
 list-literal        = "[", [ expression-list ], "]" ;
 expression-list     = expression, { ",", expression } ;

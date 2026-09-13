@@ -144,6 +144,28 @@ pub(crate) struct SwitchResolution<'ast> {
     pub(crate) exhaustive: bool,
 }
 
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // Consumed by typed-IR lowering.
+pub(crate) enum TryAction {
+    Propagate {
+        function: FunctionId,
+        destination_union: TypeId,
+        destination_error: UnionAlternative,
+    },
+    Panic { function: FunctionId },
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // Consumed by typed-IR lowering.
+pub(crate) struct TryResolution<'ast> {
+    pub(crate) expression: &'ast Expression,
+    pub(crate) operator_span: Span,
+    pub(crate) operand_union: TypeId,
+    pub(crate) source_error: UnionAlternative,
+    pub(crate) success: TypeId,
+    pub(crate) action: TryAction,
+}
+
 #[derive(Debug)]
 pub(crate) struct SemanticResult<'ast> {
     pub(crate) diagnostics: Diagnostics,
@@ -157,6 +179,8 @@ pub(crate) struct SemanticResult<'ast> {
     pub(crate) union_tests: Vec<UnionTestResolution<'ast>>,
     #[allow(dead_code)] // Consumed by typed-IR lowering.
     pub(crate) switches: Vec<SwitchResolution<'ast>>,
+    #[allow(dead_code)] // Consumed by typed-IR lowering.
+    pub(crate) tries: Vec<TryResolution<'ast>>,
     #[allow(dead_code)] // Consumed by typed-IR lowering.
     pub(crate) flow: FlowFacts<'ast>,
 }
@@ -302,13 +326,22 @@ fn deduplicate_switches(switches: &mut Vec<&Statement>) {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 #[allow(dead_code)] // Retained for typed-IR lowering.
 pub(crate) struct ExplicitReturn<'ast> {
     pub(crate) statement: &'ast Statement,
     pub(crate) function: FunctionId,
     pub(crate) value: Option<&'ast Expression>,
     pub(crate) value_state: TypeState,
+    pub(crate) unit_injection: Option<UnionAlternative>,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // Consumed by typed-IR lowering.
+pub(crate) struct FunctionCompletion<'ast> {
+    pub(crate) function: FunctionId,
+    pub(crate) body: &'ast Block,
+    pub(crate) unit_injection: Option<UnionAlternative>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -365,6 +398,7 @@ pub(crate) struct FlowRecord<'ast> {
 pub(crate) struct FlowFacts<'ast> {
     pub(crate) summaries: Vec<FlowRecord<'ast>>,
     pub(crate) returns: Vec<ExplicitReturn<'ast>>,
+    pub(crate) completions: Vec<FunctionCompletion<'ast>>,
     pub(crate) loop_controls: Vec<LoopControl<'ast>>,
     pub(crate) deferred: Vec<DeferredFlow<'ast>>,
 }
@@ -402,11 +436,11 @@ pub(crate) fn analyze<'ast>(analysis: &mut Analysis<'_, 'ast>) -> SemanticResult
     };
 
     let mut warnings = Warnings::new();
-    let (union_tests, switches) =
+    let (union_tests, switches, tries) =
         UnionValidator::new(analysis, &mut diagnostics, &mut warnings).validate();
     let (mutability, deferred_mutability) =
         MutabilityValidator::new(analysis, &mut diagnostics).validate();
-    let mut flow = FlowValidator::new(analysis, &mut diagnostics, &mut warnings, &switches).validate();
+    let mut flow = FlowValidator::new(analysis, &mut diagnostics, &mut warnings, &switches, &tries).validate();
     flow.deferred.retain(|obligation| {
         obligation.switches.is_empty() || obligation.switches.iter().any(|statement| {
             analysis.deferred.iter().any(|deferred| {
@@ -415,6 +449,20 @@ pub(crate) fn analyze<'ast>(analysis: &mut Analysis<'_, 'ast>) -> SemanticResult
             })
         })
     });
+    if diagnostics.is_empty() {
+        assert!(
+            analysis.deferred.iter().all(|deferred| deferred.resolved),
+            "diagnostic-free semantic analysis retained an unresolved deferred record"
+        );
+        assert!(
+            deferred_mutability.is_empty(),
+            "diagnostic-free semantic analysis retained deferred mutability"
+        );
+        assert!(
+            flow.deferred.is_empty(),
+            "diagnostic-free semantic analysis retained deferred flow"
+        );
+    }
     debug_assert!(entry_point.is_some() || !diagnostics.is_empty());
     SemanticResult {
         diagnostics,
@@ -424,6 +472,7 @@ pub(crate) fn analyze<'ast>(analysis: &mut Analysis<'_, 'ast>) -> SemanticResult
         deferred_mutability,
         union_tests,
         switches,
+        tries,
         flow,
     }
 }
@@ -437,7 +486,7 @@ fn assert_entry_point_prerequisites(signature: &FunctionSignature<'_>) {
         "semantic analysis received an unresolved entry-point parameter type"
     );
     assert!(
-        matches!(signature.result, TypeState::NoValue | TypeState::Resolved(_)),
+        matches!(signature.result, TypeState::Resolved(_)),
         "semantic analysis received an unresolved entry-point result type"
     );
 }
@@ -463,7 +512,7 @@ fn valid_main_signature(
         }
         _ => false,
     };
-    let result_valid = signature.result == TypeState::NoValue
+    let result_valid = signature.result == TypeState::Resolved(analysis.types.unit())
         || signature.result
             == TypeState::Resolved(analysis.types.primitive(PrimitiveType::Int));
     parameters_valid && result_valid
@@ -478,8 +527,10 @@ struct UnionValidator<'analysis, 'diagnostics, 'warnings, 'source, 'ast> {
     warnings: &'warnings mut Warnings,
     tests: Vec<UnionTestResolution<'ast>>,
     switches: Vec<SwitchResolution<'ast>>,
+    tries: Vec<TryResolution<'ast>>,
     narrowed: Vec<(BindingId, TypeId)>,
     function_result: TypeState,
+    function: Option<FunctionId>,
 }
 
 impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
@@ -490,18 +541,20 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
         diagnostics: &'diagnostics mut Diagnostics,
         warnings: &'warnings mut Warnings,
     ) -> Self {
-        Self { analysis, diagnostics, warnings, tests: Vec::new(), switches: Vec::new(), narrowed: Vec::new(), function_result: TypeState::NoValue }
+        let unit = analysis.types.unit();
+        Self { analysis, diagnostics, warnings, tests: Vec::new(), switches: Vec::new(), tries: Vec::new(), narrowed: Vec::new(), function_result: TypeState::Resolved(unit), function: None }
     }
 
-    fn validate(mut self) -> (Vec<UnionTestResolution<'ast>>, Vec<SwitchResolution<'ast>>) {
-        let functions = self.analysis.function_signatures.iter().map(|signature| (signature.node, signature.result)).collect::<Vec<_>>();
-        for (function, result) in functions {
+    fn validate(mut self) -> (Vec<UnionTestResolution<'ast>>, Vec<SwitchResolution<'ast>>, Vec<TryResolution<'ast>>) {
+        let functions = self.analysis.function_signatures.iter().map(|signature| (signature.id, signature.node, signature.result)).collect::<Vec<_>>();
+        for (id, function, result) in functions {
             self.narrowed.clear();
             self.function_result = result;
+            self.function = Some(id);
             self.block(&function.body);
             if let Some(value) = function.body.value.as_deref() { self.validate_result_value(value); }
         }
-        (self.tests, self.switches)
+        (self.tests, self.switches, self.tries)
     }
 
     fn block(&mut self, block: &'ast Block) {
@@ -689,12 +742,35 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
                     }
                 }
             }
-            ExpressionKind::Try { value, .. } => { self.expression(value); }
-            ExpressionKind::List(elements) => for element in elements { self.expression(element); },
-            ExpressionKind::Map(entries) => for entry in entries { self.expression(&entry.key); self.expression(&entry.value); },
+            ExpressionKind::Try { value, operator_span } => {
+                let operand = self.expression(value);
+                self.resolve_try(expression, *operator_span, operand);
+            }
+            ExpressionKind::List(elements) => {
+                for element in elements { self.expression(element); }
+                if !elements.is_empty() {
+                    let states = elements.iter().map(|element| self.state(element)).collect::<Vec<_>>();
+                    if let Some(TypeState::Resolved(element)) = states.first().copied()
+                        && states.iter().all(|state| *state == TypeState::Resolved(element))
+                    {
+                        let list = self.analysis.types.intern(ResolvedType::List(element));
+                        self.replace_if_changed(expression, TypeState::Resolved(list));
+                    }
+                }
+            }
+            ExpressionKind::Map(entries) => {
+                for entry in entries { self.expression(&entry.key); self.expression(&entry.value); }
+                if let Some(first) = entries.first()
+                    && let (TypeState::Resolved(key), TypeState::Resolved(value)) = (self.state(&first.key), self.state(&first.value))
+                    && entries.iter().all(|entry| self.state(&entry.key) == TypeState::Resolved(key) && self.state(&entry.value) == TypeState::Resolved(value))
+                {
+                    let map = self.analysis.types.intern(ResolvedType::Map { key, value });
+                    self.replace_if_changed(expression, TypeState::Resolved(map));
+                }
+            }
             ExpressionKind::Block(block) => {
                 self.block(block);
-                let state = block.value.as_deref().map_or(TypeState::NoValue, |value| self.state(value));
+                let state = block.value.as_deref().map_or(TypeState::Resolved(self.analysis.types.unit()), |value| self.state(value));
                 self.replace_if_changed(expression, state);
             }
             ExpressionKind::If { branches, else_branch } => {
@@ -769,7 +845,7 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
             ExpressionKind::Member { value, member } => {
                 self.expression(value); self.retype_member(expression, value, *member);
             }
-            ExpressionKind::Integer | ExpressionKind::Float | ExpressionKind::String(_)
+            ExpressionKind::Unit | ExpressionKind::Integer | ExpressionKind::Float | ExpressionKind::String(_)
             | ExpressionKind::Character(_) | ExpressionKind::Boolean(_)
             | ExpressionKind::TypedEmptyList(_) | ExpressionKind::TypedEmptyMap(_) => {}
         }
@@ -786,6 +862,53 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
             },
             _ => None,
         }
+    }
+
+    fn resolve_try(&mut self, expression: &'ast Expression, operator_span: Span, operand: TypeState) {
+        if operand == TypeState::Never {
+            self.replace_if_changed(expression, TypeState::Never);
+            return;
+        }
+        let Some((operand_union, _, alternatives)) = self.union_parts(operand) else {
+            if operand != TypeState::Error {
+                self.error(operator_span, "postfix '?' operand must be a union containing Error");
+            }
+            self.replace_expression_state(expression, TypeState::Error);
+            return;
+        };
+        let errors = alternatives.iter().filter(|alternative| matches!(alternative, UnionAlternative::Error(_))).cloned().collect::<Vec<_>>();
+        let [source_error] = errors.as_slice() else {
+            self.error(operator_span, "postfix '?' operand union must contain exactly one direct Error alternative");
+            self.replace_expression_state(expression, TypeState::Error);
+            return;
+        };
+        let successes = alternatives.iter().filter(|alternative| !matches!(alternative, UnionAlternative::Error(_))).cloned().collect::<Vec<_>>();
+        let success = if let [only] = successes.as_slice() {
+            alternative_payload(only)
+        } else {
+            self.analysis.types.intern(ResolvedType::Union(successes.into_boxed_slice()))
+        };
+        let function = self.function.expect("try resolution requires an enclosing function");
+        let function_node = self.analysis.function_signature(function).node;
+        let action = if self.analysis.identifier_text(function_node.name.span) == "main" {
+            TryAction::Panic { function }
+        } else {
+            let Some((destination_union, _, destination_alternatives)) = self.union_parts(self.function_result) else {
+                self.error(operator_span, "enclosing function result must be a union with the same Error payload");
+                self.replace_expression_state(expression, TypeState::Error);
+                return;
+            };
+            let source_payload = alternative_payload(source_error);
+            let matches = destination_alternatives.into_iter().filter(|alternative| matches!(alternative, UnionAlternative::Error(payload) if *payload == source_payload)).collect::<Vec<_>>();
+            let [destination_error] = matches.as_slice() else {
+                self.error(operator_span, "postfix '?' Error payload does not match the enclosing function result");
+                self.replace_expression_state(expression, TypeState::Error);
+                return;
+            };
+            TryAction::Propagate { function, destination_union, destination_error: destination_error.clone() }
+        };
+        self.replace_expression_state(expression, TypeState::Resolved(success));
+        self.tries.push(TryResolution { expression, operator_span, operand_union, source_error: source_error.clone(), success, action });
     }
 
     fn resolve_label(&mut self, label: &'ast Type, style: UnionStyle, alternatives: &[UnionAlternative]) -> Option<UnionAlternative> {
@@ -822,6 +945,7 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
 
     fn resolve_label_type(&mut self, ty: &'ast Type) -> Option<TypeId> {
         let resolved = match &ty.kind {
+            TypeKind::Unit => Some(self.analysis.types.unit()),
             TypeKind::Primitive(primitive) => Some(self.analysis.types.primitive(*primitive)),
             TypeKind::Named(identifier) => {
                 let name = self.analysis.identifier_text(identifier.span).to_owned();
@@ -930,8 +1054,8 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
         let spelling = self.analysis.identifier_text(name.span).to_owned();
         let int = self.analysis.types.primitive(PrimitiveType::Int);
         let method = match self.analysis.types.get(receiver_ty) {
-            ResolvedType::List(element) => match spelling.as_str() { "append" => Some((BuiltinMethod::ListAppend, Some(*element), TypeState::NoValue)), "removeIndex" => Some((BuiltinMethod::ListRemoveIndex, Some(int), TypeState::NoValue)), "len" => Some((BuiltinMethod::ListLen, None, TypeState::Resolved(int))), _ => None },
-            ResolvedType::Map { key, .. } => match spelling.as_str() { "removeKey" => Some((BuiltinMethod::MapRemoveKey, Some(*key), TypeState::NoValue)), "len" => Some((BuiltinMethod::MapLen, None, TypeState::Resolved(int))), _ => None },
+            ResolvedType::List(element) => match spelling.as_str() { "append" => Some((BuiltinMethod::ListAppend, Some(*element), TypeState::Resolved(self.analysis.types.unit()))), "removeIndex" => Some((BuiltinMethod::ListRemoveIndex, Some(int), TypeState::Resolved(self.analysis.types.unit()))), "len" => Some((BuiltinMethod::ListLen, None, TypeState::Resolved(int))), _ => None },
+            ResolvedType::Map { key, .. } => match spelling.as_str() { "removeKey" => Some((BuiltinMethod::MapRemoveKey, Some(*key), TypeState::Resolved(self.analysis.types.unit()))), "len" => Some((BuiltinMethod::MapLen, None, TypeState::Resolved(int))), _ => None },
             ResolvedType::Primitive(PrimitiveType::Str) if spelling == "len" => Some((BuiltinMethod::StrLen, None, TypeState::Resolved(int))),
             _ => None,
         };
@@ -950,9 +1074,9 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
     fn retype_assignment_target(&mut self, target: &'ast AssignmentTarget) {
         if target.suffixes.is_empty() { return; }
         let Some(NameResolution::Binding(root)) = self.analysis.name_use(&target.root).map(|use_| use_.resolution) else { return; };
-        let Some(narrowed) = self.narrowed_type(root) else { return; };
+        let root_type = self.narrowed_type(root).map(TypeState::Resolved).unwrap_or_else(|| self.analysis.binding_type(root));
         let original = self.analysis.assignment_target(target).cloned().expect("assignment target annotation");
-        let mut state = TypeState::Resolved(narrowed);
+        let mut state = root_type;
         let mut steps = Vec::new();
         for suffix in &target.suffixes {
             let TypeState::Resolved(receiver) = state else { break; };
@@ -993,6 +1117,7 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
         if let (TypeState::Resolved(actual), TypeState::Resolved(expected)) = (self.state(value), self.function_result)
         {
             if actual == expected { return; }
+            if self.try_success_widens_to(value, actual, expected) { return; }
             let alternatives = self.union_parts(TypeState::Resolved(expected)).map(|(_, _, alternatives)| {
                 alternatives.into_iter().filter(|alternative| alternative_payload(alternative) == actual).collect::<Vec<_>>()
             }).unwrap_or_default();
@@ -1003,7 +1128,12 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
                     alternative: alternative.clone(),
                 });
             } else {
-                self.error(value.span, "return value type does not match function result type");
+                let message = if expected == self.analysis.types.unit() {
+                    "unit-returning function cannot return a non-unit value"
+                } else {
+                    "return value type does not match function result type"
+                };
+                self.error(value.span, message);
             }
         }
     }
@@ -1011,6 +1141,7 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
     fn validate_expected_value(&mut self, value: &'ast Expression, expected: TypeId, message: &'static str) {
         let TypeState::Resolved(actual) = self.state(value) else { return; };
         if actual == expected { return; }
+        if self.try_success_widens_to(value, actual, expected) { return; }
         let alternatives = self.union_parts(TypeState::Resolved(expected)).map(|(_, _, alternatives)| {
             alternatives.into_iter().filter(|alternative| alternative_payload(alternative) == actual).collect::<Vec<_>>()
         }).unwrap_or_default();
@@ -1025,10 +1156,25 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
         self.analysis.expression_annotation(expression).expect("every expression has a type annotation").state
     }
 
+    fn try_success_widens_to(&self, expression: &'ast Expression, actual: TypeId, expected: TypeId) -> bool {
+        let expression = strip_expression_parentheses(expression);
+        if !matches!(&expression.kind, ExpressionKind::Try { .. }) {
+            return false;
+        }
+        let ResolvedType::Union(actual_alternatives) = self.analysis.types.get(actual) else {
+            return false;
+        };
+        let expected_alternatives = self.union_parts(TypeState::Resolved(expected))
+            .map(|(_, _, alternatives)| alternatives)
+            .unwrap_or_default();
+        !actual_alternatives.is_empty()
+            && actual_alternatives.iter().all(|alternative| expected_alternatives.contains(alternative))
+    }
+
     fn expression_body_state(&self, body: &'ast ExpressionBody) -> TypeState {
         match &body.kind {
             ExpressionBodyKind::Expression(expression) => self.state(expression),
-            ExpressionBodyKind::Block(block) => block.value.as_deref().map_or(TypeState::NoValue, |value| self.state(value)),
+            ExpressionBodyKind::Block(block) => block.value.as_deref().map_or(TypeState::Resolved(self.analysis.types.unit()), |value| self.state(value)),
         }
     }
 
@@ -1062,6 +1208,7 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
     }
     fn type_name(&self, ty: TypeId) -> String {
         match self.analysis.types.get(ty) {
+            ResolvedType::Unit => "()".to_owned(),
             ResolvedType::Primitive(primitive) => match primitive { PrimitiveType::Int => "int", PrimitiveType::Float => "float", PrimitiveType::Str => "str", PrimitiveType::Bool => "bool", PrimitiveType::Char => "char" }.to_owned(),
             ResolvedType::Nominal(declaration) => self.analysis.identifier_text(self.analysis.type_definition(*declaration).node.name.span).to_owned(),
             ResolvedType::List(element) => format!("[{}]", self.type_name(*element)),
@@ -1154,6 +1301,7 @@ struct FlowValidator<'analysis, 'diagnostics, 'warnings, 'source, 'ast> {
     function: Option<(FunctionId, TypeState)>,
     loops: Vec<&'ast Statement>,
     switches: &'analysis [SwitchResolution<'ast>],
+    tries: &'analysis [TryResolution<'ast>],
 }
 
 impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
@@ -1164,6 +1312,7 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
         diagnostics: &'diagnostics mut Diagnostics,
         warnings: &'warnings mut Warnings,
         switches: &'analysis [SwitchResolution<'ast>],
+        tries: &'analysis [TryResolution<'ast>],
     ) -> Self {
         Self {
             analysis,
@@ -1173,6 +1322,7 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
             function: None,
             loops: Vec::new(),
             switches,
+            tries,
         }
     }
 
@@ -1202,7 +1352,7 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
             .body
             .value
             .as_deref()
-            .map_or(TypeState::NoValue, |value| self.expression_state(value));
+            .map_or(TypeState::Resolved(self.analysis.types.unit()), |value| self.expression_state(value));
         if let (Some(value), TypeState::Deferred(_)) =
             (function.body.value.as_deref(), final_state)
         {
@@ -1218,18 +1368,20 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
         }
 
         match result {
-            TypeState::NoValue => {
-                if function.body.value.is_some() && matches!(final_state, TypeState::Resolved(_)) {
-                    self.error(
-                        function.body.value.as_deref().unwrap().span,
-                        "no-value function cannot have a final value",
-                    );
-                }
-            }
-            TypeState::Resolved(_) => {
+            TypeState::Resolved(result_type) => {
                 let implicitly_returns = function.body.value.is_some()
-                    && matches!(final_state, TypeState::Resolved(_) | TypeState::Deferred(_));
+                    && matches!(final_state, TypeState::Resolved(_) | TypeState::Deferred(_) | TypeState::Error);
                 if body_flow.can_fallthrough() && !implicitly_returns {
+                    let unit_injection = self.unit_alternative(result_type);
+                    if result_type == self.analysis.types.unit() || unit_injection.is_some() {
+                        self.facts.completions.push(FunctionCompletion {
+                            function: id,
+                            body: &function.body,
+                            unit_injection,
+                        });
+                        self.function = None;
+                        return;
+                    }
                     match body_flow.fallthrough {
                         FallthroughKind::Definite => self.error(
                             closing_brace_span(&function.body),
@@ -1396,16 +1548,21 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
         let (function, result) = self
             .function
             .expect("return validation requires an enclosing function");
-        let value_state = value.map_or(TypeState::NoValue, |value| self.expression_state(value));
+        let unit = self.analysis.types.unit();
+        let value_state = value.map_or(TypeState::Resolved(unit), |value| self.expression_state(value));
+        let unit_injection = match result {
+            TypeState::Resolved(result_type) if value.is_none() && result_type == unit => None,
+            TypeState::Resolved(result_type) if value.is_none() => self.unit_alternative(result_type),
+            _ => None,
+        };
         let valid = match (result, value) {
-            (TypeState::NoValue, None) => true,
-            (TypeState::NoValue, Some(_)) => {
-                self.error(statement.span, "no-value function cannot return a value");
-                false
-            }
-            (TypeState::Resolved(_), None) => {
-                self.error(statement.span, "value-returning function requires a return value");
-                false
+            (TypeState::Resolved(result_type), None) => {
+                if result_type == unit || unit_injection.is_some() {
+                    true
+                } else {
+                    self.error(statement.span, "value-returning function requires a return value");
+                    false
+                }
             }
             (TypeState::Resolved(_), Some(_)) => true,
             _ => panic!("semantic analysis received an invalid function result type"),
@@ -1416,6 +1573,7 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
                 function,
                 value,
                 value_state,
+                unit_injection,
             });
         }
         let evaluated = value.map_or_else(FlowSummary::fallthrough, |value| self.expression(value));
@@ -1493,7 +1651,8 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
 
     fn expression(&mut self, expression: &'ast Expression) -> FlowSummary<'ast> {
         let flow = match &expression.kind {
-            ExpressionKind::Identifier(_)
+            ExpressionKind::Unit
+            | ExpressionKind::Identifier(_)
             | ExpressionKind::Integer
             | ExpressionKind::Float
             | ExpressionKind::String(_)
@@ -1502,8 +1661,19 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
             | ExpressionKind::TypedEmptyList(_)
             | ExpressionKind::TypedEmptyMap(_) => FlowSummary::fallthrough(),
             ExpressionKind::Parenthesized(inner)
-            | ExpressionKind::Unary { operand: inner, .. }
-            | ExpressionKind::Try { value: inner, .. } => self.expression(inner),
+            | ExpressionKind::Unary { operand: inner, .. } => self.expression(inner),
+            ExpressionKind::Try { value: inner, .. } => {
+                let mut flow = self.expression(inner);
+                if flow.can_fallthrough()
+                    && let Some(resolution) = self.tries.iter().find(|resolution| std::ptr::eq(resolution.expression, expression))
+                {
+                    match &resolution.action {
+                        TryAction::Propagate { .. } => flow.flags.insert(FlowFlags::RETURN),
+                        TryAction::Panic { .. } => flow.flags.insert(FlowFlags::DIVERGE),
+                    }
+                }
+                flow
+            }
             ExpressionKind::List(elements) => self.expression_sequence(elements.iter()),
             ExpressionKind::Map(entries) => self.expression_sequence(
                 entries.iter().flat_map(|entry| [&entry.key, &entry.value]),
@@ -1591,6 +1761,20 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
             .iter()
             .find(|resolution| std::ptr::eq(resolution.statement, statement))
             .is_some_and(|resolution| resolution.exhaustive)
+    }
+
+    fn unit_alternative(&self, ty: TypeId) -> Option<UnionAlternative> {
+        let unit = self.analysis.types.unit();
+        let alternatives = match self.analysis.types.get(ty) {
+            ResolvedType::Union(alternatives) => alternatives.as_ref(),
+            ResolvedType::Nominal(declaration) => match &self.analysis.type_definition(*declaration).kind {
+                TypeDefinitionKind::Union { alternatives, .. } => alternatives.as_ref(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let matches = alternatives.iter().filter(|alternative| matches!(alternative, UnionAlternative::Untagged(payload) if *payload == unit)).cloned().collect::<Vec<_>>();
+        match matches.as_slice() { [only] => Some(only.clone()), _ => None }
     }
 
     fn record(&mut self, subject: FlowSubject<'ast>, summary: FlowSummary<'ast>) {
@@ -1770,7 +1954,8 @@ impl<'analysis, 'diagnostics, 'source, 'ast>
 
     fn visit_expression(&mut self, expression: &'ast Expression) {
         match &expression.kind {
-            ExpressionKind::Identifier(_)
+            ExpressionKind::Unit
+            | ExpressionKind::Identifier(_)
             | ExpressionKind::Integer
             | ExpressionKind::Float
             | ExpressionKind::String(_)
@@ -2192,7 +2377,7 @@ impl<'analysis, 'diagnostics, 'source, 'ast>
         }
         match self.analysis.types.get(ty) {
             ResolvedType::List(_) | ResolvedType::Map { .. } => true,
-            ResolvedType::Primitive(_) => false,
+            ResolvedType::Unit | ResolvedType::Primitive(_) => false,
             ResolvedType::Union(alternatives) => {
                 visiting.push(ty);
                 let result = alternatives.iter().any(|alternative| {
@@ -2470,7 +2655,7 @@ mod tests {
             ),
             (
                 "fn helper() { return 1; } fn main() {}",
-                "cannot return a value",
+                "cannot return a non-unit value",
             ),
             (
                 "fn answer() int {} fn main() {}",
@@ -2478,7 +2663,7 @@ mod tests {
             ),
             (
                 "fn helper() { 1 } fn main() {}",
-                "cannot have a final value",
+                "cannot return a non-unit value",
             ),
         ] {
             with_semantic_result(text, |result| {
@@ -2572,7 +2757,7 @@ mod tests {
             |result| {
                 assert_eq!(result.warnings.len(), 4, "{}", result.warnings);
                 assert!(
-                    result.diagnostics.to_string().contains("cannot return a value"),
+                    result.diagnostics.to_string().contains("cannot return a non-unit value"),
                     "{}",
                     result.diagnostics
                 );
@@ -2689,7 +2874,7 @@ mod tests {
                 "fn main() {}"
             ),
             |result| {
-                assert!(result.diagnostics.to_string().contains("no-value function cannot have a final value"));
+                assert!(result.diagnostics.to_string().contains("unit-returning function cannot return a non-unit value"));
                 assert_eq!(
                     result
                         .flow
@@ -2818,5 +3003,43 @@ mod tests {
         assert!(analysis.diagnostics.is_empty());
         analysis.function_signatures[0].result = TypeState::Error;
         let _ = analyze(&mut analysis);
+    }
+
+    #[test]
+    fn resolves_postfix_try_success_propagation_panic_and_chaining() {
+        let source = source(concat!(
+            "type Inner(int | Error(str)); type Outer(Inner | Error(str)); ",
+            "type Many(int | str | Error(bool)); ",
+            "fn propagate(value Inner) int | Error(str) { value? } ",
+            "fn main() () { inner := Inner(1); first := inner?; ",
+            "outer := Outer(Inner(2)); second := outer??; ",
+            "many := Many(3); choice := many?; }",
+        ));
+        let program = parser::parse(&source).unwrap();
+        let mut analysis = analysis::analyze(&source, &program);
+        assert!(analysis.diagnostics.is_empty(), "{}", analysis.diagnostics);
+        let result = analyze(&mut analysis);
+        assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
+        assert_eq!(result.tries.len(), 5);
+        assert!(matches!(&result.tries[0].action, TryAction::Propagate { .. }));
+        assert!(result.tries[1..].iter().all(|resolution| matches!(&resolution.action, TryAction::Panic { .. })));
+        assert!(matches!(analysis.types.get(result.tries.last().unwrap().success), ResolvedType::Union(alternatives) if alternatives.len() == 2));
+        assert!(analysis.deferred.iter().all(|deferred| deferred.resolved));
+    }
+
+    #[test]
+    fn diagnoses_invalid_try_operands_and_error_payload_mismatches_once() {
+        with_semantic_result(
+            concat!(
+                "type Failed(int | Error(str)); ",
+                "fn mismatch(value Failed) int | Error(bool) { value? } ",
+                "fn main() { plain := 1?; }",
+            ),
+            |result| {
+                let diagnostics = result.diagnostics.to_string();
+                assert!(diagnostics.contains("Error payload does not match"), "{diagnostics}");
+                assert!(diagnostics.contains("operand must be a union containing Error"), "{diagnostics}");
+            },
+        );
     }
 }

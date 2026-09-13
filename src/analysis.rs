@@ -74,6 +74,7 @@ pub(crate) enum CallableResolution {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ResolvedType {
+    Unit,
     Primitive(PrimitiveType),
     List(TypeId),
     Map { key: TypeId, value: TypeId },
@@ -90,13 +91,12 @@ pub(crate) enum UnionAlternative {
 
 /// The outcome of analyzing a construct which may or may not produce a value.
 ///
-/// `NoValue` and `Never` are deliberately outside `ResolvedType`: neither is a
-/// language value type. `Error` suppresses cascades without manufacturing a
+/// `Never` is deliberately outside `ResolvedType`: it is not a language value
+/// type. `Error` suppresses cascades without manufacturing a
 /// valid type, while `Deferred` makes later flow-sensitive work explicit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TypeState {
     Resolved(TypeId),
-    NoValue,
     Never,
     Error,
     Deferred(DeferredId),
@@ -468,6 +468,7 @@ impl TypeTable {
     const STR: TypeId = TypeId(2);
     const BOOL: TypeId = TypeId(3);
     const CHAR: TypeId = TypeId(4);
+    const UNIT: TypeId = TypeId(5);
 
     fn new() -> Self {
         Self {
@@ -477,6 +478,7 @@ impl TypeTable {
                 ResolvedType::Primitive(PrimitiveType::Str),
                 ResolvedType::Primitive(PrimitiveType::Bool),
                 ResolvedType::Primitive(PrimitiveType::Char),
+                ResolvedType::Unit,
             ],
         }
     }
@@ -489,6 +491,10 @@ impl TypeTable {
             PrimitiveType::Bool => Self::BOOL,
             PrimitiveType::Char => Self::CHAR,
         }
+    }
+
+    pub(crate) fn unit(&self) -> TypeId {
+        Self::UNIT
     }
 
     pub(crate) fn intern(&mut self, ty: ResolvedType) -> TypeId {
@@ -1105,7 +1111,7 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
             let result = function
                 .return_type
                 .as_ref()
-                .map_or(TypeState::NoValue, |ty| self.resolve_type(ty));
+                .map_or(TypeState::Resolved(self.types.unit()), |ty| self.resolve_type(ty));
             self.function_signatures.push(FunctionSignature {
                 id,
                 node: function,
@@ -1117,6 +1123,7 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
 
     fn resolve_type(&mut self, node: &'ast Type) -> TypeState {
         let state = match &node.kind {
+            TypeKind::Unit => TypeState::Resolved(self.types.unit()),
             TypeKind::Primitive(primitive) => {
                 TypeState::Resolved(self.types.primitive(*primitive))
             }
@@ -1294,6 +1301,7 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
 
     fn is_valid_map_key(&self, ty: TypeId, visiting: &mut Vec<TypeDeclarationId>) -> bool {
         match self.types.get(ty) {
+            ResolvedType::Unit => true,
             ResolvedType::Primitive(
                 PrimitiveType::Int | PrimitiveType::Str | PrimitiveType::Bool,
             ) => true,
@@ -1397,7 +1405,7 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
         dependencies: &mut Vec<TypeDeclarationId>,
     ) {
         match self.types.get(ty) {
-            ResolvedType::Primitive(_) | ResolvedType::List(_) | ResolvedType::Map { .. } => {}
+            ResolvedType::Unit | ResolvedType::Primitive(_) | ResolvedType::List(_) | ResolvedType::Map { .. } => {}
             ResolvedType::Nominal(id) => dependencies.push(*id),
             ResolvedType::Union(alternatives) => {
                 for alternative in alternatives.iter() {
@@ -1494,7 +1502,7 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
             .collect::<Vec<_>>();
         for (function, result) in functions {
             let expected = match result {
-                TypeState::Resolved(ty) => Some(ty),
+                TypeState::Resolved(ty) if ty != self.types.unit() => Some(ty),
                 _ => None,
             };
             ExpectedTypeResolver::new(self, result)
@@ -1673,7 +1681,8 @@ impl<'analysis, 'source, 'ast> BodyResolver<'analysis, 'source, 'ast> {
             ExpressionKind::Identifier(identifier) => {
                 self.resolve_value_name(identifier, BindingAccess::Read);
             }
-            ExpressionKind::Integer
+            ExpressionKind::Unit
+            | ExpressionKind::Integer
             | ExpressionKind::Float
             | ExpressionKind::String(_)
             | ExpressionKind::Character(_)
@@ -1924,19 +1933,13 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
         block
             .value
             .as_ref()
-            .map_or(TypeState::NoValue, |value| self.infer_expression(value))
+            .map_or(TypeState::Resolved(self.analysis.types.unit()), |value| self.infer_expression(value))
     }
 
     fn infer_statement(&mut self, statement: &'ast Statement) {
         match &statement.kind {
             StatementKind::Local { initializer, .. } => {
-                let state = match self.infer_expression(initializer) {
-                    TypeState::NoValue => self.analysis.error(
-                        initializer.span,
-                        "local initializer must produce a value",
-                    ),
-                    state => state,
-                };
+                let state = self.infer_expression(initializer);
                 let binding = self.analysis.statement_binding(statement);
                 self.analysis.binding_types[binding.0].state = state;
             }
@@ -2114,6 +2117,7 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
 
     fn infer_expression(&mut self, expression: &'ast Expression) -> TypeState {
         let state = match &expression.kind {
+            ExpressionKind::Unit => TypeState::Resolved(self.analysis.types.unit()),
             ExpressionKind::Identifier(identifier) => self.infer_identifier(identifier),
             ExpressionKind::Integer => self.infer_integer(expression, i64::MAX as u128),
             ExpressionKind::Float => self.infer_float(expression),
@@ -2148,11 +2152,6 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
                     TypeState::Error
                 } else if children.contains(&TypeState::Never) {
                     TypeState::Never
-                } else if children.contains(&TypeState::NoValue) {
-                    self.analysis.error(
-                        expression.span,
-                        "list elements must produce values",
-                    )
                 } else {
                     self.defer_expression(expression, DeferredReason::ExpectedType)
                 }
@@ -2167,13 +2166,6 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
                     ] {
                         failed |= state == TypeState::Error;
                         never |= state == TypeState::Never;
-                        if state == TypeState::NoValue {
-                            self.analysis.error(
-                                expression.span,
-                                "map keys and values must produce values",
-                            );
-                            failed = true;
-                        }
                     }
                 }
                 if failed {
@@ -2426,12 +2418,6 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
         {
             return self.defer_expression(expression, DeferredReason::ExpectedType);
         }
-        if states.contains(&TypeState::NoValue) {
-            return self.analysis.error(
-                expression.span,
-                "every if-expression branch must produce a value",
-            );
-        }
         let resolved = states.iter().find_map(|state| match state {
             TypeState::Resolved(ty) => Some(*ty),
             _ => None,
@@ -2668,13 +2654,13 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
         let int = self.analysis.types.primitive(PrimitiveType::Int);
         let method = match self.analysis.types.get(receiver_type).clone() {
             ResolvedType::List(element) => match spelling.as_str() {
-                "append" => Some((BuiltinMethod::ListAppend, Some(element), TypeState::NoValue)),
-                "removeIndex" => Some((BuiltinMethod::ListRemoveIndex, Some(int), TypeState::NoValue)),
+                "append" => Some((BuiltinMethod::ListAppend, Some(element), TypeState::Resolved(self.analysis.types.unit()))),
+                "removeIndex" => Some((BuiltinMethod::ListRemoveIndex, Some(int), TypeState::Resolved(self.analysis.types.unit()))),
                 "len" => Some((BuiltinMethod::ListLen, None, TypeState::Resolved(int))),
                 _ => None,
             },
             ResolvedType::Map { key, .. } => match spelling.as_str() {
-                "removeKey" => Some((BuiltinMethod::MapRemoveKey, Some(key), TypeState::NoValue)),
+                "removeKey" => Some((BuiltinMethod::MapRemoveKey, Some(key), TypeState::Resolved(self.analysis.types.unit()))),
                 "len" => Some((BuiltinMethod::MapLen, None, TypeState::Resolved(int))),
                 _ => None,
             },
@@ -2791,11 +2777,6 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
                 Compatibility::Match
             }
             (TypeState::Deferred(_), _) => Compatibility::Deferred,
-            (TypeState::NoValue, _) => {
-                self.analysis
-                    .error(span, "argument expression does not produce a value");
-                Compatibility::Invalid
-            }
             _ => {
                 self.analysis
                     .error(span, "argument type does not match parameter type");
@@ -2896,7 +2877,7 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
             ResolvedType::Union(_) => {
                 self.defer_expression(expression, DeferredReason::FlowDependentType)
             }
-            ResolvedType::Primitive(_) => self.analysis.error(
+            ResolvedType::Unit | ResolvedType::Primitive(_) => self.analysis.error(
                 expression.span,
                 "primitive value has no accessible member",
             ),
@@ -2939,10 +2920,6 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
                     .error(iterable.span, "for loop requires a list or map iterable"),
             },
             TypeState::Deferred(deferred) => TypeState::Deferred(deferred),
-            TypeState::NoValue => self.analysis.error(
-                iterable.span,
-                "for loop iterable must produce a value",
-            ),
             other => other,
         }
     }
@@ -2969,10 +2946,6 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
             TypeState::Deferred(_) => {
                 self.defer_expression(expression, DeferredReason::FlowDependentType)
             }
-            TypeState::NoValue => self.analysis.error(
-                expression.span,
-                "operand expression does not produce a value",
-            ),
             TypeState::Resolved(_) => unreachable!(),
         }
     }
@@ -3014,17 +2987,13 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
 
     fn non_value_target(
         &mut self,
-        target: &'ast AssignmentTarget,
+        _target: &'ast AssignmentTarget,
         state: TypeState,
     ) -> TypeState {
         match state {
             TypeState::Error => TypeState::Error,
             TypeState::Never => TypeState::Never,
             TypeState::Deferred(deferred) => TypeState::Deferred(deferred),
-            TypeState::NoValue => self.analysis.error(
-                target.span,
-                "assignment receiver does not produce a value",
-            ),
             TypeState::Resolved(_) => unreachable!(),
         }
     }
@@ -3102,7 +3071,7 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
         visiting: &mut Vec<TypeDeclarationId>,
     ) -> bool {
         match self.analysis.types.get(ty) {
-            ResolvedType::Primitive(_) | ResolvedType::List(_) | ResolvedType::Map { .. } => true,
+            ResolvedType::Unit | ResolvedType::Primitive(_) | ResolvedType::List(_) | ResolvedType::Map { .. } => true,
             ResolvedType::Nominal(declaration) => {
                 if visiting.contains(declaration) {
                     return false;
@@ -3149,24 +3118,28 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
 
     fn is_printable(&self, ty: TypeId, visiting: &mut Vec<TypeDeclarationId>) -> bool {
         match self.analysis.types.get(ty) {
-            ResolvedType::Primitive(_) => true,
+            ResolvedType::Unit | ResolvedType::Primitive(_) => true,
             ResolvedType::Nominal(declaration) => {
                 if visiting.contains(declaration) {
                     return false;
                 }
-                let TypeDefinitionKind::Tuple(members) =
-                    &self.analysis.type_definition(*declaration).kind
-                else {
-                    return false;
-                };
                 visiting.push(*declaration);
-                let printable = members.iter().all(|member| {
-                    matches!(member.ty, TypeState::Resolved(ty) if self.is_printable(ty, visiting))
-                });
+                let printable = match &self.analysis.type_definition(*declaration).kind {
+                    TypeDefinitionKind::Tuple(members) => members.iter().all(|member| {
+                        matches!(member.ty, TypeState::Resolved(ty) if self.is_printable(ty, visiting))
+                    }),
+                    TypeDefinitionKind::Union { alternatives, .. } => alternatives.iter().all(|alternative| {
+                        self.is_printable(union_alternative_payload(alternative), visiting)
+                    }),
+                    _ => false,
+                };
                 visiting.pop();
                 printable
             }
-            ResolvedType::List(_) | ResolvedType::Map { .. } | ResolvedType::Union(_) => false,
+            ResolvedType::Union(alternatives) => alternatives.iter().all(|alternative| {
+                self.is_printable(union_alternative_payload(alternative), visiting)
+            }),
+            ResolvedType::List(_) | ResolvedType::Map { .. } => false,
         }
     }
 
@@ -3196,7 +3169,7 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
         for statement in &block.statements {
             self.resolve_statement(statement);
         }
-        block.value.as_ref().map_or(TypeState::NoValue, |value| {
+        block.value.as_ref().map_or(TypeState::Resolved(self.analysis.types.unit()), |value| {
             self.resolve_expression(value, expected)
         })
     }
@@ -3228,7 +3201,7 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
             StatementKind::Return(value) => {
                 if let Some(value) = value {
                     let expected = match self.function_result {
-                        TypeState::Resolved(ty) => Some(ty),
+                        TypeState::Resolved(ty) if ty != self.analysis.types.unit() => Some(ty),
                         _ => None,
                     };
                     self.resolve_expression(value, expected);
@@ -3458,6 +3431,7 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
             .expression_annotation(expression)
             .map_or(TypeState::Error, |annotation| annotation.state);
         let state = match &expression.kind {
+            ExpressionKind::Unit => self.coerce(expression, current, expected),
             ExpressionKind::List(elements) => self.resolve_list(expression, elements, expected),
             ExpressionKind::Map(entries) => self.resolve_map(expression, entries, expected),
             ExpressionKind::TypedEmptyList(ty) | ExpressionKind::TypedEmptyMap(ty) => {
@@ -3719,7 +3693,7 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
             ResolvedType::Primitive(PrimitiveType::Str) => {
                 self.resolve_method_member(member, &["len"])
             }
-            ResolvedType::Primitive(_) => self.analysis.error(
+            ResolvedType::Unit | ResolvedType::Primitive(_) => self.analysis.error(
                 expression.span,
                 "primitive value has no accessible member",
             ),
@@ -3775,9 +3749,6 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
         }
         if states.iter().any(|state| *state == TypeState::Never) {
             return TypeState::Never;
-        }
-        if states.iter().any(|state| *state == TypeState::NoValue) {
-            return TypeState::Error;
         }
         if let Some(deferred) = states.iter().find(|state| matches!(state, TypeState::Deferred(_))) {
             return *deferred;
@@ -3841,12 +3812,6 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
             .any(|(key, value)| *key == TypeState::Never || *value == TypeState::Never)
         {
             return TypeState::Never;
-        }
-        if states
-            .iter()
-            .any(|(key, value)| *key == TypeState::NoValue || *value == TypeState::NoValue)
-        {
-            return TypeState::Error;
         }
         if let Some(deferred) = states.iter().find_map(|(key, value)| {
             [*key, *value]
@@ -3921,9 +3886,6 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
         }
         states.push(self.resolve_expression_body(else_branch, expected));
         if !valid_conditions || states.iter().any(|state| *state == TypeState::Error) {
-            return TypeState::Error;
-        }
-        if states.iter().any(|state| *state == TypeState::NoValue) {
             return TypeState::Error;
         }
         if let Some(expected) = expected {
@@ -4009,13 +3971,6 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
                                     }
                                 }
                                 TypeState::Error => failed = true,
-                                TypeState::NoValue => {
-                                    self.analysis.error(
-                                        argument.span,
-                                        "print argument must produce a value",
-                                    );
-                                    failed = true;
-                                }
                                 _ => {}
                             }
                             states.push(state);
@@ -4040,7 +3995,7 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
                     }
                     BuiltinMethod::ListAppend
                     | BuiltinMethod::ListRemoveIndex
-                    | BuiltinMethod::MapRemoveKey => TypeState::NoValue,
+                    | BuiltinMethod::MapRemoveKey => TypeState::Resolved(self.analysis.types.unit()),
                 };
                 self.finish_call(expression, &states, result)
             }
@@ -4111,13 +4066,13 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
         let int = self.analysis.types.primitive(PrimitiveType::Int);
         let method = match self.analysis.types.get(receiver).clone() {
             ResolvedType::List(element) => match spelling.as_str() {
-                "append" => Some((BuiltinMethod::ListAppend, Some(element), TypeState::NoValue)),
-                "removeIndex" => Some((BuiltinMethod::ListRemoveIndex, Some(int), TypeState::NoValue)),
+                "append" => Some((BuiltinMethod::ListAppend, Some(element), TypeState::Resolved(self.analysis.types.unit()))),
+                "removeIndex" => Some((BuiltinMethod::ListRemoveIndex, Some(int), TypeState::Resolved(self.analysis.types.unit()))),
                 "len" => Some((BuiltinMethod::ListLen, None, TypeState::Resolved(int))),
                 _ => None,
             },
             ResolvedType::Map { key, .. } => match spelling.as_str() {
-                "removeKey" => Some((BuiltinMethod::MapRemoveKey, Some(key), TypeState::NoValue)),
+                "removeKey" => Some((BuiltinMethod::MapRemoveKey, Some(key), TypeState::Resolved(self.analysis.types.unit()))),
                 "len" => Some((BuiltinMethod::MapLen, None, TypeState::Resolved(int))),
                 _ => None,
             },
@@ -4180,7 +4135,7 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
         arguments: &[TypeState],
         result: TypeState,
     ) -> TypeState {
-        if arguments.iter().any(|state| matches!(state, TypeState::Error | TypeState::NoValue)) {
+        if arguments.contains(&TypeState::Error) {
             TypeState::Error
         } else if arguments.contains(&TypeState::Never) {
             TypeState::Never
@@ -4370,13 +4325,7 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
             return TypeState::Resolved(result_type);
         }
         let state = self.resolve_argument(argument, None);
-        let TypeState::Resolved(actual) = state else {
-            return if state == TypeState::NoValue {
-                self.analysis.error(argument.span, "union constructor argument must produce a value")
-            } else {
-                state
-            };
-        };
+        let TypeState::Resolved(actual) = state else { return state; };
         let matches = alternatives.iter().filter(|alternative| {
             matches!(alternative, UnionAlternative::Untagged(ty) if *ty == actual)
         }).cloned().collect::<Vec<_>>();
@@ -4528,7 +4477,6 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
                 TypeState::Resolved(expected)
             }
             TypeState::Never | TypeState::Error | TypeState::Deferred(_) => state,
-            TypeState::NoValue => self.analysis.error(expression.span, "expression does not produce an expected value"),
         }
     }
 
@@ -4549,7 +4497,7 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
 
     fn operand_state(
         &mut self,
-        expression: &'ast Expression,
+        _expression: &'ast Expression,
         state: TypeState,
         deferred: TypeState,
     ) -> TypeState {
@@ -4557,10 +4505,6 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
             TypeState::Error => TypeState::Error,
             TypeState::Never => TypeState::Never,
             TypeState::Deferred(_) => deferred,
-            TypeState::NoValue => self.analysis.error(
-                expression.span,
-                "operand expression does not produce a value",
-            ),
             TypeState::Resolved(_) => unreachable!(),
         }
     }
@@ -4590,7 +4534,7 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
 
     fn target_state(
         &mut self,
-        target: &'ast AssignmentTarget,
+        _target: &'ast AssignmentTarget,
         state: TypeState,
         deferred: TypeState,
     ) -> TypeState {
@@ -4598,10 +4542,6 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
             TypeState::Error => TypeState::Error,
             TypeState::Never => TypeState::Never,
             TypeState::Deferred(_) => deferred,
-            TypeState::NoValue => self.analysis.error(
-                target.span,
-                "assignment receiver does not produce a value",
-            ),
             TypeState::Resolved(_) => unreachable!(),
         }
     }
@@ -4660,7 +4600,7 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
         visiting: &mut Vec<TypeDeclarationId>,
     ) -> bool {
         match self.analysis.types.get(ty) {
-            ResolvedType::Primitive(_) | ResolvedType::List(_) | ResolvedType::Map { .. } => true,
+            ResolvedType::Unit | ResolvedType::Primitive(_) | ResolvedType::List(_) | ResolvedType::Map { .. } => true,
             ResolvedType::Nominal(declaration) => {
                 if visiting.contains(declaration) {
                     return false;
@@ -4696,24 +4636,28 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
 
     fn is_printable(&self, ty: TypeId, visiting: &mut Vec<TypeDeclarationId>) -> bool {
         match self.analysis.types.get(ty) {
-            ResolvedType::Primitive(_) => true,
+            ResolvedType::Unit | ResolvedType::Primitive(_) => true,
             ResolvedType::Nominal(declaration) => {
                 if visiting.contains(declaration) {
                     return false;
                 }
-                let TypeDefinitionKind::Tuple(members) =
-                    &self.analysis.type_definition(*declaration).kind
-                else {
-                    return false;
-                };
                 visiting.push(*declaration);
-                let printable = members.iter().all(|member| {
-                    matches!(member.ty, TypeState::Resolved(ty) if self.is_printable(ty, visiting))
-                });
+                let printable = match &self.analysis.type_definition(*declaration).kind {
+                    TypeDefinitionKind::Tuple(members) => members.iter().all(|member| {
+                        matches!(member.ty, TypeState::Resolved(ty) if self.is_printable(ty, visiting))
+                    }),
+                    TypeDefinitionKind::Union { alternatives, .. } => alternatives.iter().all(|alternative| {
+                        self.is_printable(union_alternative_payload(alternative), visiting)
+                    }),
+                    _ => false,
+                };
                 visiting.pop();
                 printable
             }
-            ResolvedType::List(_) | ResolvedType::Map { .. } | ResolvedType::Union(_) => false,
+            ResolvedType::Union(alternatives) => alternatives.iter().all(|alternative| {
+                self.is_printable(union_alternative_payload(alternative), visiting)
+            }),
+            ResolvedType::List(_) | ResolvedType::Map { .. } => false,
         }
     }
 
@@ -4734,6 +4678,14 @@ fn union_style(alternatives: &[UnionAlternative]) -> UnionStyle {
         UnionStyle::Tagged
     } else {
         UnionStyle::Untagged
+    }
+}
+
+fn union_alternative_payload(alternative: &UnionAlternative) -> TypeId {
+    match alternative {
+        UnionAlternative::Untagged(payload)
+        | UnionAlternative::Tagged { payload, .. }
+        | UnionAlternative::Error(payload) => *payload,
     }
 }
 
@@ -4775,6 +4727,7 @@ pub(crate) fn analyze<'source, 'ast>(
 
     let types = TypeTable::new();
     let str_type = types.primitive(PrimitiveType::Str);
+    let unit_type = types.unit();
     let binding_types = (0..bindings.len())
         .map(|index| BindingTypeAnnotation {
             binding: BindingId(index),
@@ -4805,13 +4758,13 @@ pub(crate) fn analyze<'source, 'ast>(
                 id: IntrinsicId::Print,
                 name: "print",
                 arguments: IntrinsicArguments::OnePrintable,
-                result: TypeState::NoValue,
+                result: TypeState::Resolved(unit_type),
             },
             IntrinsicSignature {
                 id: IntrinsicId::Println,
                 name: "println",
                 arguments: IntrinsicArguments::ZeroOrOnePrintable,
-                result: TypeState::NoValue,
+                result: TypeState::Resolved(unit_type),
             },
             IntrinsicSignature {
                 id: IntrinsicId::Panic,
@@ -4949,7 +4902,8 @@ fn collect_expression_bindings<'ast>(
     bindings: &mut Vec<BindingRecord<'ast>>,
 ) {
     match &expression.kind {
-        ExpressionKind::Identifier(_)
+        ExpressionKind::Unit
+        | ExpressionKind::Identifier(_)
         | ExpressionKind::Integer
         | ExpressionKind::Float
         | ExpressionKind::String(_)
@@ -5460,7 +5414,7 @@ mod tests {
             vec![
                 ("recurse", TypeState::Resolved(int)),
                 ("recurse", TypeState::Resolved(int)),
-                ("print", TypeState::NoValue),
+                ("print", TypeState::Resolved(analysis.types.unit())),
                 ("panic", TypeState::Never),
             ]
         );
@@ -5671,8 +5625,7 @@ mod tests {
         let list = analysis.types.intern(ResolvedType::List(int));
         assert_eq!(analysis.types.get(list), &ResolvedType::List(int));
         assert_eq!(analysis.types.intern(ResolvedType::List(int)), list);
-        assert_ne!(TypeState::Resolved(int), TypeState::NoValue);
-        assert_ne!(TypeState::NoValue, TypeState::Never);
+        assert_ne!(TypeState::Resolved(int), TypeState::Resolved(analysis.types.unit()));
         assert_ne!(TypeState::Never, TypeState::Error);
     }
 
@@ -5980,6 +5933,23 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn gives_unit_ordinary_value_container_map_key_and_print_semantics() {
+        let source = source(concat!(
+            "type Result(int | Error(str)); ",
+            "fn identity(value ()) () { value } ",
+            "fn main() () { item := (); items := [()]; table := {(): ()}; ",
+            "identity(item); print(()); print(Result(1)); }",
+        ));
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        assert!(analysis.diagnostics.is_empty(), "{}", analysis.diagnostics);
+        let unit = TypeState::Resolved(analysis.types.unit());
+        assert_eq!(analysis.function_signature(analysis.function_by_name("identity").unwrap()).result, unit);
+        assert_eq!(analysis.function_signature(analysis.function_by_name("main").unwrap()).result, unit);
+        assert_eq!(analysis.binding_type(binding_named(&analysis, &source, "item")), unit);
     }
 
 }

@@ -1,5 +1,5 @@
-// Walking skeleton: milestone 3 supplies analyzed names, types, constructors, and
-// expected types to the compiler pipeline; milestone 4 expands the temporary backend.
+// Walking skeleton: milestone 5 supplies a complete semantic proof to the
+// deliberately limited milestone 4 temporary backend.
 #[allow(dead_code)]
 mod analysis;
 mod ast;

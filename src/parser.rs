@@ -275,6 +275,12 @@ impl<'source> Parser<'source> {
             }
             TokenKind::LeftParen => {
                 self.current += 1;
+                if let Some(close) = self.take(&TokenKind::RightParen) {
+                    return Ok(Type {
+                        kind: TypeKind::Unit,
+                        span: Span::new(token.span.start, close.span.end),
+                    });
+                }
                 let inner = self.parse_type()?;
                 let end = self
                     .expect(
@@ -1029,6 +1035,12 @@ impl<'source> Parser<'source> {
             )?
             .span
             .start;
+        if let Some(close) = self.take(&TokenKind::RightParen) {
+            return Ok(Expression {
+                kind: ExpressionKind::Unit,
+                span: Span::new(start, close.span.end),
+            });
+        }
         let inner = self.parse_expression()?;
         let end = self
             .expect(
@@ -2022,5 +2034,17 @@ mod tests {
         for line in [2, 3, 4] {
             assert_eq!(rendered.matches(&format!("test.sao2:{line}:")).count(), 1);
         }
+    }
+
+    #[test]
+    fn parses_unit_types_values_and_keeps_nonempty_parentheses_as_grouping() {
+        let function = function_declaration("fn identity(value ()) () { result := (); (result) }");
+        assert!(matches!(function.parameters[0].ty.kind, TypeKind::Unit));
+        assert!(matches!(function.return_type.as_ref().unwrap().kind, TypeKind::Unit));
+        let StatementKind::Local { initializer, .. } = &function.body.statements[0].kind else {
+            panic!("expected local declaration");
+        };
+        assert!(matches!(initializer.kind, ExpressionKind::Unit));
+        assert!(matches!(function.body.value.as_deref().unwrap().kind, ExpressionKind::Parenthesized(_)));
     }
 }

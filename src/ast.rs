@@ -69,6 +69,7 @@ pub struct Type {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypeKind {
+    Unit,
     Primitive(PrimitiveType),
     Named(Identifier),
     List(Box<Type>),
@@ -206,6 +207,7 @@ pub struct Expression {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExpressionKind {
+    Unit,
     Identifier(Identifier),
     Integer,
     Float,
