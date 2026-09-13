@@ -64,9 +64,9 @@ impl fmt::Display for CompileError {
 }
 
 /// Stable orchestration boundary from loaded SAO2 source through parsing,
-/// name-and-type analysis, and semantic analysis to generated C. The
-/// analyzed-AST-to-C subset remains temporary until the typed backend replaces
-/// it.
+/// name-and-type analysis, semantic analysis, and checked semantic handoff to
+/// generated C. The analyzed-AST-to-C subset remains temporary until the typed
+/// backend replaces it.
 pub(crate) fn compile(source: &SourceFile) -> Result<CompileOutput, CompileFailure> {
     compile_into(source, Path::new("build"))
 }
@@ -102,9 +102,20 @@ fn compile_into_with_semantic(
             warnings: semantic.warnings,
         });
     }
-    let entry_point = semantic
-        .entry_point
-        .expect("a diagnostic-free semantic result has a valid entry point");
+    if let Err(error) = semantic::validate_handoff(&analysis, &semantic) {
+        return Err(CompileFailure {
+            error: CompileError::Diagnostic(error),
+            warnings: semantic.warnings,
+        });
+    }
+    let Some(entry_point) = semantic.entry_point else {
+        return Err(CompileFailure {
+            error: CompileError::Diagnostic(Diagnostic::compiler(
+                "semantic handoff lost its validated entry point",
+            )),
+            warnings: semantic.warnings,
+        });
+    };
     let main = analysis.function_signature(entry_point.function_id());
     let generated_c = match c_emitter::emit(source, &program, &analysis, main) {
         Ok(generated_c) => generated_c,
@@ -409,6 +420,36 @@ mod tests {
         assert!(output.warnings.to_string().contains("synthetic warning"));
         assert!(output.generated_c.exists());
         fs::remove_dir_all(build_directory).unwrap();
+    }
+
+    #[test]
+    fn handoff_failure_precedes_backend_and_preserves_warnings_and_output() {
+        for existing in [false, true] {
+            let source = source("fn main() { return; after := (); }");
+            let build_directory = temporary_directory("handoff-failure");
+            let output_path = build_directory.join("program.c");
+            if existing {
+                fs::create_dir(&build_directory).unwrap();
+                fs::write(&output_path, "existing generated C").unwrap();
+            }
+
+            let failure = compile_into_with_semantic_result(
+                &source,
+                &build_directory,
+                |result| result.entry_point = None,
+            )
+            .unwrap_err();
+
+            assert!(failure.to_string().contains("semantic handoff invariant"));
+            assert!(!failure.to_string().contains("temporary backend"));
+            assert!(failure.warnings.to_string().contains("unreachable source"));
+            if existing {
+                assert_eq!(fs::read_to_string(&output_path).unwrap(), "existing generated C");
+                fs::remove_dir_all(build_directory).unwrap();
+            } else {
+                assert!(!build_directory.exists());
+            }
+        }
     }
 
     #[test]

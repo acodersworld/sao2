@@ -90,7 +90,7 @@ runs through generated C immediately after name and type resolution.
 
 ## 5. Semantic analysis
 
-Status: current.
+Status: complete.
 
 The phase breakdown for this milestone is in
 [Current Work: Semantic Analysis](CURRENT_WORK.md).
@@ -104,6 +104,8 @@ The phase breakdown for this milestone is in
 Outcome: every accepted program is type-correct and ready for lowering.
 
 ## 6. Typed intermediate representation
+
+Status: current.
 
 - Lower the syntax tree into a small typed IR.
 - Make evaluation order, temporary values, and control-flow edges explicit.

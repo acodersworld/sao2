@@ -1,22 +1,22 @@
 //! Flow-sensitive semantic validation over completed name-and-type analysis.
 //!
-//! Phase 1 establishes this boundary and gives it ownership of executable entry
-//! point validation. Phase 2 adds mutability authorization. Phase 3 records
-//! structural control flow, validates returns and loop control, and diagnoses
-//! unreachable regions. Phase 4 resolves contextual union operations, applies
-//! branch-local narrowing, proves switch coverage, and recomposes those flow
-//! obligations.
+//! The completed pass owns entry-point validation, mutation authorization,
+//! structural control flow, returns and loop targets, unreachable warnings,
+//! contextual union operations and narrowing, switch coverage, and postfix
+//! error propagation. `validate_handoff` is the mandatory checked boundary for
+//! downstream lowering.
 
 use crate::analysis::{
     AccessPathStep, Analysis, BindingAccess, BindingId, BuiltinMethod, CallTarget,
-    CallableId, CallResolution, DeferredId, FunctionId, FunctionSignature, NameResolution,
-    ResolvedType, TypeDefinitionKind, TypeId, TypeState, UnionAlternative, UnionStyle,
+    AstNode, BindingNode, CallableId, CallResolution, ConstructorKind, DeclarationId,
+    DeclarationNode, DeferredId, FunctionId, FunctionSignature, NameResolution, ResolvedType,
+    TypeDefinitionKind, TypeId, TypeState, UnionAlternative, UnionStyle,
 };
 use crate::ast::{
     Argument, ArgumentKind, AssignmentOperator, AssignmentTarget, BinaryOperator, Block,
-    Expression, ExpressionBody, ExpressionBodyKind, ExpressionKind, FunctionDeclaration, Member,
-    PrimitiveType, Statement, StatementBody, StatementBodyKind, StatementKind, SwitchArm, Type,
-    TypeKind,
+    Declaration, Expression, ExpressionBody, ExpressionBodyKind, ExpressionKind,
+    FunctionDeclaration, Member, PrimitiveType, Program, Statement, StatementBody,
+    StatementBodyKind, StatementKind, SwitchArm, Type, TypeKind, TypeMemberKind,
 };
 use crate::diagnostic::{Diagnostic, Diagnostics, Warnings};
 use crate::source::Span;
@@ -105,7 +105,7 @@ pub(crate) struct MutabilityResolution<'ast> {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // Phase 4 consumes and resolves these obligations.
+#[allow(dead_code)] // Retained until the handoff gate proves none remain.
 pub(crate) struct DeferredMutability<'ast> {
     pub(crate) subject: MutabilitySubject<'ast>,
     pub(crate) root: Option<BindingId>,
@@ -173,6 +173,9 @@ pub(crate) struct SemanticResult<'ast> {
     pub(crate) entry_point: Option<EntryPoint>,
     #[allow(dead_code)] // Consumed by typed-IR lowering.
     pub(crate) mutability: Vec<MutabilityResolution<'ast>>,
+    /// Subjects classified as requiring authorization, retained so handoff
+    /// coverage does not repeat the mutability decision.
+    pub(crate) mutation_subjects: Vec<MutabilitySubject<'ast>>,
     #[allow(dead_code)] // Retained only for obligations whose input is postfix `?`.
     pub(crate) deferred_mutability: Vec<DeferredMutability<'ast>>,
     #[allow(dead_code)] // Consumed by typed-IR lowering.
@@ -352,7 +355,7 @@ pub(crate) struct LoopControl<'ast> {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // Phase 4 recomposes these after proving switch coverage.
+#[allow(dead_code)] // Retained to diagnose any incomplete flow recomposition.
 pub(crate) enum DeferredFlowKind<'ast> {
     FunctionReturn {
         function: FunctionId,
@@ -370,14 +373,14 @@ pub(crate) enum DeferredFlowKind<'ast> {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // Phase 4 recomposes these after proving switch coverage.
+#[allow(dead_code)] // Retained to diagnose any incomplete flow recomposition.
 pub(crate) struct DeferredFlow<'ast> {
     pub(crate) kind: DeferredFlowKind<'ast>,
     pub(crate) switches: Box<[&'ast Statement]>,
 }
 
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // Variants are retained for Phase 4 recomposition and typed-IR lowering.
+#[allow(dead_code)] // Variants are retained for completed flow facts and typed-IR lowering.
 pub(crate) enum FlowSubject<'ast> {
     Block(&'ast Block),
     Statement(&'ast Statement),
@@ -438,7 +441,7 @@ pub(crate) fn analyze<'ast>(analysis: &mut Analysis<'_, 'ast>) -> SemanticResult
     let mut warnings = Warnings::new();
     let (union_tests, switches, tries) =
         UnionValidator::new(analysis, &mut diagnostics, &mut warnings).validate();
-    let (mutability, deferred_mutability) =
+    let (mutability, deferred_mutability, mutation_subjects) =
         MutabilityValidator::new(analysis, &mut diagnostics).validate();
     let mut flow = FlowValidator::new(analysis, &mut diagnostics, &mut warnings, &switches, &tries).validate();
     flow.deferred.retain(|obligation| {
@@ -449,26 +452,13 @@ pub(crate) fn analyze<'ast>(analysis: &mut Analysis<'_, 'ast>) -> SemanticResult
             })
         })
     });
-    if diagnostics.is_empty() {
-        assert!(
-            analysis.deferred.iter().all(|deferred| deferred.resolved),
-            "diagnostic-free semantic analysis retained an unresolved deferred record"
-        );
-        assert!(
-            deferred_mutability.is_empty(),
-            "diagnostic-free semantic analysis retained deferred mutability"
-        );
-        assert!(
-            flow.deferred.is_empty(),
-            "diagnostic-free semantic analysis retained deferred flow"
-        );
-    }
     debug_assert!(entry_point.is_some() || !diagnostics.is_empty());
     SemanticResult {
         diagnostics,
         warnings,
         entry_point,
         mutability,
+        mutation_subjects,
         deferred_mutability,
         union_tests,
         switches,
@@ -516,6 +506,1094 @@ fn valid_main_signature(
         || signature.result
             == TypeState::Resolved(analysis.types.primitive(PrimitiveType::Int));
     parameters_valid && result_valid
+}
+
+/// Checks the complete, diagnostic-free frontend result before any lowering
+/// boundary is allowed to consume it.  This is deliberately recoverable: a
+/// broken compiler invariant must not be reported as a source-language error
+/// or reach backend capability validation.
+pub(crate) fn validate_handoff<'ast>(
+    analysis: &Analysis<'_, 'ast>,
+    semantic: &SemanticResult<'ast>,
+) -> Result<(), Diagnostic> {
+    HandoffValidator::new(analysis, semantic).validate()
+}
+
+fn handoff_error(message: impl Into<String>) -> Diagnostic {
+    Diagnostic::compiler(format!(
+        "semantic handoff invariant violated: {}",
+        message.into()
+    ))
+}
+
+#[derive(Default)]
+struct HandoffSubjects<'ast> {
+    declarations: Vec<&'ast Declaration>,
+    types: Vec<&'ast Type>,
+    expressions: Vec<&'ast Expression>,
+    assignments: Vec<&'ast AssignmentTarget>,
+    calls: Vec<&'ast Expression>,
+    call_callees: Vec<&'ast Expression>,
+    name_identifiers: Vec<&'ast crate::ast::Identifier>,
+    literals: Vec<&'ast Expression>,
+    union_tests: Vec<&'ast Expression>,
+    switches: Vec<&'ast Statement>,
+    tries: Vec<&'ast Expression>,
+    returns: Vec<&'ast Statement>,
+    loop_controls: Vec<&'ast Statement>,
+    loop_targets: Vec<(&'ast Statement, &'ast Statement)>,
+    loops: Vec<&'ast Statement>,
+    blocks: Vec<&'ast Block>,
+    statements: Vec<&'ast Statement>,
+    statement_bodies: Vec<&'ast StatementBody>,
+    expression_bodies: Vec<&'ast ExpressionBody>,
+    switch_arms: Vec<&'ast SwitchArm>,
+    parameters: Vec<&'ast crate::ast::Parameter>,
+    locals: Vec<&'ast Statement>,
+    loop_bindings: Vec<&'ast Statement>,
+    expression_functions: Vec<(&'ast Expression, usize)>,
+    statement_functions: Vec<(&'ast Statement, usize)>,
+    active_loops: Vec<&'ast Statement>,
+    current_function: Option<usize>,
+}
+
+impl<'ast> HandoffSubjects<'ast> {
+    fn collect(program: &'ast Program) -> Self {
+        let mut subjects = Self::default();
+        let mut function_index = 0;
+        for declaration in &program.declarations {
+            subjects.declarations.push(declaration);
+            match declaration {
+                Declaration::Type(declaration) => {
+                    for member in &declaration.members {
+                        match &member.kind {
+                            TypeMemberKind::Named { ty, .. } | TypeMemberKind::Unnamed(ty) => {
+                                subjects.ty(ty);
+                            }
+                        }
+                    }
+                }
+                Declaration::Function(function) => {
+                    subjects.current_function = Some(function_index);
+                    function_index += 1;
+                    for parameter in &function.parameters {
+                        subjects.parameters.push(parameter);
+                        subjects.ty(&parameter.ty);
+                    }
+                    if let Some(ty) = &function.return_type {
+                        subjects.ty(ty);
+                    }
+                    subjects.block(&function.body);
+                    subjects.current_function = None;
+                }
+            }
+        }
+        subjects
+    }
+
+    fn ty(&mut self, ty: &'ast Type) {
+        self.types.push(ty);
+        match &ty.kind {
+            TypeKind::List(element) | TypeKind::Parenthesized(element) => self.ty(element),
+            TypeKind::Map { key, value } => {
+                self.ty(key);
+                self.ty(value);
+            }
+            TypeKind::Union(alternatives) => {
+                for alternative in alternatives.iter() {
+                    self.ty(alternative);
+                }
+            }
+            TypeKind::Tagged { payload, .. } => self.ty(payload),
+            TypeKind::Unit | TypeKind::Primitive(_) | TypeKind::Named(_) => {}
+        }
+    }
+
+    fn block(&mut self, block: &'ast Block) {
+        self.blocks.push(block);
+        for statement in &block.statements {
+            self.statement(statement);
+        }
+        if let Some(value) = block.value.as_deref() {
+            self.expression(value);
+        }
+    }
+
+    fn statement_body(&mut self, body: &'ast StatementBody) {
+        self.statement_bodies.push(body);
+        match &body.kind {
+            StatementBodyKind::Block(block) => self.block(block),
+            StatementBodyKind::Statement(statement) => self.statement(statement),
+        }
+    }
+
+    fn expression_body(&mut self, body: &'ast ExpressionBody) {
+        self.expression_bodies.push(body);
+        match &body.kind {
+            ExpressionBodyKind::Block(block) => self.block(block),
+            ExpressionBodyKind::Expression(expression) => self.expression(expression),
+        }
+    }
+
+    fn statement(&mut self, statement: &'ast Statement) {
+        self.statements.push(statement);
+        if let Some(function) = self.current_function {
+            self.statement_functions.push((statement, function));
+        }
+        match &statement.kind {
+            StatementKind::Local { initializer, .. } => {
+                self.locals.push(statement);
+                self.expression(initializer);
+            }
+            StatementKind::Assignment { target, value, .. } => {
+                self.assignments.push(target);
+                self.name_identifiers.push(&target.root);
+                for suffix in &target.suffixes {
+                    if let crate::ast::AssignmentTargetSuffixKind::Index(index) = &suffix.kind {
+                        self.expression(index);
+                    }
+                }
+                self.expression(value);
+            }
+            StatementKind::Expression(expression) => self.expression(expression),
+            StatementKind::Return(value) => {
+                self.returns.push(statement);
+                if let Some(value) = value {
+                    self.expression(value);
+                }
+            }
+            StatementKind::Break | StatementKind::Continue => {
+                self.loop_controls.push(statement);
+                if let Some(target) = self.active_loops.last().copied() {
+                    self.loop_targets.push((statement, target));
+                }
+            }
+            StatementKind::If { branches, else_body } => {
+                for branch in branches {
+                    self.expression(&branch.condition);
+                    self.statement_body(&branch.body);
+                }
+                if let Some(body) = else_body {
+                    self.statement_body(body);
+                }
+            }
+            StatementKind::While { condition, body } => {
+                self.loops.push(statement);
+                self.expression(condition);
+                self.active_loops.push(statement);
+                self.statement_body(body);
+                self.active_loops.pop();
+            }
+            StatementKind::For { iterable, body, .. } => {
+                self.loops.push(statement);
+                self.loop_bindings.push(statement);
+                self.expression(iterable);
+                self.active_loops.push(statement);
+                self.statement_body(body);
+                self.active_loops.pop();
+            }
+            StatementKind::Switch { value, arms, else_body } => {
+                self.switches.push(statement);
+                self.expression(value);
+                for arm in arms {
+                    self.switch_arms.push(arm);
+                    self.ty(&arm.label);
+                    self.statement_body(&arm.body);
+                }
+                if let Some(body) = else_body {
+                    self.statement_body(body);
+                }
+            }
+            StatementKind::Block(block) => self.block(block),
+        }
+    }
+
+    fn expression(&mut self, expression: &'ast Expression) {
+        self.expressions.push(expression);
+        if let Some(function) = self.current_function {
+            self.expression_functions.push((expression, function));
+        }
+        match &expression.kind {
+            ExpressionKind::Integer
+            | ExpressionKind::Float
+            | ExpressionKind::String(_)
+            | ExpressionKind::Character(_)
+            | ExpressionKind::Boolean(_) => self.literals.push(expression),
+            ExpressionKind::Parenthesized(inner)
+            | ExpressionKind::Unary { operand: inner, .. }
+            | ExpressionKind::Member { value: inner, .. } => self.expression(inner),
+            ExpressionKind::List(elements) => {
+                for element in elements {
+                    self.expression(element);
+                }
+            }
+            ExpressionKind::Map(entries) => {
+                for entry in entries {
+                    self.expression(&entry.key);
+                    self.expression(&entry.value);
+                }
+            }
+            ExpressionKind::TypedEmptyList(ty) | ExpressionKind::TypedEmptyMap(ty) => self.ty(ty),
+            ExpressionKind::Block(block) => self.block(block),
+            ExpressionKind::If { branches, else_branch } => {
+                for branch in branches {
+                    self.expression(&branch.condition);
+                    self.expression_body(&branch.body);
+                }
+                self.expression_body(else_branch);
+            }
+            ExpressionKind::Binary { left, right, .. } => {
+                self.expression(left);
+                self.expression(right);
+            }
+            ExpressionKind::Is { value, ty, .. } => {
+                self.union_tests.push(expression);
+                self.expression(value);
+                self.ty(ty);
+            }
+            ExpressionKind::Call { callee, arguments } => {
+                self.calls.push(expression);
+                self.call_callees.push(callee);
+                self.expression(callee);
+                for argument in arguments {
+                    self.expression(argument_value(argument));
+                }
+            }
+            ExpressionKind::Index { value, index } => {
+                self.expression(value);
+                self.expression(index);
+            }
+            ExpressionKind::Try { value, .. } => {
+                self.tries.push(expression);
+                self.expression(value);
+            }
+            ExpressionKind::Identifier(identifier) => self.name_identifiers.push(identifier),
+            ExpressionKind::Unit => {}
+        }
+    }
+}
+
+struct HandoffValidator<'a, 'source, 'ast> {
+    analysis: &'a Analysis<'source, 'ast>,
+    semantic: &'a SemanticResult<'ast>,
+    subjects: HandoffSubjects<'ast>,
+}
+
+impl<'a, 'source, 'ast> HandoffValidator<'a, 'source, 'ast> {
+    fn new(
+        analysis: &'a Analysis<'source, 'ast>,
+        semantic: &'a SemanticResult<'ast>,
+    ) -> Self {
+        Self {
+            analysis,
+            semantic,
+            subjects: HandoffSubjects::collect(analysis.program),
+        }
+    }
+
+    fn validate(&self) -> Result<(), Diagnostic> {
+        if !self.analysis.diagnostics.is_empty() || !self.semantic.diagnostics.is_empty() {
+            return Err(handoff_error("validator requires diagnostic-free frontend input"));
+        }
+        self.validate_identities()?;
+        self.validate_annotations()?;
+        self.validate_entry_point()?;
+        self.validate_contextual_records()?;
+        self.validate_mutability()?;
+        self.validate_flow()?;
+        Ok(())
+    }
+
+    fn validate_identities(&self) -> Result<(), Diagnostic> {
+        if self.analysis.declarations.len() != self.subjects.declarations.len() {
+            return Err(handoff_error("declaration identity coverage is incomplete"));
+        }
+        let type_count = self.subjects.declarations.iter().filter(|declaration| matches!(declaration, Declaration::Type(_))).count();
+        let function_count = self.subjects.declarations.len() - type_count;
+        if self.analysis.type_definitions.len() != type_count
+            || self.analysis.function_signatures.len() != function_count
+            || self.analysis.type_names.len() != type_count
+            || self.analysis.function_names.len() != function_count
+        {
+            return Err(handoff_error("declaration namespace or definition coverage is incomplete"));
+        }
+        if self.analysis.bindings.len()
+            != self.subjects.parameters.len() + self.subjects.locals.len() + self.subjects.loop_bindings.len()
+        {
+            return Err(handoff_error("binding identity coverage is incomplete"));
+        }
+        if self.analysis.binding_types.len() != self.analysis.bindings.len() {
+            return Err(handoff_error("binding type coverage is incomplete"));
+        }
+        for record in &self.analysis.declarations {
+            let valid_id = match record.id {
+                DeclarationId::Type(id) => id.index() < self.analysis.type_definitions.len(),
+                DeclarationId::Function(id) => id.index() < self.analysis.function_signatures.len(),
+            };
+            if !valid_id || !self.declaration_node_belongs(record.node) {
+                return Err(handoff_error("declaration record has an invalid identity or foreign AST subject"));
+            }
+            if self.analysis.declarations.iter().filter(|candidate| same_declaration_node(candidate.node, record.node)).count() != 1 {
+                return Err(handoff_error("declaration identity subject is duplicated"));
+            }
+        }
+        for (index, binding) in self.analysis.bindings.iter().enumerate() {
+            if binding.id.index() != index || !self.binding_node_belongs(binding.node) {
+                return Err(handoff_error("binding record has an invalid identity or foreign AST subject"));
+            }
+            if self.analysis.bindings.iter().filter(|candidate| same_binding_node(candidate.node, binding.node)).count() != 1 {
+                return Err(handoff_error("binding identity subject is duplicated"));
+            }
+            let annotation = self.analysis.binding_types[index];
+            if annotation.binding != binding.id || !self.final_state(annotation.state) {
+                return Err(handoff_error("binding has a stale or unresolved final type"));
+            }
+        }
+        for (index, definition) in self.analysis.type_definitions.iter().enumerate() {
+            if definition.id.index() != index
+                || !self.declaration_node_belongs(DeclarationNode::Type(definition.node))
+            {
+                return Err(handoff_error("type definition identity is invalid or cross-linked"));
+            }
+            let member_states_valid = match &definition.kind {
+                TypeDefinitionKind::Struct(members) => members.iter().all(|member| matches!(member.ty, TypeState::Resolved(ty) if self.analysis.types.contains(ty))),
+                TypeDefinitionKind::Tuple(members) => members.iter().all(|member| matches!(member.ty, TypeState::Resolved(ty) if self.analysis.types.contains(ty))),
+                TypeDefinitionKind::Union { alternatives, .. } => alternatives.iter().all(|alternative| self.analysis.types.contains(alternative_payload(alternative))),
+                TypeDefinitionKind::Invalid => false,
+            };
+            if !member_states_valid {
+                return Err(handoff_error("type definition retains an invalid member or alternative type"));
+            }
+        }
+        for entry in &self.analysis.type_names {
+            if entry.id.index() >= self.analysis.type_definitions.len()
+                || self.analysis.type_names.iter().filter(|candidate| candidate.name.as_ref() == entry.name.as_ref() || candidate.id == entry.id).count() != 1
+            {
+                return Err(handoff_error("resolved type namespace is invalid or duplicated"));
+            }
+        }
+        for (index, signature) in self.analysis.function_signatures.iter().enumerate() {
+            if signature.id.index() != index
+                || !self.declaration_node_belongs(DeclarationNode::Function(signature.node))
+                || !matches!(signature.result, TypeState::Resolved(ty) if self.analysis.types.contains(ty))
+            {
+                return Err(handoff_error("function signature identity or result type is invalid"));
+            }
+            for parameter in &signature.parameters {
+                if parameter.binding.index() >= self.analysis.bindings.len()
+                    || !self.subjects.parameters.iter().any(|node| std::ptr::eq(*node, parameter.node))
+                    || !matches!(parameter.ty, TypeState::Resolved(ty) if self.analysis.types.contains(ty))
+                {
+                    return Err(handoff_error("function parameter signature is invalid or cross-linked"));
+                }
+            }
+        }
+        for entry in &self.analysis.function_names {
+            if entry.id.index() >= self.analysis.function_signatures.len()
+                || self.analysis.function_names.iter().filter(|candidate| candidate.name.as_ref() == entry.name.as_ref() || candidate.id == entry.id).count() != 1
+            {
+                return Err(handoff_error("resolved function namespace is invalid or duplicated"));
+            }
+        }
+        for (index, deferred) in self.analysis.deferred.iter().enumerate() {
+            if deferred.id.index() != index || !deferred.resolved || !self.ast_node_belongs(deferred.node) {
+                return Err(handoff_error("unresolved or invalid deferred analysis record"));
+            }
+        }
+        if !self.semantic.deferred_mutability.is_empty() || !self.semantic.flow.deferred.is_empty() {
+            return Err(handoff_error("unresolved semantic obligation remains"));
+        }
+        Ok(())
+    }
+
+    fn validate_annotations(&self) -> Result<(), Diagnostic> {
+        for annotation in &self.analysis.type_annotations {
+            if !self.subjects.types.iter().any(|node| std::ptr::eq(*node, annotation.node))
+                || !self.annotation_state_valid(annotation.state)
+            {
+                return Err(handoff_error("type annotation is invalid or has a foreign AST subject"));
+            }
+        }
+        for annotation in &self.analysis.expression_annotations {
+            if !self.contains_expression(annotation.node) || !self.annotation_state_valid(annotation.state) {
+                return Err(handoff_error("expression annotation is invalid or has a foreign AST subject"));
+            }
+        }
+        for annotation in &self.analysis.assignment_targets {
+            if !self.subjects.assignments.iter().any(|node| std::ptr::eq(*node, annotation.node))
+                || !self.annotation_state_valid(annotation.state)
+                || annotation.root.is_some_and(|root| root.index() >= self.analysis.bindings.len())
+                || annotation.steps.iter().any(|step| !self.assignment_step_valid(step, annotation.node))
+            {
+                return Err(handoff_error("assignment annotation is invalid or has a foreign AST subject"));
+            }
+        }
+        for ty in &self.subjects.types {
+            let Some(annotation) = self.analysis.type_annotations.iter().rev().find(|item| std::ptr::eq(item.node, *ty)) else {
+                return Err(handoff_error("type node has no final annotation"));
+            };
+            if !matches!(annotation.state, TypeState::Resolved(ty) if self.analysis.types.contains(ty)) {
+                return Err(handoff_error("type node has a stale or unresolved final annotation"));
+            }
+        }
+        for expression in &self.subjects.expressions {
+            if self.subjects.call_callees.iter().any(|callee| std::ptr::eq(*callee, *expression)) {
+                continue;
+            }
+            let Some(annotation) = self.analysis.expression_annotation(expression) else {
+                return Err(handoff_error("expression has no final annotation"));
+            };
+            if !self.final_state(annotation.state) {
+                return Err(handoff_error("expression has a stale or unresolved final annotation"));
+            }
+        }
+        for literal in &self.subjects.literals {
+            if self.analysis.literals.iter().filter(|item| std::ptr::eq(item.node, *literal)).count() != 1 {
+                return Err(handoff_error("literal annotation coverage is missing or duplicated"));
+            }
+        }
+        if self.analysis.literals.iter().any(|item| !self.subjects.literals.iter().any(|node| std::ptr::eq(*node, item.node))) {
+            return Err(handoff_error("literal annotation has a foreign AST subject"));
+        }
+        for call in &self.subjects.calls {
+            if self.analysis.calls.iter().filter(|item| std::ptr::eq(item.node, *call)).count() != 1 {
+                return Err(handoff_error("call resolution coverage is missing or duplicated"));
+            }
+            let resolution = self.analysis.call_resolution(call).unwrap();
+            if matches!(resolution.target, CallTarget::Unknown | CallTarget::Expression | CallTarget::Binding(_) | CallTarget::Ambiguous { .. } | CallTarget::AmbiguousErrorConstructor { .. }) {
+                return Err(handoff_error("call retained an unresolved or non-callable target"));
+            }
+            if !self.call_target_valid(resolution.target) {
+                return Err(handoff_error("call target contains an invalid stable identity"));
+            }
+            let needs_constructor = matches!(resolution.target, CallTarget::Callable(CallableId::Constructor(_)) | CallTarget::QualifiedConstructor(_) | CallTarget::ErrorConstructor);
+            let constructor_count = self.analysis.constructors.iter().filter(|item| std::ptr::eq(item.node, *call)).count();
+            if constructor_count != usize::from(needs_constructor) {
+                return Err(handoff_error("constructor resolution coverage is missing or duplicated"));
+            }
+        }
+        if self.analysis.calls.iter().any(|item| !self.subjects.calls.iter().any(|node| std::ptr::eq(*node, item.node)) || !self.contains_expression(item.callee)) {
+            return Err(handoff_error("call resolution has a foreign AST subject"));
+        }
+        for identifier in &self.subjects.name_identifiers {
+            if self.analysis.name_uses.iter().filter(|item| std::ptr::eq(item.node, *identifier)).count() != 1 {
+                return Err(handoff_error("name-use resolution coverage is missing or duplicated"));
+            }
+        }
+        for use_ in &self.analysis.name_uses {
+            if !self.subjects.name_identifiers.iter().any(|node| std::ptr::eq(*node, use_.node))
+                || matches!(use_.resolution, NameResolution::Unknown | NameResolution::AmbiguousCall { .. } | NameResolution::AmbiguousErrorConstructor { .. })
+                || !self.name_resolution_valid(use_.resolution)
+            {
+                return Err(handoff_error("name-use resolution is unresolved or cross-linked"));
+            }
+        }
+        for target in &self.subjects.assignments {
+            let Some(annotation) = self.analysis.assignment_target(target) else {
+                return Err(handoff_error("assignment target has no final annotation"));
+            };
+            if annotation.root.is_none()
+                || annotation.steps.len() != target.suffixes.len()
+                || !matches!(annotation.state, TypeState::Resolved(ty) if self.analysis.types.contains(ty))
+            {
+                return Err(handoff_error("executable assignment target has an incomplete typed path"));
+            }
+        }
+        for constructor in &self.analysis.constructors {
+            if !self.contains_expression(constructor.node)
+                || !self.constructor_is_consistent(&constructor.kind)
+            {
+                return Err(handoff_error("constructor resolution is invalid or cross-linked"));
+            }
+        }
+        for (index, subject) in self.analysis.union_injection_subjects.iter().enumerate() {
+            if self.analysis.union_injection_subjects[..index].iter().any(|prior| same_union_injection(prior, subject))
+                || !self.contains_expression(subject.node)
+                || !self.union_has_alternative(subject.union_type, &subject.alternative)
+                || self.analysis.union_injections.iter().filter(|injection| same_union_injection(injection, subject)).count() != 1
+            {
+                return Err(handoff_error("union injection coverage is invalid or incomplete"));
+            }
+        }
+        for (index, injection) in self.analysis.union_injections.iter().enumerate() {
+            if !self.contains_expression(injection.node)
+                || !self.union_has_alternative(injection.union_type, &injection.alternative)
+                || self.analysis.union_injections[..index].iter().any(|prior| std::ptr::eq(prior.node, injection.node) && prior.union_type == injection.union_type)
+                || self.analysis.union_injection_subjects.iter().filter(|subject| same_union_injection(subject, injection)).count() != 1
+            {
+                return Err(handoff_error("union injection is invalid, duplicated, or cross-linked"));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_entry_point(&self) -> Result<(), Diagnostic> {
+        let Some(entry) = self.semantic.entry_point else {
+            return Err(handoff_error("diagnostic-free result has no entry point"));
+        };
+        let id = entry.function_id();
+        let Some(signature) = self.analysis.function_signatures.get(id.index()) else {
+            return Err(handoff_error("entry point has an invalid function identity"));
+        };
+        if signature.id != id
+            || self.analysis.function_by_name("main") != Some(id)
+            || !valid_main_signature(self.analysis, signature)
+        {
+            return Err(handoff_error("entry point disagrees with the resolved main declaration"));
+        }
+        Ok(())
+    }
+
+    fn validate_contextual_records(&self) -> Result<(), Diagnostic> {
+        for expression in &self.subjects.union_tests {
+            if self.semantic.union_tests.iter().filter(|item| std::ptr::eq(item.expression, *expression)).count() != 1 {
+                return Err(handoff_error("union test resolution coverage is missing or duplicated"));
+            }
+        }
+        for resolution in &self.semantic.union_tests {
+            if !self.contains_expression(resolution.expression)
+                || !self.union_has_alternative(resolution.operand_union, &resolution.alternative)
+                || alternative_payload(&resolution.alternative) != resolution.payload
+                || resolution.binding.is_some_and(|id| id.index() >= self.analysis.bindings.len())
+            {
+                return Err(handoff_error("union test resolution is contradictory or cross-linked"));
+            }
+        }
+        for statement in &self.subjects.switches {
+            if self.semantic.switches.iter().filter(|item| std::ptr::eq(item.statement, *statement)).count() != 1 {
+                return Err(handoff_error("switch resolution coverage is missing or duplicated"));
+            }
+        }
+        for resolution in &self.semantic.switches {
+            if !self.contains_statement(resolution.statement)
+                || !resolution.exhaustive
+                || resolution.binding.is_some_and(|id| id.index() >= self.analysis.bindings.len())
+            {
+                return Err(handoff_error("switch resolution is incomplete or cross-linked"));
+            }
+            let StatementKind::Switch { arms, else_body, .. } = &resolution.statement.kind else {
+                return Err(handoff_error("switch resolution refers to a non-switch statement"));
+            };
+            if resolution.arms.len() != arms.len()
+                || resolution.else_body.map(|body| body as *const _) != else_body.as_ref().map(|body| body as *const _)
+            {
+                return Err(handoff_error("switch arm or else coverage is incomplete"));
+            }
+            for arm in &resolution.arms {
+                if !arms.iter().any(|node| std::ptr::eq(node, arm.arm))
+                    || !self.union_has_alternative(resolution.operand_union, &arm.alternative)
+                    || alternative_payload(&arm.alternative) != arm.payload
+                {
+                    return Err(handoff_error("switch alternative resolution is contradictory"));
+                }
+            }
+            if resolution.arms.iter().any(|arm| !resolution.covered.contains(&arm.alternative))
+                || resolution.covered.len() != resolution.arms.len()
+            {
+                return Err(handoff_error("switch covered set disagrees with its unique arms"));
+            }
+            let direct = self.union_alternatives(resolution.operand_union).ok_or_else(|| handoff_error("switch operand identity is not a union"))?;
+            if resolution.covered.iter().any(|alternative| !direct.contains(alternative))
+                || resolution.covered.iter().enumerate().any(|(index, alternative)| resolution.covered[..index].contains(alternative))
+                || (resolution.else_body.is_none() && !direct.iter().all(|alternative| resolution.covered.contains(alternative)))
+            {
+                return Err(handoff_error("switch coverage contradicts its direct alternatives"));
+            }
+        }
+        for expression in &self.subjects.tries {
+            let ExpressionKind::Try { value, .. } = &expression.kind else { unreachable!() };
+            let expected = !matches!(self.analysis.expression_annotation(value).map(|item| item.state), Some(TypeState::Never));
+            let count = self.semantic.tries.iter().filter(|item| std::ptr::eq(item.expression, *expression)).count();
+            if count != usize::from(expected) {
+                return Err(handoff_error("postfix try resolution coverage is missing or duplicated"));
+            }
+        }
+        for resolution in &self.semantic.tries {
+            if !self.contains_expression(resolution.expression)
+                || !self.union_has_alternative(resolution.operand_union, &resolution.source_error)
+                || !matches!(resolution.source_error, UnionAlternative::Error(_))
+                || !self.analysis.types.contains(resolution.success)
+                || self.analysis.expression_annotation(resolution.expression).map(|item| item.state) != Some(TypeState::Resolved(resolution.success))
+            {
+                return Err(handoff_error("postfix try resolution is contradictory or cross-linked"));
+            }
+            let alternatives = self.union_alternatives(resolution.operand_union).unwrap();
+            if alternatives.iter().filter(|alternative| matches!(alternative, UnionAlternative::Error(_))).count() != 1 {
+                return Err(handoff_error("postfix try operand does not have one direct Error alternative"));
+            }
+            let successes = alternatives.iter().filter(|alternative| !matches!(alternative, UnionAlternative::Error(_))).cloned().collect::<Vec<_>>();
+            let success_matches = match successes.as_slice() {
+                [only] => resolution.success == alternative_payload(only),
+                many => matches!(self.analysis.types.get(resolution.success), ResolvedType::Union(actual) if actual.as_ref() == many),
+            };
+            if !success_matches {
+                return Err(handoff_error("postfix try success type contradicts its operand alternatives"));
+            }
+            let Some(function) = self.enclosing_function(resolution.expression) else {
+                return Err(handoff_error("postfix try has no enclosing function"));
+            };
+            match &resolution.action {
+                TryAction::Panic { function: action_function } => {
+                    if *action_function != function || self.semantic.entry_point.map(EntryPoint::function_id) != Some(function) {
+                        return Err(handoff_error("postfix try panic action has the wrong function"));
+                    }
+                }
+                TryAction::Propagate { function: action_function, destination_union, destination_error } => {
+                    let declared = self.analysis.function_signatures[function.index()].result;
+                    if *action_function != function
+                        || self.semantic.entry_point.map(EntryPoint::function_id) == Some(function)
+                        || declared != TypeState::Resolved(*destination_union)
+                        || !self.union_has_alternative(*destination_union, destination_error)
+                        || alternative_payload(destination_error) != alternative_payload(&resolution.source_error)
+                    {
+                        return Err(handoff_error("postfix try propagation action is contradictory"));
+                    }
+                }
+            }
+            let Some(flow) = self.semantic.flow.summaries.iter().find_map(|record| match record.subject {
+                FlowSubject::Expression(node) if std::ptr::eq(node, resolution.expression) => Some(&record.summary),
+                _ => None,
+            }) else {
+                return Err(handoff_error("postfix try has no flow summary"));
+            };
+            let action_flag = match &resolution.action { TryAction::Propagate { .. } => FlowFlags::RETURN, TryAction::Panic { .. } => FlowFlags::DIVERGE };
+            if !flow.flags.contains(action_flag) || flow.fallthrough == FallthroughKind::None {
+                return Err(handoff_error("postfix try flow omits its success or action path"));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_mutability(&self) -> Result<(), Diagnostic> {
+        for target in &self.subjects.assignments {
+            if self.semantic.mutation_subjects.iter().filter(|subject| matches!(subject, MutabilitySubject::Assignment(node) if std::ptr::eq(*node, *target))).count() != 1 {
+                return Err(handoff_error("assignment mutation coverage is missing or duplicated"));
+            }
+        }
+        for (index, subject) in self.semantic.mutation_subjects.iter().enumerate() {
+            if self.semantic.mutation_subjects[..index].iter().any(|prior| same_mutability_subject(*prior, *subject))
+                || !self.mutability_subject_belongs(*subject)
+                || self.semantic.mutability.iter().filter(|resolution| same_mutability_subject(resolution.subject, *subject)).count() != 1
+            {
+                return Err(handoff_error("mutation coverage is invalid or lacks one authorization"));
+            }
+        }
+        for (index, resolution) in self.semantic.mutability.iter().enumerate() {
+            if resolution.root.index() >= self.analysis.bindings.len()
+                || self.semantic.mutability[..index].iter().any(|prior| same_mutability_subject(prior.subject, resolution.subject))
+                || self.semantic.mutation_subjects.iter().filter(|subject| same_mutability_subject(**subject, resolution.subject)).count() != 1
+            {
+                return Err(handoff_error("mutation authorization has an invalid root or duplicate subject"));
+            }
+            match (resolution.subject, &resolution.path) {
+                (MutabilitySubject::Assignment(subject), MutabilityPath::Assignment(path)) => {
+                    let Some(annotation) = self.analysis.assignment_target(subject) else {
+                        return Err(handoff_error("mutation authorization refers to an unannotated assignment"));
+                    };
+                    if annotation.root != Some(resolution.root)
+                        || !self.subjects.assignments.iter().any(|node| std::ptr::eq(*node, subject))
+                        || path.len() != annotation.steps.len()
+                        || !path.iter().zip(annotation.steps.iter()).all(|(left, right)| access_steps_agree(left, right))
+                    {
+                        return Err(handoff_error("assignment mutation path contradicts name/type analysis"));
+                    }
+                    let Some(use_) = self.analysis.name_use(&subject.root) else {
+                        return Err(handoff_error("assignment mutation authorization has no root name use"));
+                    };
+                    if use_.resolution != NameResolution::Binding(resolution.root) || use_.access != resolution.access {
+                        return Err(handoff_error("assignment mutation authorization contradicts root access"));
+                    }
+                }
+                (MutabilitySubject::Receiver { call, receiver }, MutabilityPath::Expression(path)) => {
+                    if !self.contains_expression(call) || !self.contains_expression(receiver) {
+                        return Err(handoff_error("receiver mutation authorization has a foreign AST subject"));
+                    }
+                    if !matches!(self.analysis.call_resolution(call).map(|item| item.target), Some(CallTarget::Builtin(method)) if resolution.operation == MutabilityOperation::MutateReceiver(method)) {
+                        return Err(handoff_error("receiver mutation authorization contradicts its call target"));
+                    }
+                    if path.iter().any(|step| !self.place_step_valid(step)) {
+                        return Err(handoff_error("receiver mutation authorization has an invalid typed path"));
+                    }
+                }
+                (MutabilitySubject::Argument { call, argument }, MutabilityPath::Expression(path)) => {
+                    let ExpressionKind::Call { arguments, .. } = &call.kind else {
+                        return Err(handoff_error("mutable argument authorization refers to a non-call"));
+                    };
+                    if !self.contains_expression(call)
+                        || !arguments.iter().any(|node| std::ptr::eq(node, argument))
+                        || path.iter().any(|step| !self.place_step_valid(step))
+                    {
+                        return Err(handoff_error("mutable argument authorization is invalid or cross-linked"));
+                    }
+                    let MutabilityOperation::MutableArgument { function, parameter } = resolution.operation else {
+                        return Err(handoff_error("mutable argument authorization has the wrong operation"));
+                    };
+                    let Some(signature) = self.analysis.function_signatures.get(function.index()) else {
+                        return Err(handoff_error("mutable argument authorization has an invalid function"));
+                    };
+                    if !signature.parameters.iter().any(|item| item.binding == parameter && item.node.mutable) {
+                        return Err(handoff_error("mutable argument authorization has an invalid parameter"));
+                    }
+                }
+                _ => return Err(handoff_error("mutation subject and typed path category disagree")),
+            }
+            if matches!(resolution.operation, MutabilityOperation::DeferredPath) {
+                return Err(handoff_error("mutation authorization retained a deferred operation"));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_flow(&self) -> Result<(), Diagnostic> {
+        for block in &self.subjects.blocks {
+            self.require_one_flow(FlowSubject::Block(block))?;
+        }
+        for statement in &self.subjects.statements {
+            self.require_one_flow(FlowSubject::Statement(statement))?;
+        }
+        for body in &self.subjects.statement_bodies {
+            self.require_one_flow(FlowSubject::StatementBody(body))?;
+        }
+        for expression in &self.subjects.expressions {
+            self.require_one_flow(FlowSubject::Expression(expression))?;
+        }
+        for body in &self.subjects.expression_bodies {
+            self.require_one_flow(FlowSubject::ExpressionBody(body))?;
+        }
+        for arm in &self.subjects.switch_arms {
+            self.require_one_flow(FlowSubject::SwitchArm(arm))?;
+        }
+        for record in &self.semantic.flow.summaries {
+            if !self.flow_subject_belongs(record.subject)
+                || record.summary.fallthrough == FallthroughKind::SwitchDependent
+                || !record.summary.switch_dependencies.is_empty()
+                || record.summary.flags.contains(FlowFlags::FALLTHROUGH) != (record.summary.fallthrough != FallthroughKind::None)
+            {
+                return Err(handoff_error("flow summary is unresolved, contradictory, or cross-linked"));
+            }
+        }
+        for statement in &self.subjects.returns {
+            if self.semantic.flow.returns.iter().filter(|item| std::ptr::eq(item.statement, *statement)).count() != 1 {
+                return Err(handoff_error("explicit return fact is missing or duplicated"));
+            }
+        }
+        for returned in &self.semantic.flow.returns {
+            if !self.subjects.returns.iter().any(|node| std::ptr::eq(*node, returned.statement))
+                || returned.function.index() >= self.analysis.function_signatures.len()
+                || self.enclosing_statement_function(returned.statement) != Some(returned.function)
+                || returned.value.map(|value| self.analysis.expression_annotation(value).map(|item| item.state))
+                    .unwrap_or(Some(TypeState::Resolved(self.analysis.types.unit()))) != Some(returned.value_state)
+            {
+                return Err(handoff_error("explicit return fact is stale or cross-linked"));
+            }
+            if let Some(alternative) = &returned.unit_injection {
+                let result = self.analysis.function_signatures[returned.function.index()].result;
+                let TypeState::Resolved(result) = result else { unreachable!() };
+                if returned.value.is_some()
+                    || alternative_payload(alternative) != self.analysis.types.unit()
+                    || !self.union_has_alternative(result, alternative)
+                {
+                    return Err(handoff_error("explicit unit return injection is contradictory"));
+                }
+            }
+        }
+        for statement in &self.subjects.loop_controls {
+            if self.semantic.flow.loop_controls.iter().filter(|item| std::ptr::eq(item.statement, *statement)).count() != 1 {
+                return Err(handoff_error("loop-control target is missing or duplicated"));
+            }
+        }
+        for control in &self.semantic.flow.loop_controls {
+            let expected = self.subjects.loop_targets.iter().find_map(|(statement, target)| std::ptr::eq(*statement, control.statement).then_some(*target));
+            if expected.is_none_or(|target| !std::ptr::eq(target, control.target)) {
+                return Err(handoff_error("loop control does not target its nearest enclosing loop"));
+            }
+        }
+        for completion in &self.semantic.flow.completions {
+            let Some(signature) = self.analysis.function_signatures.get(completion.function.index()) else {
+                return Err(handoff_error("function completion has an invalid function identity"));
+            };
+            if !std::ptr::eq(&signature.node.body, completion.body)
+                || self.semantic.flow.completions.iter().filter(|item| std::ptr::eq(item.body, completion.body)).count() != 1
+            {
+                return Err(handoff_error("function completion is duplicated or cross-linked"));
+            }
+            let TypeState::Resolved(result) = signature.result else { unreachable!() };
+            match &completion.unit_injection {
+                None if result == self.analysis.types.unit() => {}
+                Some(alternative) if alternative_payload(alternative) == self.analysis.types.unit()
+                    && self.union_has_alternative(result, alternative) => {}
+                _ => return Err(handoff_error("function completion disagrees with its unit result")),
+            }
+        }
+        for signature in &self.analysis.function_signatures {
+            let summary = self.semantic.flow.summaries.iter().find_map(|record| match record.subject {
+                FlowSubject::Block(block) if std::ptr::eq(block, &signature.node.body) => Some(&record.summary),
+                _ => None,
+            }).ok_or_else(|| handoff_error("function body has no final flow summary"))?;
+            let needs_completion = signature.node.body.value.is_none()
+                && summary.fallthrough == FallthroughKind::Definite
+                && matches!(signature.result, TypeState::Resolved(result) if result == self.analysis.types.unit() || self.unit_alternative_for(result).is_some());
+            let count = self.semantic.flow.completions.iter().filter(|item| item.function == signature.id).count();
+            if count != usize::from(needs_completion) {
+                return Err(handoff_error("implicit function completion coverage is incomplete or duplicated"));
+            }
+        }
+        Ok(())
+    }
+
+    fn require_one_flow(&self, subject: FlowSubject<'ast>) -> Result<(), Diagnostic> {
+        if self.semantic.flow.summaries.iter().filter(|record| same_flow_subject(record.subject, subject)).count() == 1 {
+            Ok(())
+        } else {
+            Err(handoff_error("flow summary coverage is missing or duplicated"))
+        }
+    }
+
+    fn final_state(&self, state: TypeState) -> bool {
+        match state {
+            TypeState::Never => true,
+            TypeState::Resolved(ty) => self.analysis.types.contains(ty),
+            TypeState::Error | TypeState::Deferred(_) => false,
+        }
+    }
+
+    fn annotation_state_valid(&self, state: TypeState) -> bool {
+        match state {
+            TypeState::Resolved(ty) => self.analysis.types.contains(ty),
+            TypeState::Deferred(id) => id.index() < self.analysis.deferred.len(),
+            TypeState::Never | TypeState::Error => true,
+        }
+    }
+
+    fn declaration_node_belongs(&self, node: DeclarationNode<'ast>) -> bool {
+        self.subjects.declarations.iter().any(|declaration| match node {
+            DeclarationNode::Type(right) => match declaration {
+                Declaration::Type(left) => std::ptr::eq(left, right),
+                Declaration::Function(_) => false,
+            },
+            DeclarationNode::Function(right) => match declaration {
+                Declaration::Function(left) => std::ptr::eq(left, right),
+                Declaration::Type(_) => false,
+            },
+        })
+    }
+
+    fn binding_node_belongs(&self, node: BindingNode<'ast>) -> bool {
+        match node {
+            BindingNode::Parameter(node) => self.subjects.parameters.iter().any(|item| std::ptr::eq(*item, node)),
+            BindingNode::Local(node) => self.subjects.locals.iter().any(|item| std::ptr::eq(*item, node)),
+            BindingNode::Loop(node) => self.subjects.loop_bindings.iter().any(|item| std::ptr::eq(*item, node)),
+        }
+    }
+
+    fn ast_node_belongs(&self, node: AstNode<'ast>) -> bool {
+        match node {
+            AstNode::Declaration(node) => self.declaration_node_belongs(node),
+            AstNode::Binding(node) => self.binding_node_belongs(node),
+            AstNode::Type(node) => self.subjects.types.iter().any(|item| std::ptr::eq(*item, node)),
+            AstNode::Statement(node) => self.contains_statement(node),
+            AstNode::Expression(node) => self.contains_expression(node),
+            AstNode::AssignmentTarget(node) => self.subjects.assignments.iter().any(|item| std::ptr::eq(*item, node)),
+        }
+    }
+
+    fn contains_expression(&self, node: &Expression) -> bool {
+        self.subjects.expressions.iter().any(|item| std::ptr::eq(*item, node))
+    }
+
+    fn contains_statement(&self, node: &Statement) -> bool {
+        self.subjects.statements.iter().any(|item| std::ptr::eq(*item, node))
+    }
+
+    fn flow_subject_belongs(&self, subject: FlowSubject<'ast>) -> bool {
+        match subject {
+            FlowSubject::Block(node) => self.subjects.blocks.iter().any(|item| std::ptr::eq(*item, node)),
+            FlowSubject::Statement(node) => self.contains_statement(node),
+            FlowSubject::StatementBody(node) => self.subjects.statement_bodies.iter().any(|item| std::ptr::eq(*item, node)),
+            FlowSubject::Expression(node) => self.contains_expression(node),
+            FlowSubject::ExpressionBody(node) => self.subjects.expression_bodies.iter().any(|item| std::ptr::eq(*item, node)),
+            FlowSubject::SwitchArm(node) => self.subjects.switch_arms.iter().any(|item| std::ptr::eq(*item, node)),
+        }
+    }
+
+    fn mutability_subject_belongs(&self, subject: MutabilitySubject<'ast>) -> bool {
+        match subject {
+            MutabilitySubject::Assignment(node) => self.subjects.assignments.iter().any(|item| std::ptr::eq(*item, node)),
+            MutabilitySubject::Receiver { call, receiver } => self.contains_expression(call) && self.contains_expression(receiver),
+            MutabilitySubject::Argument { call, argument } => matches!(&call.kind, ExpressionKind::Call { arguments, .. } if self.contains_expression(call) && arguments.iter().any(|item| std::ptr::eq(item, argument))),
+        }
+    }
+
+    fn union_alternatives(&self, ty: TypeId) -> Option<&[UnionAlternative]> {
+        if !self.analysis.types.contains(ty) {
+            return None;
+        }
+        match self.analysis.types.get(ty) {
+            ResolvedType::Union(alternatives) => Some(alternatives),
+            ResolvedType::Nominal(declaration) if declaration.index() < self.analysis.type_definitions.len() => {
+                match &self.analysis.type_definitions[declaration.index()].kind {
+                    TypeDefinitionKind::Union { alternatives, .. } => Some(alternatives),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn union_has_alternative(&self, ty: TypeId, alternative: &UnionAlternative) -> bool {
+        self.union_alternatives(ty).is_some_and(|alternatives| alternatives.contains(alternative))
+            && self.analysis.types.contains(alternative_payload(alternative))
+    }
+
+    fn unit_alternative_for(&self, ty: TypeId) -> Option<&UnionAlternative> {
+        let unit = self.analysis.types.unit();
+        let mut matches = self.union_alternatives(ty)?.iter().filter(|alternative| matches!(alternative, UnionAlternative::Untagged(payload) if *payload == unit));
+        let only = matches.next()?;
+        matches.next().is_none().then_some(only)
+    }
+
+    fn constructor_is_consistent(&self, constructor: &ConstructorKind) -> bool {
+        match constructor {
+            ConstructorKind::Struct { declaration, argument_members } => declaration.index() < self.analysis.type_definitions.len()
+                && matches!(&self.analysis.type_definitions[declaration.index()].kind, TypeDefinitionKind::Struct(members) if argument_members.len() == members.len() && argument_members.iter().all(|index| *index < members.len())),
+            ConstructorKind::Tuple(declaration) => declaration.index() < self.analysis.type_definitions.len()
+                && matches!(&self.analysis.type_definitions[declaration.index()].kind, TypeDefinitionKind::Tuple(_)),
+            ConstructorKind::Union { declaration, alternative }
+            | ConstructorKind::TaggedUnion { declaration, alternative } => declaration.index() < self.analysis.type_definitions.len()
+                && matches!(&self.analysis.type_definitions[declaration.index()].kind, TypeDefinitionKind::Union { alternatives, .. } if alternatives.contains(alternative)),
+            ConstructorKind::Error { union_type, alternative } => self.union_has_alternative(*union_type, alternative),
+        }
+    }
+
+    fn call_target_valid(&self, target: CallTarget) -> bool {
+        match target {
+            CallTarget::Callable(CallableId::Function(id)) => id.index() < self.analysis.function_signatures.len(),
+            CallTarget::Callable(CallableId::Constructor(id)) | CallTarget::QualifiedConstructor(id) => id.index() < self.analysis.type_definitions.len(),
+            CallTarget::Callable(CallableId::Intrinsic(_)) | CallTarget::Builtin(_) | CallTarget::ErrorConstructor => true,
+            CallTarget::Binding(_) | CallTarget::Expression | CallTarget::Unknown | CallTarget::Ambiguous { .. } | CallTarget::AmbiguousErrorConstructor { .. } => false,
+        }
+    }
+
+    fn name_resolution_valid(&self, resolution: NameResolution) -> bool {
+        match resolution {
+            NameResolution::Binding(id) => id.index() < self.analysis.bindings.len(),
+            NameResolution::Callable(CallableId::Function(id)) => id.index() < self.analysis.function_signatures.len(),
+            NameResolution::Callable(CallableId::Constructor(id)) => id.index() < self.analysis.type_definitions.len(),
+            NameResolution::Callable(CallableId::Intrinsic(_)) | NameResolution::ErrorConstructor => true,
+            NameResolution::Unknown | NameResolution::AmbiguousCall { .. } | NameResolution::AmbiguousErrorConstructor { .. } => false,
+        }
+    }
+
+    fn place_step_valid(&self, step: &PlaceStep<'ast>) -> bool {
+        match step {
+            PlaceStep::StructMember { node, declaration, member, storage, state } => self.contains_expression(node)
+                && declaration.index() < self.analysis.type_definitions.len()
+                && matches!(&self.analysis.type_definitions[declaration.index()].kind, TypeDefinitionKind::Struct(members) if members.iter().any(|item| std::ptr::eq(item.node, *member) && item.storage == *storage && item.ty == *state))
+                && self.analysis.expression_annotation(node).map(|item| item.state) == Some(*state)
+                && self.final_state(*state),
+            PlaceStep::TupleMember { node, declaration, member, position, state } => self.contains_expression(node)
+                && declaration.index() < self.analysis.type_definitions.len()
+                && matches!(&self.analysis.type_definitions[declaration.index()].kind, TypeDefinitionKind::Tuple(members) if members.iter().any(|item| std::ptr::eq(item.node, *member) && item.position == *position && item.ty == *state))
+                && self.analysis.expression_annotation(node).map(|item| item.state) == Some(*state)
+                && self.final_state(*state),
+            PlaceStep::ListIndex { node, element, state } => self.contains_expression(node) && self.analysis.types.contains(*element) && *state == TypeState::Resolved(*element) && self.analysis.expression_annotation(node).map(|item| item.state) == Some(*state),
+            PlaceStep::MapIndex { node, key, value, state } => self.contains_expression(node) && self.analysis.types.contains(*key) && self.analysis.types.contains(*value) && *state == TypeState::Resolved(*value) && self.analysis.expression_annotation(node).map(|item| item.state) == Some(*state),
+        }
+    }
+
+    fn assignment_step_valid(&self, step: &AccessPathStep<'ast>, target: &AssignmentTarget) -> bool {
+        match step {
+            AccessPathStep::StructMember { suffix, declaration, member, storage, state } => target.suffixes.iter().any(|item| std::ptr::eq(item, *suffix))
+                && declaration.index() < self.analysis.type_definitions.len()
+                && matches!(&self.analysis.type_definitions[declaration.index()].kind, TypeDefinitionKind::Struct(members) if members.iter().any(|item| std::ptr::eq(item.node, *member) && item.storage == *storage && item.ty == *state))
+                && self.annotation_state_valid(*state),
+            AccessPathStep::TupleMember { suffix, declaration, member, position, state } => target.suffixes.iter().any(|item| std::ptr::eq(item, *suffix))
+                && declaration.index() < self.analysis.type_definitions.len()
+                && matches!(&self.analysis.type_definitions[declaration.index()].kind, TypeDefinitionKind::Tuple(members) if members.iter().any(|item| std::ptr::eq(item.node, *member) && item.position == *position && item.ty == *state))
+                && self.annotation_state_valid(*state),
+            AccessPathStep::ListIndex { suffix, element, state } => target.suffixes.iter().any(|item| std::ptr::eq(item, *suffix)) && self.analysis.types.contains(*element) && *state == TypeState::Resolved(*element),
+            AccessPathStep::MapIndex { suffix, key, value, state } => target.suffixes.iter().any(|item| std::ptr::eq(item, *suffix)) && self.analysis.types.contains(*key) && self.analysis.types.contains(*value) && *state == TypeState::Resolved(*value),
+        }
+    }
+
+    fn enclosing_function(&self, expression: &Expression) -> Option<FunctionId> {
+        let index = self.subjects.expression_functions.iter().find_map(|(node, function)| std::ptr::eq(*node, expression).then_some(*function))?;
+        self.analysis.function_signatures.get(index).map(|signature| signature.id)
+    }
+
+    fn enclosing_statement_function(&self, statement: &Statement) -> Option<FunctionId> {
+        let index = self.subjects.statement_functions.iter().find_map(|(node, function)| std::ptr::eq(*node, statement).then_some(*function))?;
+        self.analysis.function_signatures.get(index).map(|signature| signature.id)
+    }
+}
+
+fn access_steps_agree(left: &AccessPathStep<'_>, right: &AccessPathStep<'_>) -> bool {
+    match (left, right) {
+        (AccessPathStep::StructMember { suffix: left_suffix, declaration: left_declaration, member: left_member, storage: left_storage, state: left_state },
+         AccessPathStep::StructMember { suffix: right_suffix, declaration: right_declaration, member: right_member, storage: right_storage, state: right_state }) => {
+            std::ptr::eq(*left_suffix, *right_suffix) && left_declaration == right_declaration && std::ptr::eq(*left_member, *right_member) && left_storage == right_storage && left_state == right_state
+        }
+        (AccessPathStep::TupleMember { suffix: left_suffix, declaration: left_declaration, member: left_member, position: left_position, state: left_state },
+         AccessPathStep::TupleMember { suffix: right_suffix, declaration: right_declaration, member: right_member, position: right_position, state: right_state }) => {
+            std::ptr::eq(*left_suffix, *right_suffix) && left_declaration == right_declaration && std::ptr::eq(*left_member, *right_member) && left_position == right_position && left_state == right_state
+        }
+        (AccessPathStep::ListIndex { suffix: left_suffix, element: left_element, state: left_state },
+         AccessPathStep::ListIndex { suffix: right_suffix, element: right_element, state: right_state }) => {
+            std::ptr::eq(*left_suffix, *right_suffix) && left_element == right_element && left_state == right_state
+        }
+        (AccessPathStep::MapIndex { suffix: left_suffix, key: left_key, value: left_value, state: left_state },
+         AccessPathStep::MapIndex { suffix: right_suffix, key: right_key, value: right_value, state: right_state }) => {
+            std::ptr::eq(*left_suffix, *right_suffix) && left_key == right_key && left_value == right_value && left_state == right_state
+        }
+        _ => false,
+    }
+}
+
+fn same_union_injection(
+    left: &crate::analysis::UnionInjection<'_>,
+    right: &crate::analysis::UnionInjection<'_>,
+) -> bool {
+    std::ptr::eq(left.node, right.node)
+        && left.union_type == right.union_type
+        && left.alternative == right.alternative
+}
+
+fn same_declaration_node(left: DeclarationNode<'_>, right: DeclarationNode<'_>) -> bool {
+    match (left, right) {
+        (DeclarationNode::Type(left), DeclarationNode::Type(right)) => std::ptr::eq(left, right),
+        (DeclarationNode::Function(left), DeclarationNode::Function(right)) => std::ptr::eq(left, right),
+        _ => false,
+    }
+}
+
+fn same_binding_node(left: BindingNode<'_>, right: BindingNode<'_>) -> bool {
+    match (left, right) {
+        (BindingNode::Parameter(left), BindingNode::Parameter(right)) => std::ptr::eq(left, right),
+        (BindingNode::Local(left), BindingNode::Local(right))
+        | (BindingNode::Loop(left), BindingNode::Loop(right)) => std::ptr::eq(left, right),
+        _ => false,
+    }
+}
+
+fn same_mutability_subject(left: MutabilitySubject<'_>, right: MutabilitySubject<'_>) -> bool {
+    match (left, right) {
+        (MutabilitySubject::Assignment(left), MutabilitySubject::Assignment(right)) => std::ptr::eq(left, right),
+        (MutabilitySubject::Receiver { call: left, .. }, MutabilitySubject::Receiver { call: right, .. }) => std::ptr::eq(left, right),
+        (MutabilitySubject::Argument { call: left_call, argument: left }, MutabilitySubject::Argument { call: right_call, argument: right }) => std::ptr::eq(left_call, right_call) && std::ptr::eq(left, right),
+        _ => false,
+    }
+}
+
+fn same_flow_subject(left: FlowSubject<'_>, right: FlowSubject<'_>) -> bool {
+    match (left, right) {
+        (FlowSubject::Block(left), FlowSubject::Block(right)) => std::ptr::eq(left, right),
+        (FlowSubject::Statement(left), FlowSubject::Statement(right)) => std::ptr::eq(left, right),
+        (FlowSubject::StatementBody(left), FlowSubject::StatementBody(right)) => std::ptr::eq(left, right),
+        (FlowSubject::Expression(left), FlowSubject::Expression(right)) => std::ptr::eq(left, right),
+        (FlowSubject::ExpressionBody(left), FlowSubject::ExpressionBody(right)) => std::ptr::eq(left, right),
+        (FlowSubject::SwitchArm(left), FlowSubject::SwitchArm(right)) => std::ptr::eq(left, right),
+        _ => false,
+    }
 }
 
 /// Resolves the contextual union syntax and applies branch-local binding types.
@@ -916,18 +1994,26 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
         if let TypeKind::Named(identifier) = &bare.kind {
             let spelling = self.analysis.identifier_text(identifier.span).to_owned();
             if spelling == "Error" {
-                return alternatives.iter().find(|alternative| matches!(alternative, UnionAlternative::Error(_))).cloned().or_else(|| {
-                    self.error(identifier.span, "union has no Error alternative"); None
-                });
+                let selected = alternatives.iter().find(|alternative| matches!(alternative, UnionAlternative::Error(_))).cloned();
+                if let Some(alternative) = &selected {
+                    self.annotate_contextual_label(label, alternative_payload(alternative));
+                } else {
+                    self.error(identifier.span, "union has no Error alternative");
+                }
+                return selected;
             }
             if style == UnionStyle::Tagged {
                 if self.analysis.type_by_name(&spelling).is_some() {
                     self.error(identifier.span, "tagged union requires a tag label, not a type label");
                     return None;
                 }
-                return alternatives.iter().find(|alternative| matches!(alternative, UnionAlternative::Tagged { tag, .. } if tag.as_ref() == spelling.as_str())).cloned().or_else(|| {
-                    self.error(identifier.span, format!("unknown union tag '{spelling}'")); None
-                });
+                let selected = alternatives.iter().find(|alternative| matches!(alternative, UnionAlternative::Tagged { tag, .. } if tag.as_ref() == spelling.as_str())).cloned();
+                if let Some(alternative) = &selected {
+                    self.annotate_contextual_label(label, alternative_payload(alternative));
+                } else {
+                    self.error(identifier.span, format!("unknown union tag '{spelling}'"));
+                }
+                return selected;
             } else if self.analysis.type_by_name(&spelling).is_none() {
                 self.error(identifier.span, "untagged union requires a type label, not a tag label");
                 return None;
@@ -941,6 +2027,13 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
         alternatives.iter().find(|alternative| matches!(alternative, UnionAlternative::Untagged(payload) if *payload == label_type)).cloned().or_else(|| {
             self.error(label.span, "type label is not an alternative of this union"); None
         })
+    }
+
+    fn annotate_contextual_label(&mut self, label: &'ast Type, payload: TypeId) {
+        self.analysis.annotate_type(label, TypeState::Resolved(payload));
+        if let TypeKind::Parenthesized(inner) = &label.kind {
+            self.annotate_contextual_label(inner, payload);
+        }
     }
 
     fn resolve_label_type(&mut self, ty: &'ast Type) -> Option<TypeId> {
@@ -1122,11 +2215,11 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
                 alternatives.into_iter().filter(|alternative| alternative_payload(alternative) == actual).collect::<Vec<_>>()
             }).unwrap_or_default();
             if let [alternative] = alternatives.as_slice() {
-                self.analysis.union_injections.push(crate::analysis::UnionInjection {
-                    node: value,
-                    union_type: expected,
-                    alternative: alternative.clone(),
-                });
+                self.analysis.record_union_injection(
+                    value,
+                    expected,
+                    alternative.clone(),
+                );
             } else {
                 let message = if expected == self.analysis.types.unit() {
                     "unit-returning function cannot return a non-unit value"
@@ -1146,7 +2239,7 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
             alternatives.into_iter().filter(|alternative| alternative_payload(alternative) == actual).collect::<Vec<_>>()
         }).unwrap_or_default();
         if let [alternative] = alternatives.as_slice() {
-            self.analysis.union_injections.push(crate::analysis::UnionInjection { node: value, union_type: expected, alternative: alternative.clone() });
+            self.analysis.record_union_injection(value, expected, alternative.clone());
         } else {
             self.error(value.span, message);
         }
@@ -1835,6 +2928,7 @@ struct MutabilityValidator<'analysis, 'diagnostics, 'source, 'ast> {
     diagnostics: &'diagnostics mut Diagnostics,
     resolutions: Vec<MutabilityResolution<'ast>>,
     deferred: Vec<DeferredMutability<'ast>>,
+    subjects: Vec<MutabilitySubject<'ast>>,
 }
 
 impl<'analysis, 'diagnostics, 'source, 'ast>
@@ -1849,10 +2943,11 @@ impl<'analysis, 'diagnostics, 'source, 'ast>
             diagnostics,
             resolutions: Vec::new(),
             deferred: Vec::new(),
+            subjects: Vec::new(),
         }
     }
 
-    fn validate(mut self) -> (Vec<MutabilityResolution<'ast>>, Vec<DeferredMutability<'ast>>) {
+    fn validate(mut self) -> (Vec<MutabilityResolution<'ast>>, Vec<DeferredMutability<'ast>>, Vec<MutabilitySubject<'ast>>) {
         for declaration in &self.analysis.program.declarations {
             if let crate::ast::Declaration::Function(function) = declaration {
                 self.visit_block(&function.body);
@@ -1865,7 +2960,8 @@ impl<'analysis, 'diagnostics, 'source, 'ast>
             .sort_by_key(|resolution| mutability_subject_span(resolution.subject));
         self.deferred
             .sort_by_key(|obligation| mutability_subject_span(obligation.subject));
-        (self.resolutions, self.deferred)
+        self.subjects.sort_by_key(|subject| mutability_subject_span(*subject));
+        (self.resolutions, self.deferred, self.subjects)
     }
 
     fn visit_block(&mut self, block: &'ast Block) {
@@ -2055,6 +3151,7 @@ impl<'analysis, 'diagnostics, 'source, 'ast>
         } else {
             MutabilityOperation::Rebind
         };
+        self.subjects.push(MutabilitySubject::Assignment(target));
         if let TypeState::Deferred(deferred) = annotation.state {
             self.deferred.push(DeferredMutability {
                 subject: MutabilitySubject::Assignment(target),
@@ -2096,8 +3193,10 @@ impl<'analysis, 'diagnostics, 'source, 'ast>
                 let ExpressionKind::Member { value: receiver, .. } = &callee.kind else {
                     panic!("built-in method target must have a member callee")
                 };
+                let subject = MutabilitySubject::Receiver { call, receiver };
+                self.subjects.push(subject);
                 self.authorize_place(
-                    MutabilitySubject::Receiver { call, receiver },
+                    subject,
                     receiver,
                     BindingAccess::Mutate,
                     MutabilityOperation::MutateReceiver(method),
@@ -2117,8 +3216,10 @@ impl<'analysis, 'diagnostics, 'source, 'ast>
                     if mutable
                         && matches!(ty, TypeState::Resolved(ty) if self.can_reach_mutable_object(ty, &mut Vec::new()))
                     {
+                        let subject = MutabilitySubject::Argument { call, argument };
+                        self.subjects.push(subject);
                         self.authorize_place(
-                            MutabilitySubject::Argument { call, argument },
+                            subject,
                             argument_value(argument),
                             BindingAccess::Mutate,
                             MutabilityOperation::MutableArgument {
@@ -2154,8 +3255,10 @@ impl<'analysis, 'diagnostics, 'source, 'ast>
             _ => return,
         };
         let root = self.place_root(receiver);
+        let subject = MutabilitySubject::Receiver { call, receiver };
+        self.subjects.push(subject);
         self.deferred.push(DeferredMutability {
-            subject: MutabilitySubject::Receiver { call, receiver },
+            subject,
             root,
             access: BindingAccess::Mutate,
             operation: MutabilityOperation::MutateReceiver(method),
@@ -3041,5 +4144,169 @@ mod tests {
                 assert!(diagnostics.contains("operand must be a union containing Error"), "{diagnostics}");
             },
         );
+    }
+
+    #[test]
+    fn completed_semantic_results_pass_the_handoff_gate() {
+        for text in [
+            "fn main() {}",
+            "fn main() int { var value := 1; value = 2; return value; }",
+            concat!(
+                "type Choice(int | str); fn inspect(value Choice) { ",
+                "if value is int: println(value); ",
+                "switch value { int: return; str: return; } } fn main() {}"
+            ),
+            concat!(
+                "type Result(int | Error(str)); ",
+                "fn pass(value Result) int | Error(str) { value? } ",
+                "fn main() { value := Result(1); println(value?); }"
+            ),
+        ] {
+            let source = source(text);
+            let program = parser::parse(&source).unwrap();
+            let mut analysis = analysis::analyze(&source, &program);
+            assert!(analysis.diagnostics.is_empty(), "{text}: {}", analysis.diagnostics);
+            let result = analyze(&mut analysis);
+            assert!(result.diagnostics.is_empty(), "{text}: {}", result.diagnostics);
+            validate_handoff(&analysis, &result).unwrap_or_else(|error| panic!("{text}: {error}"));
+        }
+    }
+
+    #[test]
+    fn handoff_gate_reports_corruptions_without_panicking() {
+        let source = source("fn main() { var value := 1; value = 2; }");
+        let program = parser::parse(&source).unwrap();
+        let mut analysis = analysis::analyze(&source, &program);
+        let mut result = analyze(&mut analysis);
+        assert!(result.diagnostics.is_empty());
+
+        result.entry_point = None;
+        assert!(validate_handoff(&analysis, &result).unwrap_err().to_string().contains("compiler error"));
+
+        result.entry_point = Some(EntryPoint { function: analysis.function_by_name("main").unwrap() });
+        result.flow.summaries.push(result.flow.summaries[0].clone());
+        assert!(validate_handoff(&analysis, &result).unwrap_err().to_string().contains("flow summary"));
+        result.flow.summaries.pop();
+
+        let expression = program.declarations.iter().find_map(|declaration| match declaration {
+                Declaration::Function(function) => function.body.statements.first().and_then(|statement| match &statement.kind {
+                    StatementKind::Local { initializer, .. } => Some(initializer),
+                    _ => None,
+                }),
+                Declaration::Type(_) => None,
+            }).unwrap();
+        analysis.defer(
+            AstNode::Expression(expression),
+            crate::analysis::DeferredReason::FlowDependentType,
+        );
+        assert!(validate_handoff(&analysis, &result).unwrap_err().to_string().contains("deferred"));
+    }
+
+    #[test]
+    fn handoff_gate_requires_contextual_mutation_loop_and_flow_facts() {
+        fn corrupted(
+            text: &str,
+            mutate: impl FnOnce(&mut SemanticResult<'_>),
+        ) -> String {
+            let source = source(text);
+            let program = parser::parse(&source).unwrap();
+            let mut analysis = analysis::analyze(&source, &program);
+            let mut result = analyze(&mut analysis);
+            assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
+            mutate(&mut result);
+            validate_handoff(&analysis, &result).unwrap_err().to_string()
+        }
+
+        let union_source = concat!(
+            "type Choice(int | str); fn inspect(value Choice) { ",
+            "if value is int: println(value); ",
+            "switch value { int: return; str: return; } } fn main() {}"
+        );
+        assert!(corrupted(union_source, |result| result.union_tests.clear()).contains("union test"));
+        assert!(corrupted(union_source, |result| result.switches.clear()).contains("switch"));
+        assert!(corrupted(union_source, |result| result.switches[0].exhaustive = false).contains("switch"));
+        assert!(corrupted(union_source, |result| {
+            result.union_tests[0].alternative = result.switches[0].arms[1].alternative.clone();
+        }).contains("union test"));
+
+        let try_source = concat!(
+            "type Result(int | Error(str)); ",
+            "fn pass(value Result) int | Error(str) { value? } fn main() {}"
+        );
+        assert!(corrupted(try_source, |result| result.tries.clear()).contains("try"));
+        assert!(corrupted(try_source, |result| {
+            let function = match &result.tries[0].action {
+                TryAction::Propagate { function, .. } => *function,
+                TryAction::Panic { .. } => unreachable!(),
+            };
+            result.tries[0].action = TryAction::Panic { function };
+        }).contains("try"));
+
+        assert!(corrupted(
+            "fn main() { var value := 1; value = 2; }",
+            |result| result.mutability.clear(),
+        ).contains("mutation"));
+        assert!(corrupted(
+            "fn main() { var values := [1]; values.append(2); }",
+            |result| result.mutability.clear(),
+        ).contains("mutation"));
+        assert!(corrupted(
+            "type Box(value int); fn touch(var value Box) {} fn main() { var value := Box(value = 1); touch(value); }",
+            |result| result.mutability.clear(),
+        ).contains("mutation"));
+        assert!(corrupted(
+            "fn main() { while true { break; } }",
+            |result| result.flow.loop_controls.clear(),
+        ).contains("loop-control"));
+        assert!(corrupted(
+            "fn main() { while true { break; } }",
+            |result| {
+                let statement = result.flow.loop_controls[0].statement;
+                result.flow.loop_controls[0].target = statement;
+            },
+        ).contains("loop control"));
+        assert!(corrupted(
+            "fn main() { value := 1; }",
+            |result| { result.flow.summaries.pop(); },
+        ).contains("flow summary"));
+    }
+
+    #[test]
+    fn handoff_gate_rejects_a_foreign_ast_subject() {
+        let primary_source = source("fn main() {}");
+        let program = parser::parse(&primary_source).unwrap();
+        let foreign_source = source("fn main() {}");
+        let foreign_program = parser::parse(&foreign_source).unwrap();
+        let mut analysis = analysis::analyze(&primary_source, &program);
+        let mut result = analyze(&mut analysis);
+
+        let foreign_body = match &foreign_program.declarations[0] {
+            Declaration::Function(function) => &function.body,
+            Declaration::Type(_) => unreachable!(),
+        };
+        result.flow.summaries[0].subject = FlowSubject::Block(foreign_body);
+
+        assert!(validate_handoff(&analysis, &result)
+            .unwrap_err()
+            .to_string()
+            .contains("flow summary"));
+    }
+
+    #[test]
+    fn handoff_gate_requires_union_injection_coverage() {
+        let source = source(
+            "type Choice(int | str); fn take(value Choice) {} fn main() { take(1); }",
+        );
+        let program = parser::parse(&source).unwrap();
+        let mut analysis = analysis::analyze(&source, &program);
+        let result = analyze(&mut analysis);
+        assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
+        assert_eq!(analysis.union_injections.len(), 1);
+        analysis.union_injections.clear();
+
+        assert!(validate_handoff(&analysis, &result)
+            .unwrap_err()
+            .to_string()
+            .contains("union injection"));
     }
 }

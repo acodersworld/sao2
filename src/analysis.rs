@@ -18,8 +18,20 @@ use crate::source::{SourceFile, Span};
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct TypeDeclarationId(usize);
 
+impl TypeDeclarationId {
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct FunctionId(usize);
+
+impl FunctionId {
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum DeclarationId {
@@ -38,6 +50,12 @@ impl BindingId {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct TypeId(usize);
+
+impl TypeId {
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct DeferredId(usize);
@@ -509,6 +527,10 @@ impl TypeTable {
     pub(crate) fn get(&self, id: TypeId) -> &ResolvedType {
         &self.entries[id.0]
     }
+
+    pub(crate) fn contains(&self, id: TypeId) -> bool {
+        id.index() < self.entries.len()
+    }
 }
 
 /// Results owned by the name-and-type analysis stage.
@@ -534,6 +556,9 @@ pub(crate) struct Analysis<'source, 'ast> {
     pub(crate) assignment_targets: Vec<AssignmentTargetAnnotation<'ast>>,
     pub(crate) constructors: Vec<ConstructorResolution<'ast>>,
     pub(crate) union_injections: Vec<UnionInjection<'ast>>,
+    /// Independently retained subjects which require an injection, allowing
+    /// the semantic handoff to validate side-table coverage.
+    pub(crate) union_injection_subjects: Vec<UnionInjection<'ast>>,
     pub(crate) types: TypeTable,
     pub(crate) type_annotations: Vec<TypeAnnotation<'ast>>,
     pub(crate) expression_annotations: Vec<ExpressionAnnotation<'ast>>,
@@ -555,6 +580,21 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
     pub(crate) fn annotate_expression(&mut self, node: &'ast Expression, state: TypeState) {
         self.expression_annotations
             .push(ExpressionAnnotation { node, state });
+    }
+
+    pub(crate) fn record_union_injection(
+        &mut self,
+        node: &'ast Expression,
+        union_type: TypeId,
+        alternative: UnionAlternative,
+    ) {
+        let injection = UnionInjection {
+            node,
+            union_type,
+            alternative,
+        };
+        self.union_injection_subjects.push(injection.clone());
+        self.union_injections.push(injection);
     }
 
     pub(crate) fn resolve_deferred(&mut self, id: DeferredId) {
@@ -4469,11 +4509,11 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
                 let [alternative] = matches.as_slice() else {
                     return self.analysis.error(expression.span, "expression type does not match expected type");
                 };
-                self.analysis.union_injections.push(UnionInjection {
-                    node: expression,
-                    union_type: expected,
-                    alternative: alternative.clone(),
-                });
+                self.analysis.record_union_injection(
+                    expression,
+                    expected,
+                    alternative.clone(),
+                );
                 TypeState::Resolved(expected)
             }
             TypeState::Never | TypeState::Error | TypeState::Deferred(_) => state,
@@ -4746,6 +4786,7 @@ pub(crate) fn analyze<'source, 'ast>(
         assignment_targets: Vec::new(),
         constructors: Vec::new(),
         union_injections: Vec::new(),
+        union_injection_subjects: Vec::new(),
         types,
         type_annotations: Vec::new(),
         expression_annotations: Vec::new(),
