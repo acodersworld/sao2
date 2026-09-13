@@ -42,6 +42,12 @@ pub(crate) struct TypeId(usize);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct DeferredId(usize);
 
+impl DeferredId {
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum IntrinsicId {
     Print,
@@ -545,6 +551,13 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
             .push(ExpressionAnnotation { node, state });
     }
 
+    pub(crate) fn resolve_deferred(&mut self, id: DeferredId) {
+        let deferred = &mut self.deferred[id.index()];
+        assert_eq!(deferred.id, id);
+        assert!(!deferred.resolved, "deferred analysis record resolved more than once");
+        deferred.resolved = true;
+    }
+
     pub(crate) fn defer(
         &mut self,
         node: AstNode<'ast>,
@@ -876,6 +889,35 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
                     self.check_parameter_names(function);
                 }
                 _ => unreachable!("declaration identity must match its AST node"),
+            }
+        }
+    }
+
+    fn reject_reserved_error_bindings(&mut self) {
+        let mut spans = Vec::new();
+        for declaration in &self.program.declarations {
+            match declaration {
+                Declaration::Type(declaration) => {
+                    spans.push(declaration.name.span);
+                    for member in &declaration.members {
+                        if let TypeMemberKind::Named { name, .. } = &member.kind {
+                            spans.push(name.span);
+                        }
+                    }
+                }
+                Declaration::Function(function) => {
+                    spans.push(function.name.span);
+                }
+            }
+        }
+        spans.extend(self.bindings.iter().map(|binding| binding.span));
+        for span in spans {
+            if self.identifier_text(span) == "Error" {
+                self.diagnostics.push(Diagnostic::source(
+                    self.source,
+                    span,
+                    "'Error' is reserved for the built-in error alternative and constructor",
+                ));
             }
         }
     }
@@ -4782,6 +4824,7 @@ pub(crate) fn analyze<'source, 'ast>(
         diagnostics: Diagnostics::new(),
         pending_map_keys: Vec::new(),
     };
+    analysis.reject_reserved_error_bindings();
     analysis.collect_top_level_names();
     analysis.resolve_type_definitions();
     analysis.resolve_function_signatures();
@@ -5259,15 +5302,27 @@ mod tests {
         let error_source = source("type Error(int); fn main() { Error(1); }");
         let error_program = parser::parse(&error_source).unwrap();
         let error_analysis = analyze(&error_source, &error_program);
-        assert!(matches!(
-            error_analysis.calls[0].target,
-            CallTarget::AmbiguousErrorConstructor { .. }
-        ));
         assert!(
             error_analysis
                 .diagnostics
                 .to_string()
-                .contains("declared callable and the special error constructor")
+                .contains("'Error' is reserved")
+        );
+    }
+
+    #[test]
+    fn reserves_error_in_user_defined_identifier_positions() {
+        let source = source(concat!(
+            "type Error(int); type Record(Error int); ",
+            "fn Error(Error int) { Error := 1; for Error in [1] {} } fn main() {}",
+        ));
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        assert_eq!(
+            analysis.diagnostics.to_string().matches("'Error' is reserved").count(),
+            6,
+            "{}",
+            analysis.diagnostics,
         );
     }
 

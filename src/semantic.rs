@@ -3,17 +3,20 @@
 //! Phase 1 establishes this boundary and gives it ownership of executable entry
 //! point validation. Phase 2 adds mutability authorization. Phase 3 records
 //! structural control flow, validates returns and loop control, and diagnoses
-//! unreachable regions while retaining switch-dependent obligations.
+//! unreachable regions. Phase 4 resolves contextual union operations, applies
+//! branch-local narrowing, proves switch coverage, and recomposes those flow
+//! obligations.
 
 use crate::analysis::{
     AccessPathStep, Analysis, BindingAccess, BindingId, BuiltinMethod, CallTarget,
     CallableId, CallResolution, DeferredId, FunctionId, FunctionSignature, NameResolution,
-    ResolvedType, TypeDefinitionKind, TypeId, TypeState, UnionAlternative,
+    ResolvedType, TypeDefinitionKind, TypeId, TypeState, UnionAlternative, UnionStyle,
 };
 use crate::ast::{
     Argument, ArgumentKind, AssignmentOperator, AssignmentTarget, BinaryOperator, Block,
     Expression, ExpressionBody, ExpressionBodyKind, ExpressionKind, FunctionDeclaration, Member,
-    PrimitiveType, Statement, StatementBody, StatementBodyKind, StatementKind, SwitchArm,
+    PrimitiveType, Statement, StatementBody, StatementBodyKind, StatementKind, SwitchArm, Type,
+    TypeKind,
 };
 use crate::diagnostic::{Diagnostic, Diagnostics, Warnings};
 use crate::source::Span;
@@ -111,6 +114,36 @@ pub(crate) struct DeferredMutability<'ast> {
     pub(crate) deferred: DeferredId,
 }
 
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // Consumed by typed-IR lowering.
+pub(crate) struct UnionTestResolution<'ast> {
+    pub(crate) expression: &'ast Expression,
+    pub(crate) operand_union: TypeId,
+    pub(crate) alternative: UnionAlternative,
+    pub(crate) payload: TypeId,
+    pub(crate) binding: Option<BindingId>,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // Consumed by typed-IR lowering.
+pub(crate) struct SwitchArmResolution<'ast> {
+    pub(crate) arm: &'ast SwitchArm,
+    pub(crate) alternative: UnionAlternative,
+    pub(crate) payload: TypeId,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // Consumed by typed-IR lowering.
+pub(crate) struct SwitchResolution<'ast> {
+    pub(crate) statement: &'ast Statement,
+    pub(crate) operand_union: TypeId,
+    pub(crate) binding: Option<BindingId>,
+    pub(crate) arms: Vec<SwitchArmResolution<'ast>>,
+    pub(crate) covered: Box<[UnionAlternative]>,
+    pub(crate) else_body: Option<&'ast StatementBody>,
+    pub(crate) exhaustive: bool,
+}
+
 #[derive(Debug)]
 pub(crate) struct SemanticResult<'ast> {
     pub(crate) diagnostics: Diagnostics,
@@ -118,9 +151,13 @@ pub(crate) struct SemanticResult<'ast> {
     pub(crate) entry_point: Option<EntryPoint>,
     #[allow(dead_code)] // Consumed by typed-IR lowering.
     pub(crate) mutability: Vec<MutabilityResolution<'ast>>,
-    #[allow(dead_code)] // Consumed by Phase 4 narrowing.
+    #[allow(dead_code)] // Retained only for obligations whose input is postfix `?`.
     pub(crate) deferred_mutability: Vec<DeferredMutability<'ast>>,
-    #[allow(dead_code)] // Consumed by Phase 4 and typed-IR lowering.
+    #[allow(dead_code)] // Consumed by typed-IR lowering.
+    pub(crate) union_tests: Vec<UnionTestResolution<'ast>>,
+    #[allow(dead_code)] // Consumed by typed-IR lowering.
+    pub(crate) switches: Vec<SwitchResolution<'ast>>,
+    #[allow(dead_code)] // Consumed by typed-IR lowering.
     pub(crate) flow: FlowFacts<'ast>,
 }
 
@@ -364,10 +401,20 @@ pub(crate) fn analyze<'ast>(analysis: &mut Analysis<'_, 'ast>) -> SemanticResult
         }
     };
 
+    let mut warnings = Warnings::new();
+    let (union_tests, switches) =
+        UnionValidator::new(analysis, &mut diagnostics, &mut warnings).validate();
     let (mutability, deferred_mutability) =
         MutabilityValidator::new(analysis, &mut diagnostics).validate();
-    let mut warnings = Warnings::new();
-    let flow = FlowValidator::new(analysis, &mut diagnostics, &mut warnings).validate();
+    let mut flow = FlowValidator::new(analysis, &mut diagnostics, &mut warnings, &switches).validate();
+    flow.deferred.retain(|obligation| {
+        obligation.switches.is_empty() || obligation.switches.iter().any(|statement| {
+            analysis.deferred.iter().any(|deferred| {
+                !deferred.resolved
+                    && matches!(deferred.node, crate::analysis::AstNode::Statement(node) if std::ptr::eq(node, *statement))
+            })
+        })
+    });
     debug_assert!(entry_point.is_some() || !diagnostics.is_empty());
     SemanticResult {
         diagnostics,
@@ -375,6 +422,8 @@ pub(crate) fn analyze<'ast>(analysis: &mut Analysis<'_, 'ast>) -> SemanticResult
         entry_point,
         mutability,
         deferred_mutability,
+        union_tests,
+        switches,
         flow,
     }
 }
@@ -420,6 +469,683 @@ fn valid_main_signature(
     parameters_valid && result_valid
 }
 
+/// Resolves the contextual union syntax and applies branch-local binding types.
+/// This deliberately runs after ordinary inference: it only revisits nodes whose
+/// type can change as a consequence of a narrowing environment.
+struct UnionValidator<'analysis, 'diagnostics, 'warnings, 'source, 'ast> {
+    analysis: &'analysis mut Analysis<'source, 'ast>,
+    diagnostics: &'diagnostics mut Diagnostics,
+    warnings: &'warnings mut Warnings,
+    tests: Vec<UnionTestResolution<'ast>>,
+    switches: Vec<SwitchResolution<'ast>>,
+    narrowed: Vec<(BindingId, TypeId)>,
+    function_result: TypeState,
+}
+
+impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
+    UnionValidator<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
+{
+    fn new(
+        analysis: &'analysis mut Analysis<'source, 'ast>,
+        diagnostics: &'diagnostics mut Diagnostics,
+        warnings: &'warnings mut Warnings,
+    ) -> Self {
+        Self { analysis, diagnostics, warnings, tests: Vec::new(), switches: Vec::new(), narrowed: Vec::new(), function_result: TypeState::NoValue }
+    }
+
+    fn validate(mut self) -> (Vec<UnionTestResolution<'ast>>, Vec<SwitchResolution<'ast>>) {
+        let functions = self.analysis.function_signatures.iter().map(|signature| (signature.node, signature.result)).collect::<Vec<_>>();
+        for (function, result) in functions {
+            self.narrowed.clear();
+            self.function_result = result;
+            self.block(&function.body);
+            if let Some(value) = function.body.value.as_deref() { self.validate_result_value(value); }
+        }
+        (self.tests, self.switches)
+    }
+
+    fn block(&mut self, block: &'ast Block) {
+        for statement in &block.statements { self.statement(statement); }
+        if let Some(value) = block.value.as_deref() { self.expression(value); }
+    }
+
+    fn statement_body(&mut self, body: &'ast StatementBody) {
+        match &body.kind {
+            StatementBodyKind::Block(block) => self.block(block),
+            StatementBodyKind::Statement(statement) => self.statement(statement),
+        }
+    }
+
+    fn expression_body(&mut self, body: &'ast ExpressionBody) {
+        match &body.kind {
+            ExpressionBodyKind::Block(block) => self.block(block),
+            ExpressionBodyKind::Expression(expression) => { self.expression(expression); }
+        }
+    }
+
+    fn statement(&mut self, statement: &'ast Statement) {
+        match &statement.kind {
+            StatementKind::Local { initializer, .. } => {
+                let state = self.expression(initializer);
+                if let Some(binding) = self.analysis.local_binding(statement)
+                    && matches!(self.analysis.binding_types[binding.index()].state, TypeState::Deferred(_))
+                    && matches!(state, TypeState::Resolved(_))
+                {
+                    self.analysis.binding_types[binding.index()].state = state;
+                }
+            }
+            StatementKind::Assignment { target, value, .. } => {
+                for suffix in &target.suffixes {
+                    if let crate::ast::AssignmentTargetSuffixKind::Index(index) = &suffix.kind { self.expression(index); }
+                }
+                self.retype_assignment_target(target);
+                self.expression(value);
+                if target.suffixes.is_empty()
+                    && let Some(NameResolution::Binding(binding)) = self.analysis.name_use(&target.root).map(|use_| use_.resolution)
+                {
+                    self.remove_narrowing(binding);
+                }
+            }
+            StatementKind::Expression(expression) => { self.expression(expression); }
+            StatementKind::Return(value) => if let Some(value) = value { self.expression(value); self.validate_result_value(value); },
+            StatementKind::Break | StatementKind::Continue => {}
+            StatementKind::If { branches, else_body } => {
+                let outer = self.narrowed.clone();
+                for branch in branches {
+                    self.narrowed.clone_from(&outer);
+                    self.expression(&branch.condition);
+                    if let Some((binding, payload)) = self.direct_test(&branch.condition) {
+                        self.set_narrowing(binding, payload);
+                    }
+                    self.statement_body(&branch.body);
+                }
+                self.narrowed.clone_from(&outer);
+                if let Some(body) = else_body { self.statement_body(body); }
+                self.narrowed = outer;
+                for branch in branches {
+                    if statement_body_may_fallthrough(&branch.body) {
+                        for binding in direct_assignments_in_body(self.analysis, &branch.body) { self.remove_narrowing(binding); }
+                    }
+                }
+                if let Some(body) = else_body {
+                    if statement_body_may_fallthrough(body) {
+                        for binding in direct_assignments_in_body(self.analysis, body) { self.remove_narrowing(binding); }
+                    }
+                }
+            }
+            StatementKind::While { condition, body } => {
+                self.expression(condition);
+                let outer = self.narrowed.clone();
+                if let Some((binding, payload)) = self.direct_test(condition) { self.set_narrowing(binding, payload); }
+                self.statement_body(body);
+                let assigned = direct_assignments_in_body(self.analysis, body);
+                self.narrowed = outer;
+                for binding in assigned { self.remove_narrowing(binding); }
+            }
+            StatementKind::For { iterable, body, .. } => {
+                self.expression(iterable);
+                let assigned = direct_assignments_in_body(self.analysis, body);
+                self.statement_body(body);
+                for binding in assigned { self.remove_narrowing(binding); }
+            }
+            StatementKind::Switch { value, arms, else_body } => self.switch(statement, value, arms, else_body.as_ref()),
+            StatementKind::Block(block) => self.block(block),
+        }
+    }
+
+    fn switch(
+        &mut self,
+        statement: &'ast Statement,
+        value: &'ast Expression,
+        arms: &'ast [SwitchArm],
+        else_body: Option<&'ast StatementBody>,
+    ) {
+        self.expression(value);
+        let state = self.state(value);
+        let binding = exact_binding(self.analysis, value);
+        let Some((union_type, style, alternatives)) = self.union_parts(state) else {
+            if !matches!(state, TypeState::Error | TypeState::Never) {
+                self.error(value.span, "switch operand must have a union type");
+            }
+            for arm in arms { self.statement_body(&arm.body); }
+            if let Some(body) = else_body { self.statement_body(body); }
+            self.resolve_statement_deferred(statement);
+            return;
+        };
+        let outer = self.narrowed.clone();
+        let mut covered = Vec::new();
+        let mut resolved_arms = Vec::new();
+        for arm in arms {
+            let selected = self.resolve_label(&arm.label, style, &alternatives);
+            self.narrowed.clone_from(&outer);
+            if let Some(alternative) = selected {
+                let payload = alternative_payload(&alternative);
+                resolved_arms.push(SwitchArmResolution { arm, alternative: alternative.clone(), payload });
+                if let Some(binding) = binding { self.set_narrowing(binding, payload); }
+                if covered.contains(&alternative) {
+                    self.error(arm.label.span, "switch alternative is covered more than once");
+                } else {
+                    covered.push(alternative.clone());
+                }
+            }
+            self.statement_body(&arm.body);
+        }
+        self.narrowed.clone_from(&outer);
+        if let Some(body) = else_body { self.statement_body(body); }
+        let explicitly_exhaustive = alternatives.iter().all(|alternative| covered.contains(alternative));
+        if else_body.is_none() && !explicitly_exhaustive {
+            let missing = alternatives.iter().filter(|alternative| !covered.contains(*alternative))
+                .map(|alternative| self.alternative_name(alternative)).collect::<Vec<_>>().join(", ");
+            self.error(statement.span, format!("non-exhaustive switch; missing: {missing}"));
+        }
+        if else_body.is_some() && explicitly_exhaustive {
+            self.warnings.push(Diagnostic::source_warning(self.analysis.source, else_body.unwrap().span, "unreachable source"));
+        }
+        self.switches.push(SwitchResolution {
+            statement, operand_union: union_type, binding, arms: resolved_arms,
+            covered: covered.into_boxed_slice(), else_body,
+            exhaustive: else_body.is_some() || explicitly_exhaustive,
+        });
+        self.resolve_statement_deferred(statement);
+        self.narrowed = outer;
+        for arm in arms {
+            if statement_body_may_fallthrough(&arm.body) {
+                for binding in direct_assignments_in_body(self.analysis, &arm.body) { self.remove_narrowing(binding); }
+            }
+        }
+        if let Some(body) = else_body {
+            if statement_body_may_fallthrough(body) {
+                for binding in direct_assignments_in_body(self.analysis, body) { self.remove_narrowing(binding); }
+            }
+        }
+    }
+
+    fn expression(&mut self, expression: &'ast Expression) -> TypeState {
+        match &expression.kind {
+            ExpressionKind::Identifier(identifier) => {
+                if let Some(NameResolution::Binding(binding)) = self.analysis.name_use(identifier).map(|use_| use_.resolution)
+                    && let Some(ty) = self.narrowed_type(binding)
+                { self.replace_expression_state(expression, TypeState::Resolved(ty)); }
+            }
+            ExpressionKind::Parenthesized(inner) => {
+                let state = self.expression(inner); self.replace_if_changed(expression, state);
+            }
+            ExpressionKind::Unary { operator, operand, .. } => {
+                let operand = self.expression(operand);
+                if let TypeState::Resolved(ty) = operand {
+                    let int = self.analysis.types.primitive(PrimitiveType::Int);
+                    let float = self.analysis.types.primitive(PrimitiveType::Float);
+                    let bool_ty = self.analysis.types.primitive(PrimitiveType::Bool);
+                    let valid = match operator {
+                        crate::ast::UnaryOperator::LogicalNot => ty == bool_ty,
+                        crate::ast::UnaryOperator::BitwiseNot => ty == int,
+                        crate::ast::UnaryOperator::Plus | crate::ast::UnaryOperator::Minus => ty == int || ty == float,
+                    };
+                    if valid {
+                        self.replace_if_changed(expression, TypeState::Resolved(ty));
+                    } else if matches!(self.state(expression), TypeState::Deferred(_)) {
+                        self.error(expression.span, "unary operator is not defined for the narrowed operand type");
+                        self.replace_expression_state(expression, TypeState::Error);
+                    }
+                }
+            }
+            ExpressionKind::Try { value, .. } => { self.expression(value); }
+            ExpressionKind::List(elements) => for element in elements { self.expression(element); },
+            ExpressionKind::Map(entries) => for entry in entries { self.expression(&entry.key); self.expression(&entry.value); },
+            ExpressionKind::Block(block) => {
+                self.block(block);
+                let state = block.value.as_deref().map_or(TypeState::NoValue, |value| self.state(value));
+                self.replace_if_changed(expression, state);
+            }
+            ExpressionKind::If { branches, else_branch } => {
+                let outer = self.narrowed.clone();
+                let mut states = Vec::with_capacity(branches.len() + 1);
+                for branch in branches {
+                    self.narrowed.clone_from(&outer);
+                    self.expression(&branch.condition);
+                    if let Some((binding, payload)) = self.direct_test(&branch.condition) { self.set_narrowing(binding, payload); }
+                    self.expression_body(&branch.body);
+                    states.push(self.expression_body_state(&branch.body));
+                }
+                self.narrowed.clone_from(&outer); self.expression_body(else_branch);
+                states.push(self.expression_body_state(else_branch));
+                self.narrowed = outer;
+                if let Some(TypeState::Resolved(expected)) = states.iter().find(|state| matches!(state, TypeState::Resolved(_))).copied()
+                    && states.iter().all(|state| matches!(state, TypeState::Resolved(actual) if *actual == expected) || *state == TypeState::Never)
+                {
+                    self.replace_if_changed(expression, TypeState::Resolved(expected));
+                }
+            }
+            ExpressionKind::Binary { left, operator, right, .. } => {
+                let left_state = self.expression(left); let right_state = self.expression(right);
+                if let (TypeState::Resolved(left), TypeState::Resolved(right)) = (left_state, right_state) {
+                    let bool_ty = self.analysis.types.primitive(PrimitiveType::Bool);
+                    let result = match operator {
+                        BinaryOperator::LogicalOr | BinaryOperator::LogicalAnd if left == bool_ty && right == bool_ty => Some(bool_ty),
+                        BinaryOperator::Equal | BinaryOperator::NotEqual
+                        | BinaryOperator::Less | BinaryOperator::LessEqual
+                        | BinaryOperator::Greater | BinaryOperator::GreaterEqual if left == right => Some(bool_ty),
+                        BinaryOperator::In if matches!(self.analysis.types.get(right), ResolvedType::List(element) if *element == left)
+                            || matches!(self.analysis.types.get(right), ResolvedType::Map { key, .. } if *key == left) => Some(bool_ty),
+                        _ if left == right => Some(left),
+                        _ => None,
+                    };
+                    if let Some(result) = result {
+                        self.replace_if_changed(expression, TypeState::Resolved(result));
+                    } else if matches!(self.state(expression), TypeState::Deferred(_)) {
+                        self.error(expression.span, "operator is not defined for the narrowed operand types");
+                        self.replace_expression_state(expression, TypeState::Error);
+                    }
+                }
+            }
+            ExpressionKind::Is { value, ty, .. } => {
+                self.expression(value);
+                let state = self.state(value);
+                let binding = exact_binding(self.analysis, value);
+                if let Some((union_type, style, alternatives)) = self.union_parts(state) {
+                    if let Some(alternative) = self.resolve_label(ty, style, &alternatives) {
+                        let payload = alternative_payload(&alternative);
+                        self.tests.push(UnionTestResolution { expression, operand_union: union_type, alternative, payload, binding });
+                        self.replace_expression_state(expression, TypeState::Resolved(self.analysis.types.primitive(PrimitiveType::Bool)));
+                    } else { self.replace_expression_state(expression, TypeState::Error); }
+                } else {
+                    if !matches!(state, TypeState::Error | TypeState::Never) { self.error(value.span, "'is' operand must have a union type"); }
+                    self.replace_expression_state(expression, TypeState::Error);
+                }
+            }
+            ExpressionKind::Call { callee, arguments } => {
+                match &callee.kind {
+                    ExpressionKind::Member { value, .. } => { self.expression(value); }
+                    ExpressionKind::Identifier(_) => {}
+                    _ if self.analysis.expression_annotation(callee).is_some() => { self.expression(callee); }
+                    _ => {}
+                }
+                for argument in arguments { self.expression(argument_value(argument)); }
+                self.retype_call(expression, callee, arguments);
+            }
+            ExpressionKind::Index { value, index } => {
+                self.expression(value); self.expression(index); self.retype_index(expression, value, index);
+            }
+            ExpressionKind::Member { value, member } => {
+                self.expression(value); self.retype_member(expression, value, *member);
+            }
+            ExpressionKind::Integer | ExpressionKind::Float | ExpressionKind::String(_)
+            | ExpressionKind::Character(_) | ExpressionKind::Boolean(_)
+            | ExpressionKind::TypedEmptyList(_) | ExpressionKind::TypedEmptyMap(_) => {}
+        }
+        self.state(expression)
+    }
+
+    fn union_parts(&self, state: TypeState) -> Option<(TypeId, UnionStyle, Vec<UnionAlternative>)> {
+        let TypeState::Resolved(ty) = state else { return None; };
+        match self.analysis.types.get(ty) {
+            ResolvedType::Union(alternatives) => Some((ty, union_style_semantic(alternatives), alternatives.to_vec())),
+            ResolvedType::Nominal(declaration) => match &self.analysis.type_definition(*declaration).kind {
+                TypeDefinitionKind::Union { style, alternatives } => Some((ty, *style, alternatives.to_vec())),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn resolve_label(&mut self, label: &'ast Type, style: UnionStyle, alternatives: &[UnionAlternative]) -> Option<UnionAlternative> {
+        let bare = strip_type_parentheses(label);
+        if let TypeKind::Named(identifier) = &bare.kind {
+            let spelling = self.analysis.identifier_text(identifier.span).to_owned();
+            if spelling == "Error" {
+                return alternatives.iter().find(|alternative| matches!(alternative, UnionAlternative::Error(_))).cloned().or_else(|| {
+                    self.error(identifier.span, "union has no Error alternative"); None
+                });
+            }
+            if style == UnionStyle::Tagged {
+                if self.analysis.type_by_name(&spelling).is_some() {
+                    self.error(identifier.span, "tagged union requires a tag label, not a type label");
+                    return None;
+                }
+                return alternatives.iter().find(|alternative| matches!(alternative, UnionAlternative::Tagged { tag, .. } if tag.as_ref() == spelling.as_str())).cloned().or_else(|| {
+                    self.error(identifier.span, format!("unknown union tag '{spelling}'")); None
+                });
+            } else if self.analysis.type_by_name(&spelling).is_none() {
+                self.error(identifier.span, "untagged union requires a type label, not a tag label");
+                return None;
+            }
+        }
+        if style == UnionStyle::Tagged {
+            self.error(label.span, "tagged union requires a bare tag label");
+            return None;
+        }
+        let Some(label_type) = self.resolve_label_type(label) else { return None; };
+        alternatives.iter().find(|alternative| matches!(alternative, UnionAlternative::Untagged(payload) if *payload == label_type)).cloned().or_else(|| {
+            self.error(label.span, "type label is not an alternative of this union"); None
+        })
+    }
+
+    fn resolve_label_type(&mut self, ty: &'ast Type) -> Option<TypeId> {
+        let resolved = match &ty.kind {
+            TypeKind::Primitive(primitive) => Some(self.analysis.types.primitive(*primitive)),
+            TypeKind::Named(identifier) => {
+                let name = self.analysis.identifier_text(identifier.span).to_owned();
+                if let Some(declaration) = self.analysis.type_by_name(&name) {
+                    Some(self.analysis.types.intern(ResolvedType::Nominal(declaration)))
+                } else {
+                    self.error(identifier.span, format!("unknown type '{name}'"));
+                    None
+                }
+            }
+            TypeKind::List(element) => {
+                let element = self.resolve_label_type(element);
+                element.map(|element| self.analysis.types.intern(ResolvedType::List(element)))
+            }
+            TypeKind::Map { key, value } => {
+                let key = self.resolve_label_type(key); let value = self.resolve_label_type(value);
+                key.zip(value).map(|(key, value)| self.analysis.types.intern(ResolvedType::Map { key, value }))
+            }
+            TypeKind::Union(alternatives) => {
+                let mut resolved = Vec::new();
+                for alternative in alternatives {
+                    match &alternative.kind {
+                        TypeKind::Tagged { tag, payload } if self.analysis.identifier_text(tag.span) == "Error" => {
+                            if let Some(payload) = self.resolve_label_type(payload) { resolved.push(UnionAlternative::Error(payload)); }
+                        }
+                        TypeKind::Tagged { tag, payload } => {
+                            if let Some(payload) = self.resolve_label_type(payload) { resolved.push(UnionAlternative::Tagged { tag: self.analysis.identifier_text(tag.span).into(), payload }); }
+                        }
+                        _ => if let Some(payload) = self.resolve_label_type(alternative) { resolved.push(UnionAlternative::Untagged(payload)); },
+                    }
+                }
+                resolved.sort(); Some(self.analysis.types.intern(ResolvedType::Union(resolved.into_boxed_slice())))
+            }
+            TypeKind::Parenthesized(inner) => self.resolve_label_type(inner),
+            TypeKind::Tagged { .. } => { self.error(ty.span, "tagged alternative is only valid within a union type"); None }
+        };
+        if let Some(resolved) = resolved { self.analysis.annotate_type(ty, TypeState::Resolved(resolved)); }
+        resolved
+    }
+
+    fn retype_member(&mut self, expression: &'ast Expression, value: &'ast Expression, member: Member) {
+        let TypeState::Resolved(receiver) = self.state(value) else { return; };
+        let state = match (self.analysis.types.get(receiver), member) {
+            (ResolvedType::Nominal(declaration), Member::Named(name)) => match &self.analysis.type_definition(*declaration).kind {
+                TypeDefinitionKind::Struct(members) => members.iter().find(|field| self.analysis.identifier_text(field.name.span) == self.analysis.identifier_text(name.span)).map(|field| field.ty),
+                _ => None,
+            },
+            (ResolvedType::Nominal(declaration), Member::TupleIndex(span)) => match &self.analysis.type_definition(*declaration).kind {
+                TypeDefinitionKind::Tuple(members) => self.analysis.identifier_text(span).replace('_', "").parse::<usize>().ok().and_then(|index| members.get(index)).map(|field| field.ty),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(state) = state {
+            self.replace_if_changed(expression, state);
+        } else if matches!(self.state(expression), TypeState::Deferred(_)) {
+            self.error(expression.span, "member is not available on the narrowed alternative");
+            self.replace_expression_state(expression, TypeState::Error);
+        }
+    }
+
+    fn retype_index(&mut self, expression: &'ast Expression, value: &'ast Expression, index: &'ast Expression) {
+        let (TypeState::Resolved(value), TypeState::Resolved(index)) = (self.state(value), self.state(index)) else { return; };
+        let int = self.analysis.types.primitive(PrimitiveType::Int);
+        let result = match self.analysis.types.get(value) {
+            ResolvedType::List(element) if index == int => Some(*element),
+            ResolvedType::Map { key, value } if index == *key => Some(*value),
+            ResolvedType::Primitive(PrimitiveType::Str) if index == int => Some(self.analysis.types.primitive(PrimitiveType::Char)),
+            _ => None,
+        };
+        if let Some(result) = result {
+            self.replace_if_changed(expression, TypeState::Resolved(result));
+        } else if matches!(self.state(expression), TypeState::Deferred(_)) {
+            self.error(expression.span, "index operation is not defined for the narrowed alternative");
+            self.replace_expression_state(expression, TypeState::Error);
+        }
+    }
+
+    fn retype_call(&mut self, expression: &'ast Expression, callee: &'ast Expression, arguments: &'ast [Argument]) {
+        if let Some(target) = self.analysis.call_resolution(expression).map(|call| call.target) {
+            match target {
+                CallTarget::Callable(CallableId::Function(function)) => {
+                    let parameters = self.analysis.function_signature(function).parameters.iter().map(|parameter| (parameter.node.name.span, parameter.ty)).collect::<Vec<_>>();
+                    let mut positional = 0;
+                    for argument in arguments {
+                        let expected = match &argument.kind {
+                            ArgumentKind::Positional(_) => { let value = parameters.get(positional).map(|(_, ty)| *ty); positional += 1; value }
+                            ArgumentKind::Named { name, .. } => parameters.iter().find(|(span, _)| self.analysis.identifier_text(*span) == self.analysis.identifier_text(name.span)).map(|(_, ty)| *ty),
+                        };
+                        if let Some(TypeState::Resolved(expected)) = expected { self.validate_expected_value(argument_value(argument), expected, "argument type does not match parameter type"); }
+                    }
+                    let result = self.analysis.function_signature(function).result;
+                    self.replace_if_changed(expression, result);
+                    return;
+                }
+                CallTarget::Callable(CallableId::Intrinsic(intrinsic)) => {
+                    let result = self.analysis.intrinsic_signature(intrinsic).result;
+                    self.replace_if_changed(expression, result);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let ExpressionKind::Member { value: receiver, member: Member::Named(name) } = &callee.kind else { return; };
+        let TypeState::Resolved(receiver_ty) = self.state(receiver) else { return; };
+        let spelling = self.analysis.identifier_text(name.span).to_owned();
+        let int = self.analysis.types.primitive(PrimitiveType::Int);
+        let method = match self.analysis.types.get(receiver_ty) {
+            ResolvedType::List(element) => match spelling.as_str() { "append" => Some((BuiltinMethod::ListAppend, Some(*element), TypeState::NoValue)), "removeIndex" => Some((BuiltinMethod::ListRemoveIndex, Some(int), TypeState::NoValue)), "len" => Some((BuiltinMethod::ListLen, None, TypeState::Resolved(int))), _ => None },
+            ResolvedType::Map { key, .. } => match spelling.as_str() { "removeKey" => Some((BuiltinMethod::MapRemoveKey, Some(*key), TypeState::NoValue)), "len" => Some((BuiltinMethod::MapLen, None, TypeState::Resolved(int))), _ => None },
+            ResolvedType::Primitive(PrimitiveType::Str) if spelling == "len" => Some((BuiltinMethod::StrLen, None, TypeState::Resolved(int))),
+            _ => None,
+        };
+        if let Some((method, expected, result)) = method {
+            if let (Some(expected), Some(argument)) = (expected, arguments.first()) {
+                self.validate_expected_value(argument_value(argument), expected, "method argument type does not match the narrowed receiver type");
+            }
+            if let Some(call) = self.analysis.calls.iter_mut().find(|call| std::ptr::eq(call.node, expression)) { call.target = CallTarget::Builtin(method); }
+            self.replace_if_changed(expression, result);
+        } else if matches!(self.state(expression), TypeState::Deferred(_)) {
+            self.error(expression.span, "method is not available on the narrowed alternative");
+            self.replace_expression_state(expression, TypeState::Error);
+        }
+    }
+
+    fn retype_assignment_target(&mut self, target: &'ast AssignmentTarget) {
+        if target.suffixes.is_empty() { return; }
+        let Some(NameResolution::Binding(root)) = self.analysis.name_use(&target.root).map(|use_| use_.resolution) else { return; };
+        let Some(narrowed) = self.narrowed_type(root) else { return; };
+        let original = self.analysis.assignment_target(target).cloned().expect("assignment target annotation");
+        let mut state = TypeState::Resolved(narrowed);
+        let mut steps = Vec::new();
+        for suffix in &target.suffixes {
+            let TypeState::Resolved(receiver) = state else { break; };
+            let step = match (self.analysis.types.get(receiver), &suffix.kind) {
+                (ResolvedType::List(element), crate::ast::AssignmentTargetSuffixKind::Index(_)) => { state = TypeState::Resolved(*element); AccessPathStep::ListIndex { suffix, element: *element, state } }
+                (ResolvedType::Map { key, value }, crate::ast::AssignmentTargetSuffixKind::Index(_)) => { state = TypeState::Resolved(*value); AccessPathStep::MapIndex { suffix, key: *key, value: *value, state } }
+                (ResolvedType::Nominal(declaration), crate::ast::AssignmentTargetSuffixKind::Member(Member::Named(name))) => {
+                    let TypeDefinitionKind::Struct(members) = &self.analysis.type_definition(*declaration).kind else { break; };
+                    let Some(member) = members.iter().find(|member| self.analysis.identifier_text(member.name.span) == self.analysis.identifier_text(name.span)) else { break; };
+                    state = member.ty; AccessPathStep::StructMember { suffix, declaration: *declaration, member: member.node, storage: member.storage, state }
+                }
+                (ResolvedType::Nominal(declaration), crate::ast::AssignmentTargetSuffixKind::Member(Member::TupleIndex(span))) => {
+                    let TypeDefinitionKind::Tuple(members) = &self.analysis.type_definition(*declaration).kind else { break; };
+                    let Some(position) = self.analysis.identifier_text(*span).replace('_', "").parse::<usize>().ok() else { break; };
+                    let Some(member) = members.get(position) else { break; };
+                    state = member.ty; AccessPathStep::TupleMember { suffix, declaration: *declaration, member: member.node, position, state }
+                }
+                _ => break,
+            };
+            steps.push(step);
+        }
+        if state != original.state || steps.len() != original.steps.len() {
+            let ids = self.analysis.deferred.iter().filter(|deferred| {
+                !deferred.resolved
+                    && matches!(deferred.node, crate::analysis::AstNode::AssignmentTarget(node) if std::ptr::eq(node, target))
+            }).map(|deferred| deferred.id).collect::<Vec<_>>();
+            for id in ids { self.analysis.resolve_deferred(id); }
+            self.analysis.assignment_targets.push(crate::analysis::AssignmentTargetAnnotation { node: target, root: Some(root), steps: steps.into_boxed_slice(), state });
+        }
+    }
+
+    fn direct_test(&self, condition: &'ast Expression) -> Option<(BindingId, TypeId)> {
+        let condition = strip_expression_parentheses(condition);
+        self.tests.iter().rev().find(|test| std::ptr::eq(test.expression, condition)).and_then(|test| test.binding.map(|binding| (binding, test.payload)))
+    }
+
+    fn validate_result_value(&mut self, value: &'ast Expression) {
+        if let (TypeState::Resolved(actual), TypeState::Resolved(expected)) = (self.state(value), self.function_result)
+        {
+            if actual == expected { return; }
+            let alternatives = self.union_parts(TypeState::Resolved(expected)).map(|(_, _, alternatives)| {
+                alternatives.into_iter().filter(|alternative| alternative_payload(alternative) == actual).collect::<Vec<_>>()
+            }).unwrap_or_default();
+            if let [alternative] = alternatives.as_slice() {
+                self.analysis.union_injections.push(crate::analysis::UnionInjection {
+                    node: value,
+                    union_type: expected,
+                    alternative: alternative.clone(),
+                });
+            } else {
+                self.error(value.span, "return value type does not match function result type");
+            }
+        }
+    }
+
+    fn validate_expected_value(&mut self, value: &'ast Expression, expected: TypeId, message: &'static str) {
+        let TypeState::Resolved(actual) = self.state(value) else { return; };
+        if actual == expected { return; }
+        let alternatives = self.union_parts(TypeState::Resolved(expected)).map(|(_, _, alternatives)| {
+            alternatives.into_iter().filter(|alternative| alternative_payload(alternative) == actual).collect::<Vec<_>>()
+        }).unwrap_or_default();
+        if let [alternative] = alternatives.as_slice() {
+            self.analysis.union_injections.push(crate::analysis::UnionInjection { node: value, union_type: expected, alternative: alternative.clone() });
+        } else {
+            self.error(value.span, message);
+        }
+    }
+
+    fn state(&self, expression: &'ast Expression) -> TypeState {
+        self.analysis.expression_annotation(expression).expect("every expression has a type annotation").state
+    }
+
+    fn expression_body_state(&self, body: &'ast ExpressionBody) -> TypeState {
+        match &body.kind {
+            ExpressionBodyKind::Expression(expression) => self.state(expression),
+            ExpressionBodyKind::Block(block) => block.value.as_deref().map_or(TypeState::NoValue, |value| self.state(value)),
+        }
+    }
+
+    fn replace_if_changed(&mut self, expression: &'ast Expression, state: TypeState) {
+        if self.state(expression) != state { self.replace_expression_state(expression, state); }
+    }
+
+    fn replace_expression_state(&mut self, expression: &'ast Expression, state: TypeState) {
+        let ids = self.analysis.deferred.iter().filter(|deferred| {
+            !deferred.resolved
+                && matches!(deferred.node, crate::analysis::AstNode::Expression(node) if std::ptr::eq(node, expression))
+        }).map(|deferred| deferred.id).collect::<Vec<_>>();
+        for id in ids { self.analysis.resolve_deferred(id); }
+        self.analysis.annotate_expression(expression, state);
+    }
+
+    fn resolve_statement_deferred(&mut self, statement: &'ast Statement) {
+        let ids = self.analysis.deferred.iter().filter(|deferred| !deferred.resolved && matches!(deferred.node, crate::analysis::AstNode::Statement(node) if std::ptr::eq(node, statement))).map(|deferred| deferred.id).collect::<Vec<_>>();
+        for id in ids { self.analysis.resolve_deferred(id); }
+    }
+
+    fn narrowed_type(&self, binding: BindingId) -> Option<TypeId> { self.narrowed.iter().rev().find_map(|(candidate, ty)| (*candidate == binding).then_some(*ty)) }
+    fn set_narrowing(&mut self, binding: BindingId, ty: TypeId) { self.remove_narrowing(binding); self.narrowed.push((binding, ty)); }
+    fn remove_narrowing(&mut self, binding: BindingId) { self.narrowed.retain(|(candidate, _)| *candidate != binding); }
+    fn alternative_name(&self, alternative: &UnionAlternative) -> String {
+        match alternative {
+            UnionAlternative::Tagged { tag, .. } => tag.to_string(),
+            UnionAlternative::Error(_) => "Error".to_owned(),
+            UnionAlternative::Untagged(ty) => self.type_name(*ty),
+        }
+    }
+    fn type_name(&self, ty: TypeId) -> String {
+        match self.analysis.types.get(ty) {
+            ResolvedType::Primitive(primitive) => match primitive { PrimitiveType::Int => "int", PrimitiveType::Float => "float", PrimitiveType::Str => "str", PrimitiveType::Bool => "bool", PrimitiveType::Char => "char" }.to_owned(),
+            ResolvedType::Nominal(declaration) => self.analysis.identifier_text(self.analysis.type_definition(*declaration).node.name.span).to_owned(),
+            ResolvedType::List(element) => format!("[{}]", self.type_name(*element)),
+            ResolvedType::Map { key, value } => format!("{{{}: {}}}", self.type_name(*key), self.type_name(*value)),
+            ResolvedType::Union(_) => "union".to_owned(),
+        }
+    }
+    fn error(&mut self, span: Span, message: impl Into<String>) { self.diagnostics.push(Diagnostic::source(self.analysis.source, span, message)); }
+}
+
+fn strip_expression_parentheses(mut expression: &Expression) -> &Expression {
+    while let ExpressionKind::Parenthesized(inner) = &expression.kind { expression = inner; }
+    expression
+}
+
+fn strip_type_parentheses(mut ty: &Type) -> &Type {
+    while let TypeKind::Parenthesized(inner) = &ty.kind { ty = inner; }
+    ty
+}
+
+fn exact_binding<'ast>(analysis: &Analysis<'_, 'ast>, expression: &'ast Expression) -> Option<BindingId> {
+    let ExpressionKind::Identifier(identifier) = &strip_expression_parentheses(expression).kind else { return None; };
+    match analysis.name_use(identifier).map(|use_| use_.resolution) { Some(NameResolution::Binding(binding)) => Some(binding), _ => None }
+}
+
+fn union_style_semantic(alternatives: &[UnionAlternative]) -> UnionStyle {
+    if alternatives.iter().any(|alternative| matches!(alternative, UnionAlternative::Tagged { .. })) { UnionStyle::Tagged } else { UnionStyle::Untagged }
+}
+
+fn direct_assignments_in_body<'ast>(analysis: &Analysis<'_, 'ast>, body: &'ast StatementBody) -> Vec<BindingId> {
+    fn block<'ast>(analysis: &Analysis<'_, 'ast>, block: &'ast Block, out: &mut Vec<BindingId>) {
+        for statement in &block.statements { statement_assignments(analysis, statement, out); }
+    }
+    fn body_assignments<'ast>(analysis: &Analysis<'_, 'ast>, body: &'ast StatementBody, out: &mut Vec<BindingId>) {
+        match &body.kind {
+            StatementBodyKind::Block(value) => block(analysis, value, out),
+            StatementBodyKind::Statement(value) => statement_assignments(analysis, value, out),
+        }
+    }
+    fn statement_assignments<'ast>(analysis: &Analysis<'_, 'ast>, statement: &'ast Statement, out: &mut Vec<BindingId>) {
+        match &statement.kind {
+            StatementKind::Assignment { target, .. } if target.suffixes.is_empty() => {
+                if let Some(NameResolution::Binding(binding)) = analysis.name_use(&target.root).map(|use_| use_.resolution)
+                    && !out.contains(&binding) { out.push(binding); }
+            }
+            StatementKind::If { branches, else_body } => {
+                for branch in branches { body_assignments(analysis, &branch.body, out); }
+                if let Some(body) = else_body { body_assignments(analysis, body, out); }
+            }
+            StatementKind::While { body, .. } | StatementKind::For { body, .. } => body_assignments(analysis, body, out),
+            StatementKind::Switch { arms, else_body, .. } => {
+                for arm in arms { body_assignments(analysis, &arm.body, out); }
+                if let Some(body) = else_body { body_assignments(analysis, body, out); }
+            }
+            StatementKind::Block(value) => block(analysis, value, out),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    body_assignments(analysis, body, &mut out);
+    out
+}
+
+fn statement_body_may_fallthrough(body: &StatementBody) -> bool {
+    fn block_may_fallthrough(block: &Block) -> bool {
+        block.statements.iter().all(statement_may_fallthrough)
+    }
+    fn statement_may_fallthrough(statement: &Statement) -> bool {
+        match &statement.kind {
+            StatementKind::Return(_) | StatementKind::Break | StatementKind::Continue => false,
+            StatementKind::Block(block) => block_may_fallthrough(block),
+            StatementKind::If { branches, else_body: Some(else_body) } => {
+                branches.iter().any(|branch| statement_body_may_fallthrough(&branch.body))
+                    || statement_body_may_fallthrough(else_body)
+            }
+            _ => true,
+        }
+    }
+    match &body.kind {
+        StatementBodyKind::Block(block) => block_may_fallthrough(block),
+        StatementBodyKind::Statement(statement) => statement_may_fallthrough(statement),
+    }
+}
+
 struct FlowValidator<'analysis, 'diagnostics, 'warnings, 'source, 'ast> {
     analysis: &'analysis mut Analysis<'source, 'ast>,
     diagnostics: &'diagnostics mut Diagnostics,
@@ -427,6 +1153,7 @@ struct FlowValidator<'analysis, 'diagnostics, 'warnings, 'source, 'ast> {
     facts: FlowFacts<'ast>,
     function: Option<(FunctionId, TypeState)>,
     loops: Vec<&'ast Statement>,
+    switches: &'analysis [SwitchResolution<'ast>],
 }
 
 impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
@@ -436,6 +1163,7 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
         analysis: &'analysis mut Analysis<'source, 'ast>,
         diagnostics: &'diagnostics mut Diagnostics,
         warnings: &'warnings mut Warnings,
+        switches: &'analysis [SwitchResolution<'ast>],
     ) -> Self {
         Self {
             analysis,
@@ -444,6 +1172,7 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
             facts: FlowFacts::default(),
             function: None,
             loops: Vec::new(),
+            switches,
         }
     }
 
@@ -644,7 +1373,7 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
                 }
                 if let Some(body) = else_body {
                     alternatives.push(self.statement_body(body));
-                } else {
+                } else if !self.switch_is_exhaustive(statement) {
                     // Until Phase 4 proves coverage, the unmatched path remains
                     // conservatively reachable. It is switch-dependent rather
                     // than definite so nested unresolved switches do not cause
@@ -855,6 +1584,13 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
             .expression_annotation(expression)
             .expect("every expression has a name-and-type annotation")
             .state
+    }
+
+    fn switch_is_exhaustive(&self, statement: &Statement) -> bool {
+        self.switches
+            .iter()
+            .find(|resolution| std::ptr::eq(resolution.statement, statement))
+            .is_some_and(|resolution| resolution.exhaustive)
     }
 
     fn record(&mut self, subject: FlowSubject<'ast>, summary: FlowSummary<'ast>) {
@@ -1645,22 +2381,27 @@ mod tests {
     }
 
     #[test]
-    fn retains_successes_and_flow_dependent_obligations() {
+    fn resolves_flow_dependent_mutability_obligations() {
         with_semantic_result(
             "type Box(value int); type U(Box | int); fn main() { var value := U(Box(value = 1)); if value is Box: value.value = 2; }",
             |result| {
                 assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
-                assert_eq!(result.deferred_mutability.len(), 1);
-                assert!(matches!(result.deferred_mutability[0].operation, MutabilityOperation::DeferredPath));
+                assert!(result.deferred_mutability.is_empty());
+                assert_eq!(result.mutability.len(), 1);
+                assert!(matches!(
+                    result.mutability[0].operation,
+                    MutabilityOperation::ReplaceStructField
+                ));
             },
         );
         with_semantic_result(
             "type Choice([int] | int); fn main() { var value := Choice([1]); if value is [int]: value.append(2); }",
             |result| {
                 assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
-                assert_eq!(result.deferred_mutability.len(), 1);
+                assert!(result.deferred_mutability.is_empty());
+                assert_eq!(result.mutability.len(), 1);
                 assert!(matches!(
-                    result.deferred_mutability[0].operation,
+                    result.mutability[0].operation,
                     MutabilityOperation::MutateReceiver(BuiltinMethod::ListAppend)
                 ));
             },
@@ -1871,7 +2612,7 @@ mod tests {
     }
 
     #[test]
-    fn retains_switch_dependent_return_and_reachability_obligations() {
+    fn recomposes_switch_dependent_return_and_reachability_obligations() {
         with_semantic_result(
             concat!(
                 "type Choice(int | str); ",
@@ -1880,11 +2621,7 @@ mod tests {
             ),
             |result| {
                 assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
-                assert_eq!(result.flow.deferred.len(), 1);
-                assert!(matches!(
-                    result.flow.deferred[0].kind,
-                    DeferredFlowKind::FunctionReturn { .. }
-                ));
+                assert!(result.flow.deferred.is_empty());
             },
         );
 
@@ -1896,12 +2633,8 @@ mod tests {
             ),
             |result| {
                 assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
-                assert!(result.warnings.is_empty(), "{}", result.warnings);
-                assert_eq!(result.flow.deferred.len(), 1);
-                assert!(matches!(
-                    result.flow.deferred[0].kind,
-                    DeferredFlowKind::Reachability { .. }
-                ));
+                assert_eq!(result.warnings.len(), 1, "{}", result.warnings);
+                assert!(result.flow.deferred.is_empty());
             },
         );
 
@@ -1926,8 +2659,7 @@ mod tests {
             ),
             |result| {
                 assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
-                assert_eq!(result.flow.deferred.len(), 1);
-                assert_eq!(result.flow.deferred[0].switches.len(), 2);
+                assert!(result.flow.deferred.is_empty());
             },
         );
 
@@ -1941,15 +2673,14 @@ mod tests {
             ),
             |result| {
                 assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
-                assert_eq!(result.flow.deferred.len(), 2);
-                assert_eq!(result.flow.deferred[0].switches.len(), 1);
-                assert_eq!(result.flow.deferred[1].switches.len(), 2);
+                assert_eq!(result.warnings.len(), 1, "{}", result.warnings);
+                assert!(result.flow.deferred.is_empty());
             },
         );
     }
 
     #[test]
-    fn retains_deferred_outer_function_values_for_union_analysis() {
+    fn resolves_outer_function_values_after_union_analysis() {
         with_semantic_result(
             concat!(
                 "type Choice(int | str); ",
@@ -1958,7 +2689,7 @@ mod tests {
                 "fn main() {}"
             ),
             |result| {
-                assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
+                assert!(result.diagnostics.to_string().contains("no-value function cannot have a final value"));
                 assert_eq!(
                     result
                         .flow
@@ -1969,7 +2700,7 @@ mod tests {
                             DeferredFlowKind::FunctionFinalValue { .. }
                         ))
                         .count(),
-                    2
+                    0
                 );
             },
         );
@@ -1999,6 +2730,68 @@ mod tests {
                 && record.summary.flags.contains(FlowFlags::FALLTHROUGH)
                 && record.summary.flags.contains(FlowFlags::DIVERGE)
         }));
+    }
+
+    #[test]
+    fn resolves_union_tests_and_exhaustive_switches_with_narrowed_reads() {
+        with_semantic_result(
+            concat!(
+                "type Box(value int); type Choice(Box | str); ",
+                "fn read(value Choice) int { switch value { Box: return value.value; str: return 0; } } ",
+                "fn main() {}",
+            ),
+            |result| {
+                assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
+                assert_eq!(result.switches.len(), 1);
+                assert!(result.switches[0].exhaustive);
+                assert_eq!(result.switches[0].arms.len(), 2);
+                assert!(result.flow.deferred.is_empty());
+            },
+        );
+
+        with_semantic_result(
+            concat!(
+                "type Result(int | Error(str)); ",
+                "fn failed(value Result) bool { value is Error } fn main() {}",
+            ),
+            |result| {
+                assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
+                assert_eq!(result.union_tests.len(), 1);
+                assert!(matches!(result.union_tests[0].alternative, UnionAlternative::Error(_)));
+            },
+        );
+    }
+
+    #[test]
+    fn diagnoses_contextual_switch_labels_and_coverage() {
+        with_semantic_result(
+            concat!(
+                "type Choice(A(int) | B(str)); ",
+                "fn inspect(value Choice) { switch value { A: return; A: return; Missing: return; } } ",
+                "fn main() {}",
+            ),
+            |result| {
+                let diagnostics = result.diagnostics.to_string();
+                assert!(diagnostics.contains("covered more than once"), "{diagnostics}");
+                assert!(diagnostics.contains("unknown union tag 'Missing'"), "{diagnostics}");
+                assert!(diagnostics.contains("non-exhaustive switch; missing: B"), "{diagnostics}");
+            },
+        );
+    }
+
+    #[test]
+    fn warns_when_else_follows_complete_explicit_coverage() {
+        with_semantic_result(
+            concat!(
+                "type Choice(int | str); fn inspect(value Choice) { ",
+                "switch value { int: return; str: return; else: return; } } fn main() {}",
+            ),
+            |result| {
+                assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
+                assert_eq!(result.warnings.len(), 1, "{}", result.warnings);
+                assert!(result.switches[0].exhaustive);
+            },
+        );
     }
 
     #[test]
