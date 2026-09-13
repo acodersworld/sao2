@@ -209,16 +209,196 @@ core representation.
 
 ## Stage 2: Straight-line lowering
 
-Lower function signatures, parameters, local declarations, literals, ordinary
-unary and binary expressions, conversions, constructors, calls, intrinsics,
-member and index places, and assignments. Preserve source argument order and
-materialize operations so C operand evaluation order cannot affect behavior.
-Consume existing frontend identities, types, call targets, constructors, union
-injections, and mutation authorizations without repeating their analysis.
+Lower complete straight-line functions from the validated frontend handoff into
+owned IR, then run the Stage 1 validator before returning the result. Preserve
+left-to-right evaluation through conservative snapshots and support all value
+construction, including unions. Do not connect lowering to normal compilation
+until Stage 6.
 
-Exit criterion: straight-line functions lower deterministically into validated
-typed locals and operations, including reference-bearing temporaries across
-calls.
+### Complete the frontend handoff
+
+The current frontend does not yet represent the explicit numeric conversions
+specified by `DESIGN.md`: the reserved `int` and `float` tokens cannot begin an
+expression, and the AST has no conversion node. Add `int(expression)` and
+`float(expression)` to `GRAMMAR.ebnf`, the AST, parser, name-and-type analysis,
+semantic traversal, and handoff validation. Accept only `int(float)` and
+`float(int)`. Record the selected source and destination types; Stage 5 remains
+responsible for finite and range checks.
+
+Ordinary member and index reads also need identity-bearing handoff facts. Record
+one resolved projection for each value-level access while existing analysis is
+already selecting it:
+
+- a struct declaration, field ordinal, inline-or-referenced storage, and result
+  type;
+- a tuple declaration, position, and result type;
+- a list's element type;
+- a map's key and value types; or
+- string indexing and its `char` result.
+
+Exclude built-in method callees and qualified union constructors from these
+projection subjects; their existing call-target records are authoritative.
+Extend assignment path records with struct field ordinals as well as their
+existing member references. Update `AST.md` and the handoff validator to require
+exactly one valid projection record for every applicable expression. Missing,
+duplicated, or contradictory conversion and projection facts are compiler
+invariant failures, not new source diagnostics.
+
+### Program and identity mapping
+
+Add a lowering entry point which accepts the completed `Analysis` and
+`SemanticResult` and returns an owned `ir::Program` or a dedicated lowering
+error. The caller must already have passed `semantic::validate_handoff`.
+Lowering must not retain either input.
+
+Build the IR in deterministic passes:
+
+1. Reserve nominal definitions and functions in source declaration order.
+2. Copy canonical types and complete all owned nominal layouts.
+3. Copy every function signature before lowering bodies, allowing direct and
+   mutual recursion.
+4. Lower function bodies in source order.
+5. Validate the completed IR and convert any rejection into a lowering
+   invariant failure.
+
+Maintain explicit frontend-to-IR maps for types, nominal definitions,
+functions, bindings, fields, and union alternatives. Do not depend on frontend
+and IR numeric identities happening to match. Preallocation must support
+recursive nominal definitions and recursive function calls without placeholder
+AST references.
+
+Within a function, allocate parameter locals first in signature order, source
+locals when their declarations are encountered, and compiler temporaries in
+evaluation order. Copy all retained names, types, paths, bytes, union tags, and
+source metadata into IR-owned storage. Intern operation provenance in order of
+first occurrence of each byte span.
+
+### Expression lowering
+
+Use a lowering routine which produces a typed operand and applies any recorded
+implicit union injection before returning it. Parentheses are transparent, but
+an injection recorded on a parenthesized expression still applies at that exact
+expression boundary.
+
+- Lower unit and literals to typed constants and binding identifiers to copies
+  from their mapped locals.
+- Lower unary operations, non-short-circuit binary operations, membership, and
+  numeric conversions into typed temporaries. Leave `&&` and `||` to Stage 3
+  because their right operand is conditional.
+- Evaluate list elements, each map key followed by its value, and tuple
+  constructor arguments from left to right. Stabilize each value before
+  evaluating the next and retain that order in the aggregate operation.
+- Evaluate struct constructor arguments in source order and stabilize each
+  result. Only then use the recorded argument-to-member mapping to reorder
+  operands into declaration-field order for construction.
+- Lower untagged, tagged, and `Error` union constructors using the exact
+  recorded union alternative. Lower recorded implicit injections as explicit
+  union-injection operations without flattening nested unions.
+- Lower direct calls through mapped function identities. Lower `print` and
+  `println` through resolved intrinsic identities. For built-in methods,
+  evaluate and stabilize the receiver before arguments and retain the resolved
+  built-in method identity.
+- Lower member and index reads only through recorded projection identities.
+  Materialize computed receivers and every dynamic list index or map key before
+  constructing a projected place. Represent string indexing as its dedicated
+  read operation rather than an assignable place.
+
+Terminal `panic`, block and `if` expressions, explicit returns, statement
+conditionals, loops, switches, `break`, `continue`, and postfix `?` return a
+temporary `PendingStage` lowering error naming the owning later stage. This is
+not a compiler invariant and cannot reach users because Stage 2 lowering is not
+yet in the production pipeline. Remove each temporary case when its stage is
+implemented.
+
+### Conservative evaluation order
+
+Do not add effect analysis in this stage. Use a `stabilize` helper whenever an
+operand's value must be fixed before a later expression is evaluated. Constants
+and existing compiler-created temporaries are already stable. A copy from a
+parameter, source binding, or projected place is assigned to a fresh temporary.
+Lowering-created temporaries follow a single-assignment convention even though
+the IR itself permits mutable locals.
+
+Apply stabilization consistently:
+
+- stabilize the left operand before lowering the right operand of a binary
+  operation;
+- stabilize receivers before indices, keys, or call arguments;
+- stabilize each call, constructor, list, and map argument immediately after
+  evaluating it; and
+- retain every typed temporary, including reference-bearing values which must
+  survive a later call or possible allocation.
+
+This deliberately permits extra copies. Removing unnecessary temporaries is a
+later optimization and must not weaken explicit evaluation order.
+
+### Assignment lowering
+
+Use the exact semantic mutation authorization associated with each assignment.
+Confirm that its subject, root binding, access classification, operation, and
+typed path agree with the name-and-type assignment record, but do not repeat
+the permission decision.
+
+- For direct `=`, lower the right-hand value, including any injection, and
+  assign it to the mapped binding place.
+- For a projected target, snapshot the root object and evaluate each dynamic
+  index or key once from left to right before lowering the right-hand value.
+  Build the destination from the recorded field and projection identities.
+- For compound assignment, additionally copy the old target value before
+  lowering the right operand, lower the corresponding binary operation into a
+  temporary, and assign the result back to the previously captured place.
+- Preserve inline struct-slot replacement versus referenced-member rebinding in
+  the projection data without selecting a C representation.
+
+Emit ordinary arithmetic and indexing operations in this stage. Stage 5 adds
+the corresponding overflow, division, remainder, shift, float, conversion,
+bounds, and missing-key checks without changing operand order.
+
+Lower expression statements for their effects and discard their result. A
+straight-line function without a terminal construct ends its entry block by
+returning its final block expression, or an explicit unit constant when the
+body has no value.
+
+### Tests and completion
+
+Add parser, analysis, semantic, and handoff tests for both conversion forms,
+invalid conversion operands, every projection category, excluded method and
+qualified-constructor callees, field ordinals, and corrupted or duplicated
+handoff records.
+
+Add lowering tests covering:
+
+- owned and deterministic type, definition, function, field, alternative, and
+  binding mappings, including recursive definitions and mutual calls;
+- parameters, source locals, literals, conversions, unary and ordinary binary
+  operations, membership, expression statements, and fallthrough returns;
+- operation order and snapshots for nested calls, binary operands, receivers,
+  arguments, and later mutations;
+- list and map evaluation order, typed empty containers, tuple construction,
+  and source-ordered struct evaluation followed by layout reordering;
+- explicit untagged, tagged, and `Error` construction, implicit injection, and
+  explicitly nested union identity;
+- struct and tuple member reads, list and map indexing, and string indexing;
+- direct, projected, and compound assignments with every index or key evaluated
+  exactly once;
+- direct function calls, printable intrinsics, and all built-in methods;
+- byte-for-byte deterministic IR rendering followed by successful Stage 1
+  validation;
+- missing or contradictory frontend facts producing lowering invariant errors;
+  and
+- each deferred control-flow or postfix-`?` construct producing its explicit
+  temporary `PendingStage` result.
+
+Keep existing frontend, warning, temporary C backend, compiler, and executable
+tests unchanged. Contributor guidance prohibits compiling, running tests, or
+formatting during implementation.
+
+Exit criterion: every function in the defined straight-line subset lowers in
+source order to deterministic, owned, validated IR; all earlier observable
+values are stabilized before later effects; reference-bearing intermediates
+survive calls in typed locals; and the remaining unsupported constructs are
+explicitly assigned to Stages 3 and 4 rather than mistaken for broken frontend
+invariants.
 
 ## Stage 3: Control-flow lowering
 
@@ -234,12 +414,12 @@ with one terminator per block and no syntax-level control construct in the IR.
 
 ## Stage 4: Unions and error flow
 
-Lower explicit and implicit union construction, discriminant tests, payload
-extraction, branch-local narrowing, and switch alternatives using the recorded
-frontend resolutions. Lower postfix `?` into its success branch and its exact
-error-propagation or `main` panic branch, including bare `Error` success as unit
-and unions containing unit. Preserve union nesting, alternative identity, and
-constructor-form information needed by universal printing.
+Lower discriminant tests, payload extraction, branch-local narrowing, and
+switch alternatives using the recorded frontend resolutions and the explicit
+union values produced by Stage 2. Lower postfix `?` into its success branch and
+its exact error-propagation or `main` panic branch, including bare `Error`
+success as unit and unions containing unit. Preserve union nesting, alternative
+identity, and constructor-form information needed by universal printing.
 
 Exit criterion: union values and all postfix-`?` paths are explicit typed IR
 operations and control-flow edges with no renewed type or coverage decisions.
