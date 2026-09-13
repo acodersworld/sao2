@@ -186,6 +186,10 @@ tagged := U.A(42);
 
 When an expected union type is known, a value of one of its alternatives is
 injected implicitly. `Error(value)` constructs the special error alternative.
+`Error` is reserved for this built-in alternative, its constructor, and the
+contextual label that selects it in an `is` test or switch arm. User code cannot
+declare or bind that name as a type, function, parameter, local, member,
+ordinary union tag, loop binding, or in any other identifier position.
 
 Empty list and map literals require an expected type. A postfix type ascription
 may disambiguate them when no expected type is otherwise available:
@@ -286,11 +290,9 @@ a callable, an unqualified call whose name denotes entries in both is ambiguous
 and must be diagnosed; the compiler does not silently prefer the value callable
 or the constructor.
 
-The special `Error(value)` union constructor also participates in call-target
-resolution. If a user function or nominal type is named `Error`, an unqualified
-`Error(...)` call is ambiguous and must be diagnosed rather than preferring the
-declared callable or the special constructor. A lexical binding still shadows
-callable lookup, and qualified tagged construction remains distinct.
+The special `Error(value)` union constructor participates in call-target
+resolution without ambiguity because `Error` is reserved and cannot be
+declared or bound by user code. Qualified tagged construction remains distinct.
 
 The program entry point has one of four forms:
 

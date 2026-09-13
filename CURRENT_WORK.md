@@ -458,28 +458,109 @@ temporary backend.
 
 ## Phase 4: Union tests, narrowing, and switches
 
-- Resolve `is` and switch labels contextually against the tested union. Bare
-  identifiers select tags in tagged unions, `Error` selects the error
-  alternative, and ordinary type labels select alternatives in untagged unions.
-- Diagnose a non-union operand, a label absent from the union, a tag/type form
-  inappropriate for the union style, and duplicate switch alternatives.
-- Record the selected union, alternative, payload type, and tested binding when
-  one exists. Later stages must not repeat contextual label lookup.
-- Narrow only an exact binding operand in the selected `if` branch or switch arm.
-  Parentheses around that binding may be ignored, but negated tests, combined
-  boolean conditions, aliases, and prior failed branches do not introduce
-  narrowing. An `else` body is not narrowed.
-- Apply narrowing to reads, member/index receivers, calls, and indirect mutation
-  inside the body. Direct reassignment of the tested binding continues to use
-  its declared union type.
-- Require each union alternative exactly once when no `else` arm exists. An
-  `else` makes a partial switch exhaustive; if explicit arms already cover all
-  alternatives, retain the valid switch and warn that its `else` is unreachable.
-- Use exhaustive switch-arm flow summaries when proving function return paths.
+This phase is one semantic change. It resolves contextual union operations,
+applies their branch-local types, proves switch coverage, and recomposes the
+flow facts deferred by Phase 3. Do not split these responsibilities into
+separately landed stages: each depends on the same resolved alternative records
+and the phase must leave the compiler boundary internally consistent.
 
-Exit criterion: all `is` expressions and switches have concrete alternative
-records, branch-local expressions have final types, and switch coverage is
-proven.
+- Reserve `Error` for the built-in error alternative used by postfix `?`.
+  Reject that exact spelling in every user-defined identifier position,
+  including type and function declarations, parameters, locals, members,
+  ordinary union tags, and loop bindings. Preserve only `Error(Type)` as the
+  final alternative of a union, `Error(value)` as its constructor, and `Error`
+  as the contextual `is` or switch label selecting that alternative. Record
+  this restriction in `DESIGN.md`, replacing its previous callable-ambiguity
+  rule for user declarations named `Error`.
+- Resolve every `is` and switch label against the operand's resolved top-level
+  union. A bare identifier selects a tag in a tagged union, an ordinary type
+  label is resolved through the type namespace for an untagged union, and
+  `Error` selects the special error alternative. Match only direct
+  alternatives: an explicitly nested union remains one alternative and is not
+  flattened while looking for a label.
+- Keep contextual label diagnostics in semantic analysis. Diagnose a non-union
+  operand, a label absent from that union, a tag label used for an untagged
+  union, a type label used for a tagged union, and a repeated resolved switch
+  alternative at the most specific operand or label span. Factor ordinary type
+  construction and type-namespace lookup out of the existing resolver where
+  needed so untagged labels reuse those rules without rerunning source name
+  analysis or placing semantic errors in the earlier diagnostic collection.
+- Add durable semantic records for each resolved union test and switch. A test
+  record identifies its expression, operand union, selected alternative,
+  payload type, and exact tested `BindingId` when present. A switch record
+  identifies its statement, operand union, exact tested binding, ordered arm
+  records, uniquely covered alternatives, optional `else`, and exhaustiveness.
+  Each arm record retains the arm source, selected alternative, and payload
+  type. Tagged labels are contextual selectors rather than type expressions and
+  must not receive fabricated ordinary type annotations. Later phases consume
+  these records instead of repeating label lookup.
+- Complete a valid `is` expression as `bool`; complete an invalid one with an
+  error annotation after reporting its source diagnostic. Mark its existing
+  flow-dependent record resolved exactly once. Strip transparent parentheses
+  around the complete condition and its operand when recognizing the exact
+  binding tested by an `if`, but do not look through any other expression.
+- Narrow only the selected body of a direct `is` condition and each explicitly
+  selected switch arm when the operand is an exact binding. Negated tests,
+  combined boolean conditions, aliases, and the failed tests represented by
+  later `else if` conditions do not introduce narrowing. A final `else` body is
+  never narrowed. Key the environment by `BindingId`, not spelling, so lexical
+  shadowing neither inherits nor destroys another binding's narrowing.
+- Apply the payload type to binding reads, member and index receivers, calls,
+  method calls, and indirect mutation in the narrowed body. Recompute only
+  annotations that were explicitly deferred for flow-dependent input or whose
+  already-recorded child type changed because of narrowing; do not repeat
+  literal decoding, source name lookup, constructor selection, or unrelated
+  inference. Append final annotations through the existing latest-annotation
+  convention and resolve each corresponding deferred record once.
+- Continue to check a direct assignment to the tested binding against its
+  declared union type, then invalidate that binding's narrowing on the
+  assignment's fallthrough path. At a control-flow join, retain a narrowing
+  only when every reachable fallthrough path preserves the same payload type;
+  terminal paths do not participate in the join. Conservatively invalidate it
+  after a loop when an executable body path can directly reassign the binding,
+  because the loop may execute. Mutation reached through a narrowed member or
+  index does not change the union discriminant and does not invalidate the
+  narrowing.
+- Revisit Phase 2's deferred mutability obligations after their narrowed target
+  types become concrete. Move valid operations into the normal authorization
+  records and diagnose invalid ones using the original target and operation
+  spans. Leave an obligation deferred only when it still depends on postfix
+  `?`, which Phase 5 owns.
+- Validate switch coverage by resolved alternative identity rather than source
+  spelling. Without `else`, require every direct alternative exactly once and
+  emit one diagnostic at the switch for non-exhaustive coverage, listing missing
+  alternatives in deterministic union order. An `else` supplies the unmatched
+  path. If unique explicit arms already cover the union, retain the valid switch
+  and emit one unreachable-source warning at the `else` body. Continue checking
+  the bodies of missing, invalid, or duplicate arms so independent semantic
+  diagnostics are not lost; only uniquely resolved arms contribute to
+  coverage.
+- Recompose the Phase 3 switch-dependent flow summaries after coverage is
+  known. Remove the unmatched path for an exhaustive switch and preserve it for
+  an invalid non-exhaustive switch. Resolve deferred function-return,
+  final-block-value, and reachability conclusions after all switch dependencies
+  they name are concrete. Suppress a cascading missing-return diagnostic when
+  the same path is already invalid solely because its switch is non-exhaustive,
+  and do not duplicate warnings emitted by Phase 3. Preserve only conclusions
+  whose remaining unknown is postfix `?` for Phase 5.
+- Add semantic tests for tagged, untagged, nested, and special `Error`
+  alternatives; every contextual-label error; duplicate, missing, exhaustive,
+  partial-with-`else`, and redundant-`else` switches; and rejection of the
+  reserved `Error` spelling in every declaration and binding category. Cover
+  direct and parenthesized tests, shadowing, scope exit, negated and combined
+  conditions, aliases, failed branches, and unnarrowed `else` bodies.
+- Test narrowed reads, member/index access, calls, methods, direct and indirect
+  mutation, deferred mutability, assignment invalidation, branch joins, loops,
+  and terminal paths. Cover return and reachability results depending on one or
+  multiple switches, coexistence of warnings and semantic errors, and absence
+  of duplicate warnings. Preserve all earlier semantic tests, CLI ordering and
+  no-output-on-error behavior, and milestone 4 generated-C assertions.
+
+Exit criterion: every `is` expression and switch has a final contextual
+alternative record; all branch-local types, assignment invalidations, and
+related mutability decisions are final; switch coverage is proven or diagnosed;
+dependent return and reachability facts are recomposed without duplicate or
+cascading diagnostics; and only postfix-`?` work remains deferred to Phase 5.
 
 ## Phase 5: Postfix `?`
 
