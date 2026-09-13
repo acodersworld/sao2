@@ -16,6 +16,24 @@ pub(crate) struct CompileOutput {
 }
 
 #[derive(Debug)]
+pub(crate) struct CompileFailure {
+    pub(crate) error: CompileError,
+    pub(crate) warnings: Warnings,
+}
+
+impl CompileFailure {
+    pub(crate) fn exit_code(&self) -> i32 {
+        self.error.exit_code()
+    }
+}
+
+impl fmt::Display for CompileFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+#[derive(Debug)]
 pub enum CompileError {
     Diagnostic(Diagnostic),
     SourceDiagnostics(Diagnostics),
@@ -49,14 +67,14 @@ impl fmt::Display for CompileError {
 /// name-and-type analysis, and semantic analysis to generated C. The
 /// analyzed-AST-to-C subset remains temporary until the typed backend replaces
 /// it.
-pub(crate) fn compile(source: &SourceFile) -> Result<CompileOutput, CompileError> {
+pub(crate) fn compile(source: &SourceFile) -> Result<CompileOutput, CompileFailure> {
     compile_into(source, Path::new("build"))
 }
 
 fn compile_into(
     source: &SourceFile,
     build_directory: &Path,
-) -> Result<CompileOutput, CompileError> {
+) -> Result<CompileOutput, CompileFailure> {
     compile_into_with_semantic(source, build_directory, |_| {})
 }
 
@@ -64,36 +82,59 @@ fn compile_into_with_semantic(
     source: &SourceFile,
     build_directory: &Path,
     inject: impl for<'ast> FnOnce(&mut SemanticResult<'ast>),
-) -> Result<CompileOutput, CompileError> {
-    let program = parser::parse(source).map_err(CompileError::SourceDiagnostics)?;
+) -> Result<CompileOutput, CompileFailure> {
+    let program = parser::parse(source).map_err(|diagnostics| CompileFailure {
+        error: CompileError::SourceDiagnostics(diagnostics),
+        warnings: Warnings::new(),
+    })?;
     let mut analysis = analysis::analyze(source, &program);
     if !analysis.diagnostics.is_empty() {
-        return Err(CompileError::SourceDiagnostics(analysis.diagnostics));
+        return Err(CompileFailure {
+            error: CompileError::SourceDiagnostics(analysis.diagnostics),
+            warnings: Warnings::new(),
+        });
     }
     let mut semantic = semantic::analyze(&mut analysis);
     inject(&mut semantic);
     if !semantic.diagnostics.is_empty() {
-        return Err(CompileError::SourceDiagnostics(semantic.diagnostics));
+        return Err(CompileFailure {
+            error: CompileError::SourceDiagnostics(semantic.diagnostics),
+            warnings: semantic.warnings,
+        });
     }
     let entry_point = semantic
         .entry_point
         .expect("a diagnostic-free semantic result has a valid entry point");
     let main = analysis.function_signature(entry_point.function_id());
-    let generated_c = c_emitter::emit(source, &program, &analysis, main)?;
+    let generated_c = match c_emitter::emit(source, &program, &analysis, main) {
+        Ok(generated_c) => generated_c,
+        Err(error) => {
+            return Err(CompileFailure {
+                error: CompileError::Diagnostic(error),
+                warnings: semantic.warnings,
+            });
+        }
+    };
 
-    fs::create_dir_all(build_directory).map_err(|error| {
-        Diagnostic::compiler(format!(
-            "cannot create build directory '{}': {error}",
-            build_directory.display()
-        ))
-    })?;
+    if let Err(error) = fs::create_dir_all(build_directory) {
+        return Err(CompileFailure {
+            error: CompileError::Diagnostic(Diagnostic::compiler(format!(
+                "cannot create build directory '{}': {error}",
+                build_directory.display()
+            ))),
+            warnings: semantic.warnings,
+        });
+    }
     let output_path = build_directory.join("program.c");
-    fs::write(&output_path, generated_c).map_err(|error| {
-        Diagnostic::compiler(format!(
-            "cannot write generated C file '{}': {error}",
-            output_path.display()
-        ))
-    })?;
+    if let Err(error) = fs::write(&output_path, generated_c) {
+        return Err(CompileFailure {
+            error: CompileError::Diagnostic(Diagnostic::compiler(format!(
+                "cannot write generated C file '{}': {error}",
+                output_path.display()
+            ))),
+            warnings: semantic.warnings,
+        });
+    }
     Ok(CompileOutput {
         generated_c: output_path,
         warnings: semantic.warnings,
@@ -105,7 +146,7 @@ fn compile_into_with_semantic_result(
     source: &SourceFile,
     build_directory: &Path,
     inject: impl for<'ast> FnOnce(&mut SemanticResult<'ast>),
-) -> Result<CompileOutput, CompileError> {
+) -> Result<CompileOutput, CompileFailure> {
     compile_into_with_semantic(source, build_directory, inject)
 }
 
@@ -188,11 +229,6 @@ mod tests {
                 "fn main(args [str]) { print(\"x\"); }",
                 "does not support parameters",
             ),
-            (
-                "fn main() int {}",
-                "requires integer main to have a final value or unconditional return",
-            ),
-            ("fn main() { 1 }", "final value in no-value main"),
             ("fn main() { 1; }", "does not support this expression"),
             (
                 "fn main() { panic(\"stop\"); }",
@@ -280,29 +316,35 @@ mod tests {
 
     #[test]
     fn semantic_errors_precede_backend_validation_and_preserve_output() {
-        for existing in [false, true] {
-            let build_directory = temporary_directory("semantic-error");
-            let output_path = build_directory.join("program.c");
-            if existing {
-                fs::create_dir(&build_directory).unwrap();
-                fs::write(&output_path, "existing generated C").unwrap();
-            }
+        for (text, expected) in [
+            ("type Number(int); fn helper() {}", "requires one 'main'"),
+            ("fn main() int {}", "may fall through without returning a value"),
+            ("fn main() { 1 }", "no-value function cannot have a final value"),
+        ] {
+            for existing in [false, true] {
+                let build_directory = temporary_directory("semantic-error");
+                let output_path = build_directory.join("program.c");
+                if existing {
+                    fs::create_dir(&build_directory).unwrap();
+                    fs::write(&output_path, "existing generated C").unwrap();
+                }
 
-            let source = source("type Number(int); fn helper() {}");
-            let diagnostic = compile_into(&source, &build_directory)
-                .unwrap_err()
-                .to_string();
+                let source = source(text);
+                let diagnostic = compile_into(&source, &build_directory)
+                    .unwrap_err()
+                    .to_string();
 
-            assert!(diagnostic.contains("requires one 'main'"), "{diagnostic}");
-            assert!(!diagnostic.contains("temporary backend"), "{diagnostic}");
-            if existing {
-                assert_eq!(
-                    fs::read_to_string(&output_path).unwrap(),
-                    "existing generated C"
-                );
-                fs::remove_dir_all(&build_directory).unwrap();
-            } else {
-                assert!(!build_directory.exists());
+                assert!(diagnostic.contains(expected), "{diagnostic}");
+                assert!(!diagnostic.contains("temporary backend"), "{diagnostic}");
+                if existing {
+                    assert_eq!(
+                        fs::read_to_string(&output_path).unwrap(),
+                        "existing generated C"
+                    );
+                    fs::remove_dir_all(&build_directory).unwrap();
+                } else {
+                    assert!(!build_directory.exists());
+                }
             }
         }
     }
@@ -366,6 +408,47 @@ mod tests {
 
         assert!(output.warnings.to_string().contains("synthetic warning"));
         assert!(output.generated_c.exists());
+        fs::remove_dir_all(build_directory).unwrap();
+    }
+
+    #[test]
+    fn real_unreachable_warning_is_nonfatal_for_a_supported_program() {
+        let source = source("fn main() int { return 1; after := 2; }");
+        let build_directory = temporary_directory("real-warning");
+        let output = compile_into(&source, &build_directory).unwrap();
+        assert!(output.warnings.to_string().contains("unreachable source"));
+        assert!(output.generated_c.exists());
+        fs::remove_dir_all(build_directory).unwrap();
+    }
+
+    #[test]
+    fn semantic_and_backend_failures_retain_prior_warnings_without_writing_output() {
+        for (text, expected) in [
+            (
+                "fn main() { panic(\"stop\"); return 1; }",
+                "cannot return a value",
+            ),
+            (
+                "fn main() { return; after := 1; }",
+                "temporary backend supports return only from integer main",
+            ),
+        ] {
+            let source = source(text);
+            let build_directory = temporary_directory("warning-failure");
+            let failure = compile_into(&source, &build_directory).unwrap_err();
+            assert!(failure.warnings.to_string().contains("unreachable source"));
+            assert!(failure.to_string().contains(expected), "{failure}");
+            assert!(!build_directory.exists());
+        }
+
+        let source = source("fn main() { panic(\"stop\"); return 1; }");
+        let build_directory = temporary_directory("warning-preserve");
+        fs::create_dir(&build_directory).unwrap();
+        let output_path = build_directory.join("program.c");
+        fs::write(&output_path, "existing generated C").unwrap();
+        let failure = compile_into(&source, &build_directory).unwrap_err();
+        assert!(failure.warnings.to_string().contains("unreachable source"));
+        assert_eq!(fs::read_to_string(&output_path).unwrap(), "existing generated C");
         fs::remove_dir_all(build_directory).unwrap();
     }
 }

@@ -41,7 +41,9 @@ fn build(options: cli::CompileOptions, requested_run: bool) -> i32 {
     };
     let compiled = match compiler::compile(&source) {
         Ok(compiled) => compiled,
-        Err(error) => return report_error(&error, error.exit_code()),
+        Err(failure) => {
+            return report_compile_failure(failure, &mut std::io::stderr());
+        }
     };
     finish_build(
         compiled,
@@ -51,6 +53,17 @@ fn build(options: cli::CompileOptions, requested_run: bool) -> i32 {
         host_compiler::compile,
         program::run,
     )
+}
+
+fn report_compile_failure<W: Write>(
+    failure: compiler::CompileFailure,
+    standard_error: &mut W,
+) -> i32 {
+    if !failure.warnings.is_empty() {
+        let _ = writeln!(standard_error, "{}", failure.warnings);
+    }
+    let _ = writeln!(standard_error, "{}", failure.error);
+    failure.exit_code()
 }
 
 fn finish_build<W, H, R>(
@@ -157,5 +170,31 @@ mod tests {
             |_| unreachable!("build must not run the executable"),
         );
         assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn warnings_are_rendered_before_a_compile_failure_without_changing_its_status() {
+        let source = SourceFile::new(PathBuf::from("test.sao2"), "fn main() {}".to_owned());
+        let mut warnings = Warnings::new();
+        warnings.push(Diagnostic::source_warning(
+            &source,
+            Span::empty(0),
+            "unreachable source",
+        ));
+        let captured = Rc::new(RefCell::new(Vec::new()));
+        let mut sink = Captured(Rc::clone(&captured));
+        let status = report_compile_failure(
+            compiler::CompileFailure {
+                error: compiler::CompileError::Diagnostic(Diagnostic::compiler("backend failed")),
+                warnings,
+            },
+            &mut sink,
+        );
+        let rendered = String::from_utf8(captured.borrow().clone()).unwrap();
+        assert!(
+            rendered.find("source warning").unwrap()
+                < rendered.find("compiler error").unwrap()
+        );
+        assert_eq!(status, 1);
     }
 }

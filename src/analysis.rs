@@ -2289,12 +2289,21 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
     ) -> TypeState {
         let left_state = self.infer_expression(left);
         let right_state = self.infer_expression(right);
+        let bool_type = self.analysis.types.primitive(PrimitiveType::Bool);
+        if matches!(operator, BinaryOperator::LogicalOr | BinaryOperator::LogicalAnd)
+            && left_state == TypeState::Resolved(bool_type)
+            && right_state == TypeState::Never
+        {
+            // The right operand may be skipped. Semantic flow analysis records
+            // its divergent path, but normal short-circuit completion still
+            // gives the complete expression type bool.
+            return TypeState::Resolved(bool_type);
+        }
         let (TypeState::Resolved(left_type), TypeState::Resolved(right_type)) =
             (left_state, right_state)
         else {
             return self.combine_operand_states(expression, left_state, right_state);
         };
-        let bool_type = self.analysis.types.primitive(PrimitiveType::Bool);
         let int_type = self.analysis.types.primitive(PrimitiveType::Int);
         let result = match operator {
             BinaryOperator::LogicalOr | BinaryOperator::LogicalAnd

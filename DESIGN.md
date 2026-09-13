@@ -731,8 +731,9 @@ for equal spans. The compiler recovers at safe boundaries such as semicolons
 and closing braces to report multiple errors.
 
 In v0, only statically unreachable source produces a warning. Such warnings are
-non-fatal: successful `build` and `run` commands print them to standard error
-without changing their normal status. Reachability is structural; the compiler
+non-fatal: `build` and `run` print them to standard error on both success and
+failure, before any fatal diagnostic, without changing the status that the
+command would otherwise return. Reachability is structural; the compiler
 does not infer non-termination from literal loop conditions or perform general
 constant folding for this purpose. The first construct in each contiguous
 unreachable region produces one warning. Warning policy beyond unreachable

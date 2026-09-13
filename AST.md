@@ -201,10 +201,10 @@ compiler invariant failure. C is generated fully in memory before filesystem
 output, so frontend or capability errors cannot create or truncate generated
 source.
 
-This boundary is deliberately temporary. Later milestone 5 phases remain
-responsible for complete mutability and return-path validation, unreachable and
-loop-context checks, narrowing, switch coverage, and resolving flow-dependent
-expressions.
+This boundary is deliberately temporary. Completed milestone 5 phases now own
+mutability, structural return-path validation, unreachable warnings, and loop
+control resolution. Later phases remain responsible for narrowing, switch
+coverage, postfix `?`, and resolving flow-dependent expressions.
 Milestone 6 will replace direct AST emission with typed IR that makes control
 flow, evaluation order, runtime checks, and source locations explicit.
 
@@ -231,3 +231,21 @@ typed path. Paths whose member or receiver type depends on union narrowing are
 retained as explicit deferred mutability obligations associated with the
 existing `DeferredId`; Phase 4 must resolve those obligations. The temporary C
 emitter remains unchanged and does not own these permissions.
+
+## Semantic control-flow handoff
+
+Semantic Phase 3 records dependency-free flow flags for fallthrough, function
+return, loop break, loop continue, and divergence. Side-table summaries retain
+direct references to every block, statement, statement body, expression,
+expression body, and switch arm. Sequential summaries contain only exits from
+reachable paths, while nested bodies are still analyzed independently so their
+own unreachable regions and semantic errors are preserved.
+
+Valid explicit returns retain their statement, enclosing `FunctionId`, optional
+value expression, and resolved or deferred value state. Valid `break` and
+`continue` statements retain the nearest lexically enclosing loop statement.
+Non-`else` switches whose unmatched path is the only remaining fallthrough
+produce explicit return-flow or reachability obligations for Phase 4 rather
+than premature diagnostics or warnings. A deferred outer function value also
+retains its function, block, expression, and declared result so Phase 4 can
+finish implicit-return or no-value validation after narrowing.

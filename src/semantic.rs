@@ -1,8 +1,9 @@
 //! Flow-sensitive semantic validation over completed name-and-type analysis.
 //!
 //! Phase 1 establishes this boundary and gives it ownership of executable entry
-//! point validation. Phase 2 adds mutability authorization and explicit
-//! obligations for paths that remain flow-dependent until union narrowing.
+//! point validation. Phase 2 adds mutability authorization. Phase 3 records
+//! structural control flow, validates returns and loop control, and diagnoses
+//! unreachable regions while retaining switch-dependent obligations.
 
 use crate::analysis::{
     AccessPathStep, Analysis, BindingAccess, BindingId, BuiltinMethod, CallTarget,
@@ -10,9 +11,9 @@ use crate::analysis::{
     ResolvedType, TypeDefinitionKind, TypeId, TypeState, UnionAlternative,
 };
 use crate::ast::{
-    Argument, ArgumentKind, AssignmentOperator, AssignmentTarget, Block, Expression,
-    ExpressionBody, ExpressionBodyKind, ExpressionKind, Member, PrimitiveType, Statement,
-    StatementBody, StatementBodyKind, StatementKind,
+    Argument, ArgumentKind, AssignmentOperator, AssignmentTarget, BinaryOperator, Block,
+    Expression, ExpressionBody, ExpressionBodyKind, ExpressionKind, FunctionDeclaration, Member,
+    PrimitiveType, Statement, StatementBody, StatementBodyKind, StatementKind, SwitchArm,
 };
 use crate::diagnostic::{Diagnostic, Diagnostics, Warnings};
 use crate::source::Span;
@@ -119,6 +120,216 @@ pub(crate) struct SemanticResult<'ast> {
     pub(crate) mutability: Vec<MutabilityResolution<'ast>>,
     #[allow(dead_code)] // Consumed by Phase 4 narrowing.
     pub(crate) deferred_mutability: Vec<DeferredMutability<'ast>>,
+    #[allow(dead_code)] // Consumed by Phase 4 and typed-IR lowering.
+    pub(crate) flow: FlowFacts<'ast>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FlowFlags(u8);
+
+impl FlowFlags {
+    pub(crate) const FALLTHROUGH: Self = Self(1 << 0);
+    pub(crate) const RETURN: Self = Self(1 << 1);
+    pub(crate) const BREAK: Self = Self(1 << 2);
+    pub(crate) const CONTINUE: Self = Self(1 << 3);
+    pub(crate) const DIVERGE: Self = Self(1 << 4);
+
+    pub(crate) fn contains(self, flag: Self) -> bool {
+        self.0 & flag.0 != 0
+    }
+
+    fn insert(&mut self, flags: Self) {
+        self.0 |= flags.0;
+    }
+
+    fn remove(&mut self, flags: Self) {
+        self.0 &= !flags.0;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FallthroughKind {
+    None,
+    Definite,
+    SwitchDependent,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FlowSummary<'ast> {
+    pub(crate) flags: FlowFlags,
+    pub(crate) fallthrough: FallthroughKind,
+    /// Non-`else` switches that may govern the remaining fallthrough paths.
+    pub(crate) switch_dependencies: Box<[&'ast Statement]>,
+}
+
+impl<'ast> FlowSummary<'ast> {
+    fn terminal(flags: FlowFlags) -> Self {
+        Self {
+            flags,
+            fallthrough: FallthroughKind::None,
+            switch_dependencies: Box::new([]),
+        }
+    }
+
+    fn fallthrough() -> Self {
+        Self {
+            flags: FlowFlags::FALLTHROUGH,
+            fallthrough: FallthroughKind::Definite,
+            switch_dependencies: Box::new([]),
+        }
+    }
+
+    fn dependent(switches: Vec<&'ast Statement>) -> Self {
+        Self {
+            flags: FlowFlags::FALLTHROUGH,
+            fallthrough: FallthroughKind::SwitchDependent,
+            switch_dependencies: switches.into_boxed_slice(),
+        }
+    }
+
+    fn can_fallthrough(&self) -> bool {
+        self.fallthrough != FallthroughKind::None
+    }
+
+    fn then(mut self, next: Self) -> Self {
+        if !self.can_fallthrough() {
+            return self;
+        }
+        let entry_kind = self.fallthrough;
+        let mut dependencies = self.switch_dependencies.into_vec();
+        self.flags.remove(FlowFlags::FALLTHROUGH);
+        self.flags.insert(FlowFlags(next.flags.0 & !FlowFlags::FALLTHROUGH.0));
+        self.fallthrough = match (entry_kind, next.fallthrough) {
+            (_, FallthroughKind::None) => FallthroughKind::None,
+            (FallthroughKind::Definite, kind) => kind,
+            (FallthroughKind::SwitchDependent, _) => FallthroughKind::SwitchDependent,
+            (FallthroughKind::None, _) => unreachable!(),
+        };
+        if self.fallthrough != FallthroughKind::None {
+            if entry_kind == FallthroughKind::Definite {
+                dependencies.clear();
+            }
+            dependencies.extend(next.switch_dependencies);
+            deduplicate_switches(&mut dependencies);
+            self.flags.insert(FlowFlags::FALLTHROUGH);
+        } else {
+            dependencies.clear();
+        }
+        self.switch_dependencies = dependencies.into_boxed_slice();
+        self
+    }
+
+    fn alternatives(flows: impl IntoIterator<Item = Self>) -> Self {
+        let mut flags = FlowFlags::default();
+        let mut kind = FallthroughKind::None;
+        let mut dependencies = Vec::new();
+        for flow in flows {
+            flags.insert(flow.flags);
+            match flow.fallthrough {
+                FallthroughKind::Definite => {
+                    kind = FallthroughKind::Definite;
+                    dependencies.clear();
+                }
+                FallthroughKind::SwitchDependent if kind != FallthroughKind::Definite => {
+                    kind = FallthroughKind::SwitchDependent;
+                    dependencies.extend(flow.switch_dependencies);
+                }
+                FallthroughKind::None | FallthroughKind::SwitchDependent => {}
+            }
+        }
+        if kind == FallthroughKind::None {
+            flags.remove(FlowFlags::FALLTHROUGH);
+        } else {
+            flags.insert(FlowFlags::FALLTHROUGH);
+        }
+        deduplicate_switches(&mut dependencies);
+        Self {
+            flags,
+            fallthrough: kind,
+            switch_dependencies: dependencies.into_boxed_slice(),
+        }
+    }
+}
+
+fn deduplicate_switches(switches: &mut Vec<&Statement>) {
+    let mut index = 0;
+    while index < switches.len() {
+        if switches[..index]
+            .iter()
+            .any(|prior| std::ptr::eq(*prior, switches[index]))
+        {
+            switches.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Retained for typed-IR lowering.
+pub(crate) struct ExplicitReturn<'ast> {
+    pub(crate) statement: &'ast Statement,
+    pub(crate) function: FunctionId,
+    pub(crate) value: Option<&'ast Expression>,
+    pub(crate) value_state: TypeState,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Retained for typed-IR lowering.
+pub(crate) struct LoopControl<'ast> {
+    pub(crate) statement: &'ast Statement,
+    pub(crate) target: &'ast Statement,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Phase 4 recomposes these after proving switch coverage.
+pub(crate) enum DeferredFlowKind<'ast> {
+    FunctionReturn {
+        function: FunctionId,
+        body: &'ast Block,
+    },
+    FunctionFinalValue {
+        function: FunctionId,
+        body: &'ast Block,
+        value: &'ast Expression,
+        declared_result: TypeState,
+    },
+    Reachability {
+        construct: FlowSubject<'ast>,
+    },
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // Phase 4 recomposes these after proving switch coverage.
+pub(crate) struct DeferredFlow<'ast> {
+    pub(crate) kind: DeferredFlowKind<'ast>,
+    pub(crate) switches: Box<[&'ast Statement]>,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Variants are retained for Phase 4 recomposition and typed-IR lowering.
+pub(crate) enum FlowSubject<'ast> {
+    Block(&'ast Block),
+    Statement(&'ast Statement),
+    StatementBody(&'ast StatementBody),
+    Expression(&'ast Expression),
+    ExpressionBody(&'ast ExpressionBody),
+    SwitchArm(&'ast SwitchArm),
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // The complete side-table record is consumed by later milestones.
+pub(crate) struct FlowRecord<'ast> {
+    pub(crate) subject: FlowSubject<'ast>,
+    pub(crate) summary: FlowSummary<'ast>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct FlowFacts<'ast> {
+    pub(crate) summaries: Vec<FlowRecord<'ast>>,
+    pub(crate) returns: Vec<ExplicitReturn<'ast>>,
+    pub(crate) loop_controls: Vec<LoopControl<'ast>>,
+    pub(crate) deferred: Vec<DeferredFlow<'ast>>,
 }
 
 pub(crate) fn analyze<'ast>(analysis: &mut Analysis<'_, 'ast>) -> SemanticResult<'ast> {
@@ -155,13 +366,16 @@ pub(crate) fn analyze<'ast>(analysis: &mut Analysis<'_, 'ast>) -> SemanticResult
 
     let (mutability, deferred_mutability) =
         MutabilityValidator::new(analysis, &mut diagnostics).validate();
+    let mut warnings = Warnings::new();
+    let flow = FlowValidator::new(analysis, &mut diagnostics, &mut warnings).validate();
     debug_assert!(entry_point.is_some() || !diagnostics.is_empty());
     SemanticResult {
         diagnostics,
-        warnings: Warnings::new(),
+        warnings,
         entry_point,
         mutability,
         deferred_mutability,
+        flow,
     }
 }
 
@@ -204,6 +418,484 @@ fn valid_main_signature(
         || signature.result
             == TypeState::Resolved(analysis.types.primitive(PrimitiveType::Int));
     parameters_valid && result_valid
+}
+
+struct FlowValidator<'analysis, 'diagnostics, 'warnings, 'source, 'ast> {
+    analysis: &'analysis mut Analysis<'source, 'ast>,
+    diagnostics: &'diagnostics mut Diagnostics,
+    warnings: &'warnings mut Warnings,
+    facts: FlowFacts<'ast>,
+    function: Option<(FunctionId, TypeState)>,
+    loops: Vec<&'ast Statement>,
+}
+
+impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
+    FlowValidator<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
+{
+    fn new(
+        analysis: &'analysis mut Analysis<'source, 'ast>,
+        diagnostics: &'diagnostics mut Diagnostics,
+        warnings: &'warnings mut Warnings,
+    ) -> Self {
+        Self {
+            analysis,
+            diagnostics,
+            warnings,
+            facts: FlowFacts::default(),
+            function: None,
+            loops: Vec::new(),
+        }
+    }
+
+    fn validate(mut self) -> FlowFacts<'ast> {
+        let functions = self
+            .analysis
+            .function_signatures
+            .iter()
+            .map(|signature| (signature.id, signature.node, signature.result))
+            .collect::<Vec<_>>();
+        for (id, function, result) in functions {
+            self.validate_function(id, function, result);
+        }
+        self.facts
+    }
+
+    fn validate_function(
+        &mut self,
+        id: FunctionId,
+        function: &'ast FunctionDeclaration,
+        result: TypeState,
+    ) {
+        self.function = Some((id, result));
+        debug_assert!(self.loops.is_empty());
+        let body_flow = self.block(&function.body);
+        let final_state = function
+            .body
+            .value
+            .as_deref()
+            .map_or(TypeState::NoValue, |value| self.expression_state(value));
+        if let (Some(value), TypeState::Deferred(_)) =
+            (function.body.value.as_deref(), final_state)
+        {
+            self.facts.deferred.push(DeferredFlow {
+                kind: DeferredFlowKind::FunctionFinalValue {
+                    function: id,
+                    body: &function.body,
+                    value,
+                    declared_result: result,
+                },
+                switches: body_flow.switch_dependencies.clone(),
+            });
+        }
+
+        match result {
+            TypeState::NoValue => {
+                if function.body.value.is_some() && matches!(final_state, TypeState::Resolved(_)) {
+                    self.error(
+                        function.body.value.as_deref().unwrap().span,
+                        "no-value function cannot have a final value",
+                    );
+                }
+            }
+            TypeState::Resolved(_) => {
+                let implicitly_returns = function.body.value.is_some()
+                    && matches!(final_state, TypeState::Resolved(_) | TypeState::Deferred(_));
+                if body_flow.can_fallthrough() && !implicitly_returns {
+                    match body_flow.fallthrough {
+                        FallthroughKind::Definite => self.error(
+                            closing_brace_span(&function.body),
+                            "value-returning function may fall through without returning a value",
+                        ),
+                        FallthroughKind::SwitchDependent => {
+                            self.facts.deferred.push(DeferredFlow {
+                                kind: DeferredFlowKind::FunctionReturn {
+                                    function: id,
+                                    body: &function.body,
+                                },
+                                switches: body_flow.switch_dependencies.clone(),
+                            });
+                        }
+                        FallthroughKind::None => {}
+                    }
+                }
+            }
+            _ => panic!("semantic analysis received an invalid function result type"),
+        }
+        self.function = None;
+    }
+
+    fn block(&mut self, block: &'ast Block) -> FlowSummary<'ast> {
+        let mut flow = FlowSummary::fallthrough();
+        let mut unreachable_region = false;
+        let mut deferred_dependencies: Vec<&'ast Statement> = Vec::new();
+        for statement in &block.statements {
+            let statement_flow = self.statement(statement);
+            match flow.fallthrough {
+                FallthroughKind::None => {
+                    if !unreachable_region {
+                        self.warn(statement.span);
+                        unreachable_region = true;
+                    }
+                }
+                FallthroughKind::SwitchDependent => {
+                    if !same_switches(&deferred_dependencies, &flow.switch_dependencies) {
+                        self.defer_reachability(
+                            FlowSubject::Statement(statement),
+                            &flow.switch_dependencies,
+                        );
+                        deferred_dependencies = flow.switch_dependencies.to_vec();
+                    }
+                    flow = flow.then(statement_flow);
+                }
+                FallthroughKind::Definite => {
+                    deferred_dependencies.clear();
+                    flow = flow.then(statement_flow);
+                }
+            }
+        }
+        if let Some(value) = block.value.as_deref() {
+            let value_flow = self.expression(value);
+            match flow.fallthrough {
+                FallthroughKind::None => {
+                    if !unreachable_region {
+                        self.warn(value.span);
+                    }
+                }
+                FallthroughKind::SwitchDependent => {
+                    if !same_switches(&deferred_dependencies, &flow.switch_dependencies) {
+                        self.defer_reachability(
+                            FlowSubject::Expression(value),
+                            &flow.switch_dependencies,
+                        );
+                    }
+                    flow = flow.then(value_flow);
+                }
+                FallthroughKind::Definite => flow = flow.then(value_flow),
+            }
+        }
+        self.record(FlowSubject::Block(block), flow.clone());
+        flow
+    }
+
+    fn statement(&mut self, statement: &'ast Statement) -> FlowSummary<'ast> {
+        let flow = match &statement.kind {
+            StatementKind::Local { initializer, .. } => {
+                let flow = self.expression(initializer);
+                let state = self.expression_state(initializer);
+                let binding = self
+                    .analysis
+                    .local_binding(statement)
+                    .expect("local statement has a stable binding identity");
+                if self.analysis.binding_types[binding.index()].state == TypeState::Never
+                    && matches!(state, TypeState::Resolved(_))
+                {
+                    self.analysis.binding_types[binding.index()].state = state;
+                }
+                flow
+            }
+            StatementKind::Assignment { target, value, .. } => {
+                let mut flow = FlowSummary::fallthrough();
+                for suffix in &target.suffixes {
+                    if let crate::ast::AssignmentTargetSuffixKind::Index(index) = &suffix.kind {
+                        flow = flow.then(self.expression(index));
+                    }
+                }
+                flow.then(self.expression(value))
+            }
+            StatementKind::Expression(expression) => self.expression(expression),
+            StatementKind::Return(value) => self.return_statement(statement, value.as_ref()),
+            StatementKind::Break => self.loop_control(statement, FlowFlags::BREAK),
+            StatementKind::Continue => self.loop_control(statement, FlowFlags::CONTINUE),
+            StatementKind::If { branches, else_body } => {
+                let mut remaining = FlowSummary::fallthrough();
+                let mut alternatives = Vec::new();
+                for branch in branches {
+                    remaining = remaining.then(self.expression(&branch.condition));
+                    alternatives.push(remaining.clone().then(self.statement_body(&branch.body)));
+                }
+                if let Some(body) = else_body {
+                    alternatives.push(remaining.then(self.statement_body(body)));
+                } else {
+                    alternatives.push(remaining);
+                }
+                FlowSummary::alternatives(alternatives)
+            }
+            StatementKind::While { condition, body } => {
+                let condition = self.expression(condition);
+                self.loops.push(statement);
+                let body = self.statement_body(body);
+                self.loops.pop();
+                self.loop_flow(condition, body)
+            }
+            StatementKind::For { iterable, body, .. } => {
+                let iterable = self.expression(iterable);
+                self.loops.push(statement);
+                let body = self.statement_body(body);
+                self.loops.pop();
+                self.loop_flow(iterable, body)
+            }
+            StatementKind::Switch { value, arms, else_body } => {
+                let value = self.expression(value);
+                let mut alternatives = Vec::new();
+                for arm in arms {
+                    let arm_flow = self.statement_body(&arm.body);
+                    self.record(FlowSubject::SwitchArm(arm), arm_flow.clone());
+                    alternatives.push(arm_flow);
+                }
+                if let Some(body) = else_body {
+                    alternatives.push(self.statement_body(body));
+                } else {
+                    // Until Phase 4 proves coverage, the unmatched path remains
+                    // conservatively reachable. It is switch-dependent rather
+                    // than definite so nested unresolved switches do not cause
+                    // premature function-fallthrough errors.
+                    alternatives.push(FlowSummary::dependent(vec![statement]));
+                }
+                value.then(FlowSummary::alternatives(alternatives))
+            }
+            StatementKind::Block(block) => self.block(block),
+        };
+        self.record(FlowSubject::Statement(statement), flow.clone());
+        flow
+    }
+
+    fn return_statement(
+        &mut self,
+        statement: &'ast Statement,
+        value: Option<&'ast Expression>,
+    ) -> FlowSummary<'ast> {
+        let (function, result) = self
+            .function
+            .expect("return validation requires an enclosing function");
+        let value_state = value.map_or(TypeState::NoValue, |value| self.expression_state(value));
+        let valid = match (result, value) {
+            (TypeState::NoValue, None) => true,
+            (TypeState::NoValue, Some(_)) => {
+                self.error(statement.span, "no-value function cannot return a value");
+                false
+            }
+            (TypeState::Resolved(_), None) => {
+                self.error(statement.span, "value-returning function requires a return value");
+                false
+            }
+            (TypeState::Resolved(_), Some(_)) => true,
+            _ => panic!("semantic analysis received an invalid function result type"),
+        };
+        if valid {
+            self.facts.returns.push(ExplicitReturn {
+                statement,
+                function,
+                value,
+                value_state,
+            });
+        }
+        let evaluated = value.map_or_else(FlowSummary::fallthrough, |value| self.expression(value));
+        if evaluated.can_fallthrough() {
+            let mut returned = evaluated;
+            returned.flags.remove(FlowFlags::FALLTHROUGH);
+            returned.flags.insert(FlowFlags::RETURN);
+            returned.fallthrough = FallthroughKind::None;
+            returned.switch_dependencies = Box::new([]);
+            returned
+        } else {
+            evaluated
+        }
+    }
+
+    fn loop_control(
+        &mut self,
+        statement: &'ast Statement,
+        exit: FlowFlags,
+    ) -> FlowSummary<'ast> {
+        if let Some(target) = self.loops.last().copied() {
+            self.facts.loop_controls.push(LoopControl { statement, target });
+            FlowSummary::terminal(exit)
+        } else {
+            let keyword = if exit == FlowFlags::BREAK { "break" } else { "continue" };
+            self.error(
+                statement.span,
+                format!("'{keyword}' is only valid inside a loop"),
+            );
+            FlowSummary::fallthrough()
+        }
+    }
+
+    fn loop_flow(
+        &self,
+        condition_or_iterable: FlowSummary<'ast>,
+        body: FlowSummary<'ast>,
+    ) -> FlowSummary<'ast> {
+        if !condition_or_iterable.can_fallthrough() {
+            return condition_or_iterable;
+        }
+        let mut flags = condition_or_iterable.flags;
+        flags.remove(FlowFlags::FALLTHROUGH);
+        if body.flags.contains(FlowFlags::RETURN) {
+            flags.insert(FlowFlags::RETURN);
+        }
+        if body.flags.contains(FlowFlags::DIVERGE) {
+            flags.insert(FlowFlags::DIVERGE);
+        }
+        flags.insert(FlowFlags::FALLTHROUGH);
+        FlowSummary {
+            flags,
+            fallthrough: condition_or_iterable.fallthrough,
+            switch_dependencies: condition_or_iterable.switch_dependencies,
+        }
+    }
+
+    fn statement_body(&mut self, body: &'ast StatementBody) -> FlowSummary<'ast> {
+        let flow = match &body.kind {
+            StatementBodyKind::Block(block) => self.block(block),
+            StatementBodyKind::Statement(statement) => self.statement(statement),
+        };
+        self.record(FlowSubject::StatementBody(body), flow.clone());
+        flow
+    }
+
+    fn expression_body(&mut self, body: &'ast ExpressionBody) -> FlowSummary<'ast> {
+        let flow = match &body.kind {
+            ExpressionBodyKind::Block(block) => self.block(block),
+            ExpressionBodyKind::Expression(expression) => self.expression(expression),
+        };
+        self.record(FlowSubject::ExpressionBody(body), flow.clone());
+        flow
+    }
+
+    fn expression(&mut self, expression: &'ast Expression) -> FlowSummary<'ast> {
+        let flow = match &expression.kind {
+            ExpressionKind::Identifier(_)
+            | ExpressionKind::Integer
+            | ExpressionKind::Float
+            | ExpressionKind::String(_)
+            | ExpressionKind::Character(_)
+            | ExpressionKind::Boolean(_)
+            | ExpressionKind::TypedEmptyList(_)
+            | ExpressionKind::TypedEmptyMap(_) => FlowSummary::fallthrough(),
+            ExpressionKind::Parenthesized(inner)
+            | ExpressionKind::Unary { operand: inner, .. }
+            | ExpressionKind::Try { value: inner, .. } => self.expression(inner),
+            ExpressionKind::List(elements) => self.expression_sequence(elements.iter()),
+            ExpressionKind::Map(entries) => self.expression_sequence(
+                entries.iter().flat_map(|entry| [&entry.key, &entry.value]),
+            ),
+            ExpressionKind::Block(block) => self.block(block),
+            ExpressionKind::If { branches, else_branch } => {
+                let mut remaining = FlowSummary::fallthrough();
+                let mut alternatives = Vec::new();
+                for branch in branches {
+                    remaining = remaining.then(self.expression(&branch.condition));
+                    alternatives.push(remaining.clone().then(self.expression_body(&branch.body)));
+                }
+                alternatives.push(remaining.then(self.expression_body(else_branch)));
+                FlowSummary::alternatives(alternatives)
+            }
+            ExpressionKind::Binary { left, operator, right, .. }
+                if matches!(*operator, BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr) =>
+            {
+                let left_flow = self.expression(left);
+                let right_flow = self.expression(right);
+                let evaluated_right = left_flow.clone().then(right_flow);
+                let flow = FlowSummary::alternatives([left_flow.clone(), evaluated_right]);
+                let bool_type = self.analysis.types.primitive(PrimitiveType::Bool);
+                if left_flow.can_fallthrough()
+                    && flow.can_fallthrough()
+                    && self.expression_state(left) == TypeState::Resolved(bool_type)
+                    && self.expression_state(expression) == TypeState::Never
+                {
+                    self.analysis
+                        .annotate_expression(expression, TypeState::Resolved(bool_type));
+                }
+                flow
+            }
+            ExpressionKind::Binary { left, right, .. } => {
+                self.expression(left).then(self.expression(right))
+            }
+            ExpressionKind::Is { value, .. } => self.expression(value),
+            ExpressionKind::Call { callee, arguments } => {
+                let mut flow = self.expression(callee);
+                for argument in arguments {
+                    flow = flow.then(self.expression(argument_value(argument)));
+                }
+                if flow.can_fallthrough()
+                    && matches!(
+                        self.analysis.call_resolution(expression).map(|call| call.target),
+                        Some(CallTarget::Callable(CallableId::Intrinsic(
+                            crate::analysis::IntrinsicId::Panic
+                        )))
+                    )
+                {
+                    flow.flags.remove(FlowFlags::FALLTHROUGH);
+                    flow.flags.insert(FlowFlags::DIVERGE);
+                    flow.fallthrough = FallthroughKind::None;
+                    flow.switch_dependencies = Box::new([]);
+                }
+                flow
+            }
+            ExpressionKind::Index { value, index } => {
+                self.expression(value).then(self.expression(index))
+            }
+            ExpressionKind::Member { value, .. } => self.expression(value),
+        };
+        self.record(FlowSubject::Expression(expression), flow.clone());
+        flow
+    }
+
+    fn expression_sequence(
+        &mut self,
+        expressions: impl Iterator<Item = &'ast Expression>,
+    ) -> FlowSummary<'ast> {
+        expressions.fold(FlowSummary::fallthrough(), |flow, expression| {
+            flow.then(self.expression(expression))
+        })
+    }
+
+    fn expression_state(&self, expression: &'ast Expression) -> TypeState {
+        self.analysis
+            .expression_annotation(expression)
+            .expect("every expression has a name-and-type annotation")
+            .state
+    }
+
+    fn record(&mut self, subject: FlowSubject<'ast>, summary: FlowSummary<'ast>) {
+        self.facts.summaries.push(FlowRecord { subject, summary });
+    }
+
+    fn defer_reachability(
+        &mut self,
+        construct: FlowSubject<'ast>,
+        switches: &[&'ast Statement],
+    ) {
+        self.facts.deferred.push(DeferredFlow {
+            kind: DeferredFlowKind::Reachability { construct },
+            switches: switches.into(),
+        });
+    }
+
+    fn error(&mut self, span: Span, message: impl Into<String>) {
+        self.diagnostics
+            .push(Diagnostic::source(self.analysis.source, span, message));
+    }
+
+    fn warn(&mut self, span: Span) {
+        self.warnings.push(Diagnostic::source_warning(
+            self.analysis.source,
+            span,
+            "unreachable source",
+        ));
+    }
+}
+
+fn closing_brace_span(block: &Block) -> Span {
+    Span::new(block.span.end.saturating_sub(1), block.span.end)
+}
+
+fn same_switches(left: &[&Statement], right: &[&Statement]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| std::ptr::eq(*left, *right))
 }
 
 enum Place<'ast> {
@@ -855,9 +1547,9 @@ mod tests {
     fn accepts_all_four_entry_point_signatures() {
         for text in [
             "fn main() {}",
-            "fn main() int {}",
+            "fn main() int { 0 }",
             "fn main(args [str]) {}",
-            "fn main(args [str]) int {}",
+            "fn main(args [str]) int { 0 }",
         ] {
             with_semantic_result(text, |result| {
                 assert!(
@@ -1013,6 +1705,314 @@ mod tests {
                 .diagnostics
                 .to_string()
                 .contains("duplicate function declaration 'main'")
+        );
+    }
+
+    #[test]
+    fn validates_explicit_implicit_branching_and_diverging_returns() {
+        for text in [
+            "fn answer() int { return 1; } fn main() {}",
+            "fn answer() int { 1 } fn main() {}",
+            "fn answer() int { if true: return 1; else: return 2; } fn main() {}",
+            "fn answer() int { panic(\"stop\"); } fn main() {}",
+            "fn main() { return; }",
+        ] {
+            with_semantic_result(text, |result| {
+                assert!(result.diagnostics.is_empty(), "{text}: {}", result.diagnostics);
+            });
+        }
+
+        for (text, expected) in [
+            (
+                "fn answer() int { return; } fn main() {}",
+                "requires a return value",
+            ),
+            (
+                "fn helper() { return 1; } fn main() {}",
+                "cannot return a value",
+            ),
+            (
+                "fn answer() int {} fn main() {}",
+                "may fall through",
+            ),
+            (
+                "fn helper() { 1 } fn main() {}",
+                "cannot have a final value",
+            ),
+        ] {
+            with_semantic_result(text, |result| {
+                assert!(
+                    result.diagnostics.to_string().contains(expected),
+                    "{text}: {}",
+                    result.diagnostics
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn incompatible_return_values_remain_name_and_type_errors() {
+        let source = source("fn answer() int { return \"wrong\"; } fn main() {}");
+        let program = parser::parse(&source).unwrap();
+        let analysis = analysis::analyze(&source, &program);
+        assert!(
+            analysis
+                .diagnostics
+                .to_string()
+                .contains("expression type does not match expected type")
+        );
+    }
+
+    #[test]
+    fn records_returns_and_resolves_loop_control_to_the_nearest_loop() {
+        with_semantic_result(
+            "fn helper() int { while true { while true { continue; } break; } return 1; } fn main() {}",
+            |result| {
+                assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
+                assert_eq!(result.flow.returns.len(), 1);
+                assert_eq!(result.flow.loop_controls.len(), 2);
+                assert!(!std::ptr::eq(
+                    result.flow.loop_controls[0].target,
+                    result.flow.loop_controls[1].target,
+                ));
+            },
+        );
+
+        for keyword in ["break", "continue"] {
+            let text = format!("fn main() {{ {keyword}; }}");
+            with_semantic_result(&text, |result| {
+                assert!(
+                    result
+                        .diagnostics
+                        .to_string()
+                        .contains("only valid inside a loop"),
+                    "{}",
+                    result.diagnostics
+                );
+            });
+        }
+
+        with_semantic_result(
+            "type Choice(int | str); fn main() { value := Choice(1); switch value { int: break; else: continue; } }",
+            |result| {
+                assert_eq!(
+                    result
+                        .diagnostics
+                        .to_string()
+                        .matches("only valid inside a loop")
+                        .count(),
+                    2
+                );
+            },
+        );
+
+        with_semantic_result(
+            "type Choice(int | str); fn main() { value := Choice(1); while true { switch value { int: break; else: continue; } } }",
+            |result| {
+                assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
+                assert_eq!(result.flow.loop_controls.len(), 2);
+                assert!(std::ptr::eq(
+                    result.flow.loop_controls[0].target,
+                    result.flow.loop_controls[1].target,
+                ));
+            },
+        );
+    }
+
+    #[test]
+    fn warns_once_for_each_contiguous_unreachable_region_and_keeps_validating() {
+        with_semantic_result(
+            concat!(
+                "fn helper() int { return 1; first := 1; second := 2; } ",
+                "fn looped() { while true { break; after_break := 1; } ",
+                "while true { continue; after_continue := 1; } } ",
+                "fn main() { panic(\"stop\"); after_panic := 1; return 2; }"
+            ),
+            |result| {
+                assert_eq!(result.warnings.len(), 4, "{}", result.warnings);
+                assert!(
+                    result.diagnostics.to_string().contains("cannot return a value"),
+                    "{}",
+                    result.diagnostics
+                );
+            },
+        );
+
+        with_semantic_result(
+            "fn answer() int { return 1; 2 } fn main() {}",
+            |result| {
+                assert_eq!(result.warnings.len(), 1);
+                assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
+            },
+        );
+
+        with_semantic_result(
+            "fn main() { return; { entered := 1; return; inner_unreachable := 2; } }",
+            |result| {
+                assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
+                assert_eq!(result.warnings.len(), 2, "{}", result.warnings);
+            },
+        );
+    }
+
+    #[test]
+    fn caps_real_unreachable_warnings_independently() {
+        let mut text = String::new();
+        for index in 0..25 {
+            text.push_str(&format!(
+                "fn helper{index}() {{ return; value := {index}; }} "
+            ));
+        }
+        text.push_str("fn main() {}");
+        with_semantic_result(&text, |result| {
+            assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
+            assert_eq!(result.warnings.len(), crate::diagnostic::MAX_SOURCE_WARNINGS);
+        });
+    }
+
+    #[test]
+    fn retains_switch_dependent_return_and_reachability_obligations() {
+        with_semantic_result(
+            concat!(
+                "type Choice(int | str); ",
+                "fn answer(value Choice) int { switch value { int: return 1; str: return 2; } } ",
+                "fn main() {}"
+            ),
+            |result| {
+                assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
+                assert_eq!(result.flow.deferred.len(), 1);
+                assert!(matches!(
+                    result.flow.deferred[0].kind,
+                    DeferredFlowKind::FunctionReturn { .. }
+                ));
+            },
+        );
+
+        with_semantic_result(
+            concat!(
+                "type Choice(int | str); ",
+                "fn helper(value Choice) { switch value { int: return; str: return; } after := 1; } ",
+                "fn main() {}"
+            ),
+            |result| {
+                assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
+                assert!(result.warnings.is_empty(), "{}", result.warnings);
+                assert_eq!(result.flow.deferred.len(), 1);
+                assert!(matches!(
+                    result.flow.deferred[0].kind,
+                    DeferredFlowKind::Reachability { .. }
+                ));
+            },
+        );
+
+        with_semantic_result(
+            concat!(
+                "type Choice(int | str); ",
+                "fn answer(value Choice) int { switch value { int: return 1; else: return 2; } } ",
+                "fn main() {}"
+            ),
+            |result| {
+                assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
+                assert!(result.flow.deferred.is_empty());
+            },
+        );
+
+        with_semantic_result(
+            concat!(
+                "type Choice(int | str); ",
+                "fn answer(first Choice, second Choice) int { ",
+                "switch first { int: switch second { int: return 1; str: return 2; } str: return 3; } } ",
+                "fn main() {}"
+            ),
+            |result| {
+                assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
+                assert_eq!(result.flow.deferred.len(), 1);
+                assert_eq!(result.flow.deferred[0].switches.len(), 2);
+            },
+        );
+
+        with_semantic_result(
+            concat!(
+                "type Choice(int | str); ",
+                "fn helper(first Choice, second Choice) { ",
+                "switch first { int: return; str: return; } ",
+                "switch second { int: return; str: return; } after := 1; } ",
+                "fn main() {}"
+            ),
+            |result| {
+                assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
+                assert_eq!(result.flow.deferred.len(), 2);
+                assert_eq!(result.flow.deferred[0].switches.len(), 1);
+                assert_eq!(result.flow.deferred[1].switches.len(), 2);
+            },
+        );
+    }
+
+    #[test]
+    fn retains_deferred_outer_function_values_for_union_analysis() {
+        with_semantic_result(
+            concat!(
+                "type Choice(int | str); ",
+                "fn predicate(value Choice) bool { value is int } ",
+                "fn invalid_after_resolution(value Choice) { value is int } ",
+                "fn main() {}"
+            ),
+            |result| {
+                assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
+                assert_eq!(
+                    result
+                        .flow
+                        .deferred
+                        .iter()
+                        .filter(|obligation| matches!(
+                            obligation.kind,
+                            DeferredFlowKind::FunctionFinalValue { .. }
+                        ))
+                        .count(),
+                    2
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn short_circuit_flow_keeps_a_boolean_result_when_only_the_right_diverges() {
+        let source = source("fn main() { value := true && panic(\"stop\"); }");
+        let program = parser::parse(&source).unwrap();
+        let mut analysis = analysis::analyze(&source, &program);
+        assert!(analysis.diagnostics.is_empty(), "{}", analysis.diagnostics);
+        let result = analyze(&mut analysis);
+        assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
+        let crate::ast::Declaration::Function(main) = &program.declarations[0] else {
+            unreachable!()
+        };
+        let StatementKind::Local { initializer, .. } = &main.body.statements[0].kind else {
+            unreachable!()
+        };
+        let bool_type = analysis.types.primitive(PrimitiveType::Bool);
+        assert_eq!(
+            analysis.expression_annotation(initializer).unwrap().state,
+            TypeState::Resolved(bool_type)
+        );
+        assert!(result.flow.summaries.iter().any(|record| {
+            matches!(record.subject, FlowSubject::Expression(node) if std::ptr::eq(node, initializer))
+                && record.summary.flags.contains(FlowFlags::FALLTHROUGH)
+                && record.summary.flags.contains(FlowFlags::DIVERGE)
+        }));
+    }
+
+    #[test]
+    fn expression_flow_is_ordered_but_later_children_are_still_validated() {
+        with_semantic_result(
+            concat!(
+                "fn main() { values := [panic(\"stop\"), { return; 1 }]; ",
+                "after := 2; }"
+            ),
+            |result| {
+                assert!(result.diagnostics.is_empty(), "{}", result.diagnostics);
+                assert_eq!(result.flow.returns.len(), 1);
+                assert_eq!(result.warnings.len(), 2, "{}", result.warnings);
+            },
         );
     }
 

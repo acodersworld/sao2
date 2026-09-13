@@ -3,7 +3,6 @@ use std::fmt;
 use std::path::PathBuf;
 
 pub const MAX_SOURCE_ERRORS: usize = 20;
-#[allow(dead_code)] // Phase 3 begins producing unreachable-source warnings.
 pub const MAX_SOURCE_WARNINGS: usize = 20;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -11,7 +10,6 @@ pub enum DiagnosticKind {
     Usage,
     Input,
     Source,
-    #[allow(dead_code)] // Phase 3 begins producing this diagnostic in production.
     SourceWarning,
     Compiler,
     Program,
@@ -52,7 +50,6 @@ impl Diagnostic {
         Self::source_with_kind(source, span, DiagnosticKind::Source, message)
     }
 
-    #[allow(dead_code)] // Phase 3 begins producing source warnings in production.
     pub fn source_warning(
         source: &SourceFile,
         span: Span,
@@ -201,7 +198,6 @@ pub struct Warnings {
     entries: Vec<Diagnostic>,
 }
 
-#[allow(dead_code)] // Mutation and limits are exercised before Phase 3 consumes them.
 impl Warnings {
     pub fn new() -> Self {
         Self::default()
@@ -211,9 +207,11 @@ impl Warnings {
             self.entries.push(warning);
         }
     }
+    #[cfg(test)]
     pub fn is_full(&self) -> bool {
         self.entries.len() == MAX_SOURCE_WARNINGS
     }
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
