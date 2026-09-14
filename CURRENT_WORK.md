@@ -567,16 +567,182 @@ fully checked by the frontend but absent from the lowered program.
 
 ## Stage 4: Unions and error flow
 
-Lower discriminant tests, payload extraction, branch-local narrowing, and
-complete union switch statements using the recorded frontend resolutions and
-the explicit union values produced by Stage 2. Lower postfix `?` into its
-success branch and its exact error-propagation or `main` panic branch, including
-bare `Error` success as unit and unions containing unit. Preserve union nesting,
-alternative identity, and constructor-form information needed by universal
-printing.
+Complete union lowering as one change: union tests, branch-local narrowing,
+exhaustive switches, and postfix `?`. Remove the final `PendingStage` cases so
+every validated language construct can be represented in IR before Stage 5
+adds runtime checks.
 
-Exit criterion: union values and all postfix-`?` paths are explicit typed IR
-operations and control-flow edges with no renewed type or coverage decisions.
+This stage also records and implements the design decision that every `Error`
+payload must be exactly one primitive type: `int`, `float`, `str`, `bool`, or
+`char`.
+
+### Error payload and panic design
+
+Update `DESIGN.md` before changing behavior:
+
+- Restrict every `Error(T)` alternative, whether in a named or anonymous union,
+  to the five primitive payload types.
+- Keep standalone `Error(T)` invalid. An operation with no non-error result uses
+  `() | Error(T)`, and postfix `?` produces unit on its successful path.
+- Specify that an unhandled Error reached through `?` in `main` prints
+  `Error(payload)` using the primitive payload's ordinary formatting, reports
+  the `?` source location, and terminates with a nonzero status.
+- Keep the explicit `panic(message)` intrinsic restricted to `str`; an
+  unhandled Error is a distinct typed panic operation rather than an implicit
+  conversion to string.
+
+Diagnose a non-primitive Error payload during type resolution at the payload
+type span. Apply the restriction equally to all union syntax and retain the
+existing rule that Error is the final alternative. Extend the semantic handoff
+validator to reject any contradictory Error alternative which reaches
+lowering. Update `AST.md` with the restricted payload contract and the
+propagate-or-panic lowering information.
+
+### Target-independent union operations
+
+Replace the raw integer-producing `Discriminant` IR operation with
+`UnionTest`, which names a union operand and one `AlternativeId` and produces a
+`bool`. Runtime discriminant numbering remains a backend layout choice and must
+not appear as an integer constant in core IR.
+
+Retain `UnionPayload` for extraction after a branch or switch has established
+the active alternative. Strengthen validation of `Switch` terminators so their
+targets contain every direct alternative exactly once. Distinct alternatives
+may intentionally target the same `else` block.
+
+Add an `ErrorPanic` terminator whose operand is the extracted Error payload.
+Keep it distinct from the existing string `Panic` terminator. Validate that its
+operand has one of the five permitted primitive types. Render union tests,
+payload extraction, exhaustive switches, and Error panic canonically without
+exposing physical tags or runtime helper names.
+
+### Scoped narrowing
+
+Maintain a lowering-time narrowing environment. Each active entry records the
+frontend binding, stabilized union operand, selected alternative, payload type,
+and extracted payload local. Save and restore this environment around branches,
+loop bodies, switch arms, and nested tests.
+
+Lower `value is Alternative` by evaluating and stabilizing the union once and
+emitting `UnionTest` with the exact mapped alternative. A general boolean use
+of `is` produces only its boolean result. When an exact binding test directly
+controls an `if`, `if` expression, or `while`, emit `UnionPayload` at the true
+body's entry and activate that payload local for the body. Do not infer negative
+narrowing on false or `else` paths.
+
+When lowering a binding read, select its narrowed local only when the
+expression's final semantic annotation agrees with that payload. Otherwise use
+the original union local. This lets the final frontend facts remain the source
+of truth and prevents a stale narrowing environment from changing a read.
+
+Use the narrowed payload local as the root for resolved member access, indexing,
+built-in calls, and projected mutation. A direct reassignment writes the
+original union binding and invalidates narrowing for subsequent reads. Nested
+narrowing of the same binding temporarily shadows the outer entry. Do not
+repeat member selection, mutability checking, or narrowed type inference.
+
+### Complete switch lowering
+
+Consume the unique `SwitchResolution` for each switch:
+
+1. Evaluate and stabilize the union operand exactly once.
+2. Create explicit arm blocks in source order, followed by a reachable `else`
+   block when required, and then a merge block if any path falls through.
+3. Build the switch target table in the union's direct alternative order.
+4. Route each covered alternative to its resolved arm and each uncovered
+   alternative to the shared `else` block.
+5. For an exact binding operand, extract the selected payload at each explicit
+   arm's entry and activate it for that arm. An `else` body receives no
+   narrowing.
+6. Preserve existing terminators in terminal arms and jump only fallthrough
+   arms to the merge. Propagate divergence when no arm falls through.
+
+If explicit arms already cover every alternative, preserve the frontend's
+unreachable warning but do not allocate or lower its unreachable `else` body.
+Do not recompute labels, coverage, exhaustiveness, payload types, or whether an
+else arm is reachable.
+
+### Postfix `?`
+
+Consume the unique `TryResolution` for each reachable postfix operation.
+Evaluate and stabilize its operand exactly once, then emit one exhaustive union
+switch. Route the Error alternative to an error block and every successful
+alternative to its own success block.
+
+In each success block, extract the payload with `UnionPayload`:
+
+- With one success alternative, assign its payload directly to the shared
+  result temporary.
+- With multiple success alternatives, inject each payload into the recorded
+  anonymous success union using the corresponding preserved alternative, then
+  assign that value to the shared result.
+- Preserve a unit payload normally, so `() | Error(P)` produces the ordinary
+  unit value.
+
+Map source and success alternatives by their semantic identity rather than
+assuming their numeric positions match. Preserve tags, explicit nesting, and
+constructor form. Route every successful fallthrough to one merge and return
+its typed operand to the enclosing expression.
+
+On the Error path:
+
+- For `TryAction::Propagate`, extract the primitive payload, inject it into the
+  exact destination Error alternative, emit `EndIteration` for every active
+  `for` loop from innermost to outermost, and terminate with `Return`.
+- For `TryAction::Panic`, extract the primitive payload and terminate with
+  `ErrorPanic` at the recorded `?` operator span. Do not emit iteration cleanup
+  because the process terminates.
+- If evaluating the operand already diverges, emit no switch. A `Never` operand
+  has no try record and simply preserves that divergence.
+
+Lower chained tries inside-out so each successful result becomes the next
+postfix operand. Do not reuse ordinary widening for Error propagation; the
+recorded source and destination payload types and alternatives must agree
+exactly.
+
+After union tests, switches, and tries are implemented, remove `PendingStage`
+and the pending lowering-error variant entirely. Any remaining accepted syntax
+which cannot lower is a compiler invariant failure.
+
+### Tests and completion
+
+Add analysis and handoff tests for all five permitted Error payload primitives,
+and reject unit, lists, maps, tuples, structs, unions, and other nominal Error
+payloads at their payload spans.
+
+Add IR and lowering tests covering:
+
+- `UnionTest` typing, rendering, invalid alternatives, and the absence of raw
+  discriminant-number comparisons;
+- narrowed identifiers, members, indices, built-ins, projected mutations,
+  nested tests, loop-condition narrowing, and invalidation after direct
+  reassignment;
+- tests on computed unions which produce booleans without binding narrowing;
+- exhaustive named and anonymous, tagged and untagged switches;
+- source-ordered arm blocks, alternative-ordered targets, shared else targets,
+  payload extraction, terminal arms, all-diverging switches, and omission of
+  an unreachable exhaustive else body;
+- single-success, multiple-success, unit-success, nominal, anonymous, tagged,
+  explicitly nested, and chained postfix tries;
+- exact Error propagation, destination reinjection, and active iteration
+  cleanup before propagated returns;
+- `main` Error panic for `int`, `float`, `str`, `bool`, and `char`, including
+  its `Error(payload)` rendering intent and `?` source location;
+- try operands which already diverge and therefore produce no dispatch;
+- corrupted union-test, switch, try, alternative, payload, narrowing, or action
+  facts producing lowering invariant errors; and
+- deterministic rendering and successful whole-program IR validation with no
+  remaining pending-stage result.
+
+Keep existing warning behavior, diagnostic ordering, temporary C backend,
+compiler tests, and executable tests unchanged. Contributor guidance prohibits
+compiling, running tests, or formatting during implementation.
+
+Exit criterion: every valid union inspection, narrowed path, switch, and
+postfix-`?` lowers to explicit typed operations and closed control-flow edges;
+Error payloads are uniformly primitive and precisely propagated or rendered by
+panic; runtime discriminant numbering remains outside core IR; and no valid
+source construct remains pending lowering.
 
 ## Stage 5: Runtime checks and source locations
 
