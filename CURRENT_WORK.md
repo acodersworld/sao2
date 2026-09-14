@@ -402,24 +402,178 @@ invariants.
 
 ## Stage 3: Control-flow lowering
 
-Lower value-producing blocks and `if` expressions through destination
-temporaries and merge blocks. Lower statement conditionals, short-circuit
-operators, `while`, `for`, exhaustive switches, `break`, `continue`, explicit
-returns, fallthrough completion, and unreachable paths into named basic blocks
-with explicit terminators. Preserve the semantic pass's resolved loop targets,
-switch coverage, reachability, and `Never` behavior.
+Extend lowering from one active straight-line block into a complete
+control-flow graph for blocks, conditionals, short-circuit operators, loops,
+returns, panic, and divergent expressions. The frontend continues to parse and
+semantically validate unreachable source and emit its existing warnings, but
+lowering omits unreachable tails after an unconditional terminator. Union
+tests, switches, narrowing, and postfix `?` remain together in Stage 4.
 
-Exit criterion: every accepted control-flow form has a closed, validated graph
-with one terminator per block and no syntax-level control construct in the IR.
+### Lowering state and semantic handoff
+
+- Replace the single current `BlockId` with an optional live block. Terminating
+  a path consumes it; subsequent expressions or statements on that path cannot
+  emit operations.
+- Make expression lowering return either a typed operand or divergence.
+  Callers must stop evaluation after divergence and must not evaluate later
+  operands, arguments, statements, or block values.
+- Add lookup helpers for the validated semantic flow tables: flow summaries,
+  explicit returns, function completions, and loop-control targets. Missing,
+  duplicated, or contradictory records remain lowering invariants.
+- Maintain a loop-context stack containing the source loop, continue target,
+  break target, and any active iteration cleanup. Resolve `break` and
+  `continue` through the recorded semantic target rather than assuming the top
+  context is correct.
+- Remove every `PendingStage::Stage3` result after its construct is implemented.
+  Keep `PendingStage::Stage4` for union tests, switches, and postfix `?`.
+- Continue validating the completed program through the Stage 1 validator.
+  Lowering remains disconnected from normal compilation until Stage 6.
+
+### Blocks, returns, and divergence
+
+Lower statement blocks directly into the current path; braces do not require a
+basic block by themselves. Stop lowering the remainder of a sequential region
+once its current path terminates. The frontend has already validated and warned
+about that unreachable syntax, so it is intentionally absent from IR rather
+than copied into detached blocks.
+
+Lower explicit returns using their unique `ExplicitReturn` record. Evaluate the
+return value first, apply its recorded injection, and then emit `Return`. A bare
+return constructs unit and applies the record's unit-union injection. Before a
+return from inside active `for` loops, emit their cleanup operations from
+innermost to outermost.
+
+Lower function fallthrough using the unique `FunctionCompletion` record. Return
+the final block value when present; otherwise return unit with any recorded
+injection. If the body diverges, do not manufacture a return or continuation.
+
+Lower `panic` wherever it occurs as an expression. Evaluate its message, emit
+the `Panic` terminator, and propagate divergence through the enclosing
+expression. Panic requires no iteration cleanup because it terminates the
+process. Preserve structural reachability and do not fold literal conditions.
+
+### Conditional control flow
+
+Lower an `if` statement into condition, body, false-chain, and merge blocks.
+Evaluate `else if` conditions sequentially so a later condition runs only when
+all preceding conditions are false. Only fallthrough bodies jump to the merge;
+terminal bodies retain their existing terminators. An `if` without `else` keeps
+its final false path as a fallthrough path.
+
+Lower an `if` expression into one preallocated result temporary. Every
+fallthrough branch assigns its value to that destination and jumps to the
+merge. A terminal branch neither assigns nor jumps. If all branches diverge,
+create no merge result and propagate divergence.
+
+Allocate condition and branch blocks in source order, allocate the merge after
+them, and then patch the collected fallthrough edges. This keeps stable block
+identities and rendered IR deterministic without placing merge blocks before
+their contributing branches.
+
+Lower short-circuit expressions without evaluating the right operand eagerly:
+
+- Evaluate and stabilize the left boolean once, then copy it into a result
+  temporary.
+- For `&&`, branch directly to the merge when the left value is false and
+  evaluate the right operand only on the true edge.
+- For `||`, branch directly to the merge when the left value is true and
+  evaluate the right operand only on the false edge.
+- A fallthrough right path overwrites the result and jumps to the merge. A
+  divergent right path retains its terminal control flow.
+
+### While loops and loop control
+
+Lower `while` into a preheader jump followed by condition, body, and exit
+blocks. Re-evaluate the condition on every iteration, branch to the body or
+exit, route ordinary body fallthrough and `continue` back to the condition, and
+route `break` to the exit.
+
+Nested loop control must use the semantic `LoopControl` target. A terminal
+`break` or `continue` ends the current path, so the rest of that sequential
+source region is checked and warned about by the frontend but not lowered.
+
+### Indexed `for` loops and iteration locks
+
+Lower list and map iteration using indexed compiler primitives rather than an
+opaque iterator type:
+
+1. Evaluate and stabilize the iterable exactly once.
+2. Emit `BeginIteration` to increment the container's internal iteration-lock
+   count.
+3. Snapshot its length, initialize an integer index to zero, and jump to the
+   loop header.
+4. Test `index < length`; branch to the body or cleanup block.
+5. Use `IterationValue` to fetch the list element or insertion-order map key at
+   the current index and assign it to the mapped loop-binding local.
+6. Route body fallthrough and `continue` through an advance block which
+   increments the index and returns to the header.
+7. Route exhaustion and `break` through one cleanup block which emits
+   `EndIteration` before reaching the exit.
+
+Use a counter rather than a boolean so nested iteration over the same container
+is valid. A return emits `EndIteration` for every active `for` loop before its
+`Return` terminator; `continue` keeps the current iteration locked. The
+stabilized iterable remains a typed local and therefore remains available to
+future shadow-frame root derivation.
+
+Extend the target-independent IR with `BeginIteration`, `EndIteration`, and
+`IterationValue` operations. Validate that begin and end operands are lists or
+maps, iteration indices are integers, and the fetched destination agrees with
+the list element or map key type. Do not encode container layout, C helper
+names, or an opaque runtime iterator in the core IR.
+
+The eventual list or map runtime stores the internal lock count. Structural
+operations check that count and panic immediately while it is nonzero, including
+when reached through an alias or called function. Element replacement is not a
+structural change and remains permitted.
+
+### Tests and completion
+
+Add lowering and IR-validation tests covering:
+
+- statement blocks, nested value-producing blocks, final function values, and
+  unit or unit-union completion;
+- `if`, `else if`, missing `else`, expression merge destinations, terminal
+  branches, and expressions whose every branch diverges;
+- `&&` and `||` evaluation order, bypass paths, result values, and divergent
+  right operands;
+- `while` condition reevaluation, ordinary fallthrough, nested loops, `break`,
+  and `continue`;
+- list and map iteration order, typed loop bindings, length snapshots, indexed
+  iteration values, and nested iteration locks;
+- iteration cleanup on exhaustion, `break`, and return through one or several
+  active `for` loops, with no cleanup emitted after panic;
+- explicit value returns, bare returns, injected unit returns, fallthrough
+  returns, and divergent return expressions;
+- panic nested inside operands, arguments, conditions, and branch values;
+- omission of operations after return, panic, break, continue, or another
+  divergent expression while frontend warnings remain unchanged;
+- deterministic block allocation and rendering followed by successful
+  whole-program IR validation;
+- corrupted flow summaries, explicit returns, function completions, or loop
+  targets producing lowering invariant errors; and
+- union tests, switches, and postfix `?` remaining explicit Stage 4 pending
+  cases.
+
+Keep existing frontend, warning, temporary C backend, compiler, and executable
+tests unchanged. Contributor guidance prohibits compiling, running tests, or
+formatting during implementation.
+
+Exit criterion: every accepted non-union control-flow form lowers to a closed,
+deterministic, validated graph; no syntax-level block, conditional,
+short-circuit operator, loop, return, or panic remains in IR; iteration locks
+are balanced on every non-panicking lowered exit; and unreachable source is
+fully checked by the frontend but absent from the lowered program.
 
 ## Stage 4: Unions and error flow
 
 Lower discriminant tests, payload extraction, branch-local narrowing, and
-switch alternatives using the recorded frontend resolutions and the explicit
-union values produced by Stage 2. Lower postfix `?` into its success branch and
-its exact error-propagation or `main` panic branch, including bare `Error`
-success as unit and unions containing unit. Preserve union nesting, alternative
-identity, and constructor-form information needed by universal printing.
+complete union switch statements using the recorded frontend resolutions and
+the explicit union values produced by Stage 2. Lower postfix `?` into its
+success branch and its exact error-propagation or `main` panic branch, including
+bare `Error` success as unit and unions containing unit. Preserve union nesting,
+alternative identity, and constructor-form information needed by universal
+printing.
 
 Exit criterion: union values and all postfix-`?` paths are explicit typed IR
 operations and control-flow edges with no renewed type or coverage decisions.
@@ -428,7 +582,9 @@ operations and control-flow edges with no renewed type or coverage decisions.
 
 Make every required integer overflow, negation, division, remainder, shift,
 float validity, numeric conversion, list or string bounds, and missing-map-key
-failure explicit in evaluation order. Intern compact location IDs that map each
+failure explicit in evaluation order. Before each structural list or map
+mutation, add an explicit check which panics when the underlying container's
+iteration-lock count is nonzero. Intern compact location IDs that map each
 runtime failure back to its source file, byte span, operation, and enclosing
 function. Keep failure operations target-independent rather than encoding C
 helpers in the core IR.
