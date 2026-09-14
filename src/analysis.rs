@@ -55,6 +55,10 @@ impl TypeId {
     pub(crate) fn index(self) -> usize {
         self.0
     }
+
+    pub(crate) fn from_index(index: usize) -> Self {
+        Self(index)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -279,6 +283,33 @@ pub(crate) struct LiteralAnnotation<'ast> {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub(crate) struct NumericConversionResolution<'ast> {
+    pub(crate) node: &'ast Expression,
+    pub(crate) source: TypeId,
+    pub(crate) destination: TypeId,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ProjectionKind {
+    Struct {
+        declaration: TypeDeclarationId,
+        field: usize,
+        storage: MemberStorage,
+        result: TypeId,
+    },
+    Tuple { declaration: TypeDeclarationId, position: usize, result: TypeId },
+    List { element: TypeId },
+    Map { key: TypeId, value: TypeId },
+    String { result: TypeId },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProjectionResolution<'ast> {
+    pub(crate) node: &'ast Expression,
+    pub(crate) kind: ProjectionKind,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct BindingTypeAnnotation {
     pub(crate) binding: BindingId,
     pub(crate) state: TypeState,
@@ -298,6 +329,7 @@ pub(crate) enum AccessPathStep<'ast> {
         suffix: &'ast crate::ast::AssignmentTargetSuffix,
         declaration: TypeDeclarationId,
         member: &'ast TypeMember,
+        field: usize,
         storage: MemberStorage,
         state: TypeState,
     },
@@ -531,6 +563,13 @@ impl TypeTable {
     pub(crate) fn contains(&self, id: TypeId) -> bool {
         id.index() < self.entries.len()
     }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (TypeId, &ResolvedType)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| (TypeId(index), ty))
+    }
 }
 
 /// Results owned by the name-and-type analysis stage.
@@ -552,6 +591,8 @@ pub(crate) struct Analysis<'source, 'ast> {
     pub(crate) name_uses: Vec<NameUse<'ast>>,
     pub(crate) calls: Vec<CallResolution<'ast>>,
     pub(crate) literals: Vec<LiteralAnnotation<'ast>>,
+    pub(crate) numeric_conversions: Vec<NumericConversionResolution<'ast>>,
+    pub(crate) projections: Vec<ProjectionResolution<'ast>>,
     pub(crate) binding_types: Vec<BindingTypeAnnotation>,
     pub(crate) assignment_targets: Vec<AssignmentTargetAnnotation<'ast>>,
     pub(crate) constructors: Vec<ConstructorResolution<'ast>>,
@@ -699,6 +740,22 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
             .find_map(|literal| std::ptr::eq(literal.node, node).then_some(&literal.value))
     }
 
+    pub(crate) fn numeric_conversion(&self, node: &'ast Expression) -> Option<&NumericConversionResolution<'ast>> {
+        self.numeric_conversions.iter().find(|item| std::ptr::eq(item.node, node))
+    }
+
+    pub(crate) fn projection(&self, node: &'ast Expression) -> Option<&ProjectionResolution<'ast>> {
+        self.projections.iter().find(|item| std::ptr::eq(item.node, node))
+    }
+
+    pub(crate) fn constructor(&self, node: &'ast Expression) -> Option<&ConstructorResolution<'ast>> {
+        self.constructors.iter().find(|item| std::ptr::eq(item.node, node))
+    }
+
+    pub(crate) fn union_injection(&self, node: &'ast Expression) -> Option<&UnionInjection<'ast>> {
+        self.union_injections.iter().find(|item| std::ptr::eq(item.node, node))
+    }
+
     pub(crate) fn binding_type(&self, id: BindingId) -> TypeState {
         let binding = self.binding_types[id.0];
         debug_assert_eq!(binding.binding, id);
@@ -761,9 +818,10 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
                         break;
                     };
                     let spelling = self.identifier_text(name.span);
-                    let Some(member) = members
+                    let Some((field, member)) = members
                         .iter()
-                        .find(|member| self.identifier_text(member.name.span) == spelling)
+                        .enumerate()
+                        .find(|(_, member)| self.identifier_text(member.name.span) == spelling)
                     else {
                         break;
                     };
@@ -772,6 +830,7 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
                         suffix,
                         declaration: *declaration,
                         member: member.node,
+                        field,
                         storage: member.storage,
                         state: current,
                     }
@@ -1730,6 +1789,7 @@ impl<'analysis, 'source, 'ast> BodyResolver<'analysis, 'source, 'ast> {
             | ExpressionKind::TypedEmptyList(_)
             | ExpressionKind::TypedEmptyMap(_) => {}
             ExpressionKind::Parenthesized(inner)
+            | ExpressionKind::Conversion { operand: inner, .. }
             | ExpressionKind::Unary { operand: inner, .. }
             | ExpressionKind::Try { value: inner, .. } => self.resolve_expression(inner),
             ExpressionKind::List(elements) => {
@@ -2183,6 +2243,30 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
                 self.primitive(PrimitiveType::Bool)
             }
             ExpressionKind::Parenthesized(inner) => self.infer_expression(inner),
+            ExpressionKind::Conversion { destination, operand } => {
+                let operand_state = self.infer_expression(operand);
+                let TypeState::Resolved(source) = operand_state else {
+                    return self.non_value_operand(expression, operand_state);
+                };
+                let destination = self.analysis.types.primitive(*destination);
+                let int = self.analysis.types.primitive(PrimitiveType::Int);
+                let float = self.analysis.types.primitive(PrimitiveType::Float);
+                if !((source == int && destination == float)
+                    || (source == float && destination == int))
+                {
+                    self.analysis.error(
+                        expression.span,
+                        "numeric conversion must be int(float) or float(int)",
+                    )
+                } else {
+                    self.analysis.numeric_conversions.push(NumericConversionResolution {
+                        node: expression,
+                        source,
+                        destination,
+                    });
+                    TypeState::Resolved(destination)
+                }
+            }
             ExpressionKind::List(elements) => {
                 let children = elements
                     .iter()
@@ -2840,10 +2924,27 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
         };
         let int = self.analysis.types.primitive(PrimitiveType::Int);
         match self.analysis.types.get(value_type).clone() {
-            ResolvedType::List(element) if index_type == int => TypeState::Resolved(element),
-            ResolvedType::Map { key, value } if index_type == key => TypeState::Resolved(value),
+            ResolvedType::List(element) if index_type == int => {
+                self.analysis.projections.push(ProjectionResolution {
+                    node: expression,
+                    kind: ProjectionKind::List { element },
+                });
+                TypeState::Resolved(element)
+            }
+            ResolvedType::Map { key, value } if index_type == key => {
+                self.analysis.projections.push(ProjectionResolution {
+                    node: expression,
+                    kind: ProjectionKind::Map { key, value },
+                });
+                TypeState::Resolved(value)
+            }
             ResolvedType::Primitive(PrimitiveType::Str) if index_type == int => {
-                self.primitive(PrimitiveType::Char)
+                let result = self.analysis.types.primitive(PrimitiveType::Char);
+                self.analysis.projections.push(ProjectionResolution {
+                    node: expression,
+                    kind: ProjectionKind::String { result },
+                });
+                TypeState::Resolved(result)
             }
             _ => self.analysis.error(
                 expression.span,
@@ -2870,7 +2971,8 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
                         let spelling = self.analysis.identifier_text(name.span).to_owned();
                         members
                             .iter()
-                            .find(|field| {
+                            .enumerate()
+                            .find(|(_, field)| {
                                 self.analysis.identifier_text(field.name.span) == spelling.as_str()
                             })
                             .map_or_else(
@@ -2880,16 +2982,35 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
                                         format!("struct has no member '{spelling}'"),
                                     )
                                 },
-                                |field| field.ty,
+                                |(field, member)| {
+                                    if let TypeState::Resolved(result) = member.ty {
+                                        self.analysis.projections.push(ProjectionResolution {
+                                            node: expression,
+                                            kind: ProjectionKind::Struct {
+                                                declaration,
+                                                field,
+                                                storage: member.storage,
+                                                result,
+                                            },
+                                        });
+                                    }
+                                    member.ty
+                                },
                             )
                     }
                     (TypeDefinitionKind::Tuple(members), Member::TupleIndex(span)) => {
                         let index = self.parse_tuple_index(span);
-                        index
-                            .and_then(|index| members.get(index))
-                            .map_or_else(
+                        index.and_then(|position| members.get(position).map(|member| (position, member))).map_or_else(
                                 || self.analysis.error(span, "tuple member index is out of range"),
-                                |field| field.ty,
+                                |(position, member)| {
+                                    if let TypeState::Resolved(result) = member.ty {
+                                        self.analysis.projections.push(ProjectionResolution {
+                                            node: expression,
+                                            kind: ProjectionKind::Tuple { declaration, position, result },
+                                        });
+                                    }
+                                    member.ty
+                                },
                             )
                     }
                     (TypeDefinitionKind::Union { .. }, _) => {
@@ -3478,6 +3599,10 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
                 self.resolve_typed_empty(expression, ty, expected)
             }
             ExpressionKind::Parenthesized(inner) => self.resolve_expression(inner, expected),
+            ExpressionKind::Conversion { operand, .. } => {
+                self.resolve_expression(operand, None);
+                self.coerce(expression, current, expected)
+            }
             ExpressionKind::Block(block) => self.resolve_block(block, expected),
             ExpressionKind::If {
                 branches,
@@ -3665,10 +3790,24 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
         };
         let int = self.analysis.types.primitive(PrimitiveType::Int);
         let state = match self.analysis.types.get(value).clone() {
-            ResolvedType::List(element) if index == int => TypeState::Resolved(element),
-            ResolvedType::Map { key, value } if index == key => TypeState::Resolved(value),
+            ResolvedType::List(element) if index == int => {
+                if self.analysis.projection(expression).is_none() {
+                    self.analysis.projections.push(ProjectionResolution { node: expression, kind: ProjectionKind::List { element } });
+                }
+                TypeState::Resolved(element)
+            }
+            ResolvedType::Map { key, value } if index == key => {
+                if self.analysis.projection(expression).is_none() {
+                    self.analysis.projections.push(ProjectionResolution { node: expression, kind: ProjectionKind::Map { key, value } });
+                }
+                TypeState::Resolved(value)
+            }
             ResolvedType::Primitive(PrimitiveType::Str) if index == int => {
-                TypeState::Resolved(self.analysis.types.primitive(PrimitiveType::Char))
+                let result = self.analysis.types.primitive(PrimitiveType::Char);
+                if self.analysis.projection(expression).is_none() {
+                    self.analysis.projections.push(ProjectionResolution { node: expression, kind: ProjectionKind::String { result } });
+                }
+                TypeState::Resolved(result)
             }
             _ => self.analysis.error(
                 expression.span,
@@ -3699,17 +3838,31 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
                 match (self.analysis.type_definition(declaration).kind.clone(), member) {
                     (TypeDefinitionKind::Struct(members), Member::Named(name)) => {
                         let spelling = self.analysis.identifier_text(name.span).to_owned();
-                        members.iter().find(|field| {
+                        members.iter().enumerate().find(|(_, field)| {
                             self.analysis.identifier_text(field.name.span) == spelling.as_str()
                         }).map_or_else(
                             || self.analysis.error(name.span, format!("struct has no member '{spelling}'")),
-                            |field| field.ty,
+                            |(field, member)| {
+                                if let TypeState::Resolved(result) = member.ty
+                                    && self.analysis.projection(expression).is_none()
+                                {
+                                    self.analysis.projections.push(ProjectionResolution { node: expression, kind: ProjectionKind::Struct { declaration, field, storage: member.storage, result } });
+                                }
+                                member.ty
+                            },
                         )
                     }
                     (TypeDefinitionKind::Tuple(members), Member::TupleIndex(span)) => {
-                        self.parse_tuple_index(span).and_then(|index| members.get(index)).map_or_else(
+                        self.parse_tuple_index(span).and_then(|position| members.get(position).map(|member| (position, member))).map_or_else(
                             || self.analysis.error(span, "tuple member index is out of range"),
-                            |field| field.ty,
+                            |(position, member)| {
+                                if let TypeState::Resolved(result) = member.ty
+                                    && self.analysis.projection(expression).is_none()
+                                {
+                                    self.analysis.projections.push(ProjectionResolution { node: expression, kind: ProjectionKind::Tuple { declaration, position, result } });
+                                }
+                                member.ty
+                            },
                         )
                     }
                     (TypeDefinitionKind::Union { .. }, _) => current,
@@ -4782,6 +4935,8 @@ pub(crate) fn analyze<'source, 'ast>(
         name_uses: Vec::new(),
         calls: Vec::new(),
         literals: Vec::new(),
+        numeric_conversions: Vec::new(),
+        projections: Vec::new(),
         binding_types,
         assignment_targets: Vec::new(),
         constructors: Vec::new(),
@@ -4953,6 +5108,7 @@ fn collect_expression_bindings<'ast>(
         | ExpressionKind::TypedEmptyList(_)
         | ExpressionKind::TypedEmptyMap(_) => {}
         ExpressionKind::Parenthesized(inner)
+        | ExpressionKind::Conversion { operand: inner, .. }
         | ExpressionKind::Unary { operand: inner, .. }
         | ExpressionKind::Try { value: inner, .. } => {
             collect_expression_bindings(inner, bindings);
@@ -5034,6 +5190,22 @@ mod tests {
             })
             .map(|binding| binding.id)
             .unwrap()
+    }
+
+    #[test]
+    fn resolves_only_cross_kind_numeric_conversions() {
+        let valid_source = source("fn main() int { converted := int(1.5); float(converted); converted }");
+        let program = parser::parse(&valid_source).unwrap();
+        let analysis = analyze(&valid_source, &program);
+        assert!(analysis.diagnostics.is_empty(), "{}", analysis.diagnostics);
+        assert_eq!(analysis.numeric_conversions.len(), 2);
+
+        for text in ["fn main() { int(1); }", "fn main() { float(1.0); }"] {
+            let invalid_source = source(text);
+            let program = parser::parse(&invalid_source).unwrap();
+            let analysis = analyze(&invalid_source, &program);
+            assert!(analysis.diagnostics.to_string().contains("numeric conversion must be"));
+        }
     }
 
     #[test]

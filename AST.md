@@ -54,11 +54,24 @@ intrinsic identity and its access classification. Lowering does not perform
 lexical or top-level lookup. Literal annotations contain the decoded integer,
 binary64 float, ASCII string, character, or boolean value.
 
+Explicit `int(expression)` and `float(expression)` conversions have dedicated
+syntax nodes rather than ordinary call targets. Each valid conversion has one
+resolution record containing its canonical source and destination types; the
+only permitted pairs are `float` to `int` and `int` to `float`.
+
 Every call has one final `CallTarget`: a function, constructor, qualified tagged
 constructor, special `Error` constructor, intrinsic, or built-in method.
 Constructor records identify the selected struct, tuple, tagged union, untagged
 union, or error alternative. Struct constructor records map source-order
 arguments to declaration members while preserving evaluation order.
+
+Every ordinary value-level member or index access has one resolved projection
+record. Struct projections identify the declaration, field ordinal, storage
+mode, and result type; tuple projections identify the declaration, position,
+and result type; list, map, and string projections retain their canonical
+element, key, value, and character types. Built-in method callee members and
+qualified union-constructor callees are excluded because their call-target
+records are authoritative.
 
 Implicit conversion into an expected union is explicit in `UnionInjection`.
 The record identifies the expression, destination union, and selected direct
@@ -72,7 +85,8 @@ Every executable assignment target has a resolved root `BindingId`, final type,
 and ordered typed path. Path steps distinguish struct members, tuple members,
 list indices, and map indices. Member steps retain declaration and member
 identity; struct steps also retain inline-versus-referenced storage. Index steps
-retain canonical element, key, and value types.
+retain canonical element, key, and value types. Struct steps additionally carry
+their declaration-field ordinal.
 
 Semantic mutation authorizations are separate from name/type annotations. Each
 authorized assignment, mutating built-in receiver, or object-reaching `var`

@@ -180,6 +180,7 @@ index-access        = "[", expression, "]" ;
 member-access       = ".", ( identifier | decimal-integer ) ;
 
 primary-expression  = identifier
+                    | numeric-conversion
                     | integer-literal
                     | float-literal
                     | string-literal
@@ -193,6 +194,8 @@ primary-expression  = identifier
                     | typed-empty-map
                     | block
                     | if-expression ;
+
+numeric-conversion  = ( "int" | "float" ), "(", expression, ")" ;
 
 parenthesized-expression
                     = "(", expression, ")" ;

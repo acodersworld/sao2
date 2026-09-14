@@ -1,8 +1,8 @@
 //! Owned typed control-flow IR.
 //!
-//! This module is intentionally disconnected from the compiler pipeline during
-//! milestone 6, stage 1.  It is the construction boundary used by lowering in
-//! later stages; consequently none of its values borrow the frontend.
+//! This module remains intentionally disconnected from the compiler pipeline
+//! until milestone 6, stage 6. It is the owned construction boundary used by
+//! lowering; consequently none of its values borrow the frontend.
 
 use std::collections::HashSet;
 use std::fmt::{self, Write as _};
@@ -15,6 +15,7 @@ macro_rules! index_id {
 
         impl $name {
             pub(crate) fn index(self) -> usize { self.0 }
+            pub(crate) fn from_index(index: usize) -> Self { Self(index) }
         }
 
         impl fmt::Display for $name {

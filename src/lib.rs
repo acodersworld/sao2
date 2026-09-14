@@ -11,6 +11,8 @@ mod host_compiler;
 #[allow(dead_code)]
 mod ir;
 mod lexer;
+#[allow(dead_code)]
+mod lowering;
 mod parser;
 mod program;
 mod semantic;

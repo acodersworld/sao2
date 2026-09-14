@@ -976,6 +976,27 @@ impl<'source> Parser<'source> {
     fn parse_primary(&mut self) -> Result<Expression, Diagnostic> {
         let token = self.current_token().clone();
         match token.kind {
+            kind @ (TokenKind::Int | TokenKind::FloatType) => {
+                self.current += 1;
+                let destination = if matches!(kind, TokenKind::Int) {
+                    PrimitiveType::Int
+                } else {
+                    PrimitiveType::Float
+                };
+                self.expect(&TokenKind::LeftParen, "expected '(' after numeric conversion")?;
+                let operand = self.parse_expression()?;
+                let end = self
+                    .expect(&TokenKind::RightParen, "expected ')' after numeric conversion operand")?
+                    .span
+                    .end;
+                Ok(Expression {
+                    kind: ExpressionKind::Conversion {
+                        destination,
+                        operand: Box::new(operand),
+                    },
+                    span: Span::new(token.span.start, end),
+                })
+            }
             TokenKind::Identifier => {
                 self.current += 1;
                 let identifier = Identifier { span: token.span };
@@ -1545,6 +1566,15 @@ mod tests {
         ] {
             assert_eq!(value_expression(text).kind, expected, "{text}");
         }
+    }
+
+    #[test]
+    fn parses_numeric_conversions_as_dedicated_expressions() {
+        let expression = value_expression("int(float(1))");
+        let ExpressionKind::Conversion { destination: PrimitiveType::Int, operand } = expression.kind else {
+            panic!("expected outer int conversion");
+        };
+        assert!(matches!(operand.kind, ExpressionKind::Conversion { destination: PrimitiveType::Float, .. }));
     }
 
     #[test]

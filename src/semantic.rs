@@ -10,7 +10,8 @@ use crate::analysis::{
     AccessPathStep, Analysis, BindingAccess, BindingId, BuiltinMethod, CallTarget,
     AstNode, BindingNode, CallableId, CallResolution, ConstructorKind, DeclarationId,
     DeclarationNode, DeferredId, FunctionId, FunctionSignature, NameResolution, ResolvedType,
-    TypeDefinitionKind, TypeId, TypeState, UnionAlternative, UnionStyle,
+    ProjectionKind, ProjectionResolution, TypeDefinitionKind, TypeId, TypeState,
+    UnionAlternative, UnionStyle,
 };
 use crate::ast::{
     Argument, ArgumentKind, AssignmentOperator, AssignmentTarget, BinaryOperator, Block,
@@ -720,6 +721,7 @@ impl<'ast> HandoffSubjects<'ast> {
             | ExpressionKind::Character(_)
             | ExpressionKind::Boolean(_) => self.literals.push(expression),
             ExpressionKind::Parenthesized(inner)
+            | ExpressionKind::Conversion { operand: inner, .. }
             | ExpressionKind::Unary { operand: inner, .. }
             | ExpressionKind::Member { value: inner, .. } => self.expression(inner),
             ExpressionKind::List(elements) => {
@@ -955,6 +957,51 @@ impl<'a, 'source, 'ast> HandoffValidator<'a, 'source, 'ast> {
         if self.analysis.literals.iter().any(|item| !self.subjects.literals.iter().any(|node| std::ptr::eq(*node, item.node))) {
             return Err(handoff_error("literal annotation has a foreign AST subject"));
         }
+        for expression in &self.subjects.expressions {
+            if let ExpressionKind::Conversion { destination, operand } = &expression.kind {
+                let records = self.analysis.numeric_conversions.iter().filter(|item| std::ptr::eq(item.node, *expression)).collect::<Vec<_>>();
+                let expected = matches!(self.analysis.expression_annotation(expression).map(|item| item.state), Some(TypeState::Resolved(_)));
+                if records.len() != usize::from(expected) {
+                    return Err(handoff_error("numeric conversion coverage is missing or duplicated"));
+                }
+                if !expected { continue; }
+                let record = records[0];
+                let expected_destination = self.analysis.types.primitive(*destination);
+                let source = self.analysis.expression_annotation(operand).map(|item| item.state);
+                let conversion_result = self.analysis.union_injection(expression)
+                    .map(|item| TypeState::Resolved(alternative_payload(&item.alternative)))
+                    .or_else(|| self.analysis.expression_annotation(expression).map(|item| item.state));
+                if record.destination != expected_destination
+                    || source != Some(TypeState::Resolved(record.source))
+                    || conversion_result != Some(TypeState::Resolved(record.destination))
+                    || !matches!(
+                        (self.analysis.types.get(record.source), self.analysis.types.get(record.destination)),
+                        (ResolvedType::Primitive(PrimitiveType::Int), ResolvedType::Primitive(PrimitiveType::Float))
+                            | (ResolvedType::Primitive(PrimitiveType::Float), ResolvedType::Primitive(PrimitiveType::Int))
+                    )
+                {
+                    return Err(handoff_error("numeric conversion resolution is contradictory"));
+                }
+            }
+            let applicable_projection = matches!(&expression.kind, ExpressionKind::Index { .. } | ExpressionKind::Member { .. })
+                && !self.subjects.call_callees.iter().any(|callee| std::ptr::eq(*callee, *expression))
+                && matches!(self.analysis.expression_annotation(expression).map(|item| item.state), Some(TypeState::Resolved(_)));
+            let count = self.analysis.projections.iter().filter(|item| std::ptr::eq(item.node, *expression)).count();
+            if count != usize::from(applicable_projection) {
+                return Err(handoff_error("value projection coverage is missing or duplicated"));
+            }
+        }
+        if self.analysis.numeric_conversions.iter().any(|item| !self.contains_expression(item.node) || !matches!(&item.node.kind, ExpressionKind::Conversion { .. })) {
+            return Err(handoff_error("numeric conversion resolution has a foreign AST subject"));
+        }
+        for projection in &self.analysis.projections {
+            if !self.contains_expression(projection.node)
+                || self.subjects.call_callees.iter().any(|callee| std::ptr::eq(*callee, projection.node))
+                || !self.projection_valid(projection)
+            {
+                return Err(handoff_error("value projection resolution is contradictory or cross-linked"));
+            }
+        }
         for call in &self.subjects.calls {
             if self.analysis.calls.iter().filter(|item| std::ptr::eq(item.node, *call)).count() != 1 {
                 return Err(handoff_error("call resolution coverage is missing or duplicated"));
@@ -1025,6 +1072,44 @@ impl<'a, 'source, 'ast> HandoffValidator<'a, 'source, 'ast> {
             }
         }
         Ok(())
+    }
+
+    fn projection_valid(&self, resolution: &crate::analysis::ProjectionResolution<'ast>) -> bool {
+        use crate::analysis::ProjectionKind;
+        let result = self.analysis.union_injection(resolution.node)
+            .map(|item| TypeState::Resolved(alternative_payload(&item.alternative)))
+            .or_else(|| self.analysis.expression_annotation(resolution.node).map(|item| item.state));
+        match (&resolution.node.kind, resolution.kind) {
+            (ExpressionKind::Index { value, index }, ProjectionKind::List { element }) => {
+                result == Some(TypeState::Resolved(element))
+                    && matches!(self.analysis.expression_annotation(value).map(|item| item.state), Some(TypeState::Resolved(ty)) if matches!(self.analysis.types.get(ty), ResolvedType::List(actual) if *actual == element))
+                    && self.analysis.expression_annotation(index).map(|item| item.state) == Some(TypeState::Resolved(self.analysis.types.primitive(PrimitiveType::Int)))
+            }
+            (ExpressionKind::Index { value, index }, ProjectionKind::Map { key, value: item }) => {
+                result == Some(TypeState::Resolved(item))
+                    && matches!(self.analysis.expression_annotation(value).map(|item| item.state), Some(TypeState::Resolved(ty)) if matches!(self.analysis.types.get(ty), ResolvedType::Map { key: actual_key, value: actual_value } if *actual_key == key && *actual_value == item))
+                    && self.analysis.expression_annotation(index).map(|item| item.state) == Some(TypeState::Resolved(key))
+            }
+            (ExpressionKind::Index { value, index }, ProjectionKind::String { result: character }) => {
+                result == Some(TypeState::Resolved(character))
+                    && character == self.analysis.types.primitive(PrimitiveType::Char)
+                    && self.analysis.expression_annotation(value).map(|item| item.state) == Some(TypeState::Resolved(self.analysis.types.primitive(PrimitiveType::Str)))
+                    && self.analysis.expression_annotation(index).map(|item| item.state) == Some(TypeState::Resolved(self.analysis.types.primitive(PrimitiveType::Int)))
+            }
+            (ExpressionKind::Member { value, .. }, ProjectionKind::Struct { declaration, field, storage, result: member_type }) => {
+                result == Some(TypeState::Resolved(member_type))
+                    && matches!(self.analysis.expression_annotation(value).map(|item| item.state), Some(TypeState::Resolved(ty)) if matches!(self.analysis.types.get(ty), ResolvedType::Nominal(actual) if *actual == declaration))
+                    && declaration.index() < self.analysis.type_definitions.len()
+                    && matches!(&self.analysis.type_definition(declaration).kind, TypeDefinitionKind::Struct(fields) if fields.get(field).is_some_and(|item| item.storage == storage && item.ty == TypeState::Resolved(member_type)))
+            }
+            (ExpressionKind::Member { value, .. }, ProjectionKind::Tuple { declaration, position, result: member_type }) => {
+                result == Some(TypeState::Resolved(member_type))
+                    && matches!(self.analysis.expression_annotation(value).map(|item| item.state), Some(TypeState::Resolved(ty)) if matches!(self.analysis.types.get(ty), ResolvedType::Nominal(actual) if *actual == declaration))
+                    && declaration.index() < self.analysis.type_definitions.len()
+                    && matches!(&self.analysis.type_definition(declaration).kind, TypeDefinitionKind::Tuple(fields) if fields.get(position).is_some_and(|item| item.ty == TypeState::Resolved(member_type)))
+            }
+            _ => false,
+        }
     }
 
     fn validate_entry_point(&self) -> Result<(), Diagnostic> {
@@ -1503,9 +1588,9 @@ impl<'a, 'source, 'ast> HandoffValidator<'a, 'source, 'ast> {
 
     fn assignment_step_valid(&self, step: &AccessPathStep<'ast>, target: &AssignmentTarget) -> bool {
         match step {
-            AccessPathStep::StructMember { suffix, declaration, member, storage, state } => target.suffixes.iter().any(|item| std::ptr::eq(item, *suffix))
+            AccessPathStep::StructMember { suffix, declaration, member, field, storage, state } => target.suffixes.iter().any(|item| std::ptr::eq(item, *suffix))
                 && declaration.index() < self.analysis.type_definitions.len()
-                && matches!(&self.analysis.type_definitions[declaration.index()].kind, TypeDefinitionKind::Struct(members) if members.iter().any(|item| std::ptr::eq(item.node, *member) && item.storage == *storage && item.ty == *state))
+                && matches!(&self.analysis.type_definitions[declaration.index()].kind, TypeDefinitionKind::Struct(members) if members.get(*field).is_some_and(|item| std::ptr::eq(item.node, *member) && item.storage == *storage && item.ty == *state))
                 && self.annotation_state_valid(*state),
             AccessPathStep::TupleMember { suffix, declaration, member, position, state } => target.suffixes.iter().any(|item| std::ptr::eq(item, *suffix))
                 && declaration.index() < self.analysis.type_definitions.len()
@@ -1529,9 +1614,9 @@ impl<'a, 'source, 'ast> HandoffValidator<'a, 'source, 'ast> {
 
 fn access_steps_agree(left: &AccessPathStep<'_>, right: &AccessPathStep<'_>) -> bool {
     match (left, right) {
-        (AccessPathStep::StructMember { suffix: left_suffix, declaration: left_declaration, member: left_member, storage: left_storage, state: left_state },
-         AccessPathStep::StructMember { suffix: right_suffix, declaration: right_declaration, member: right_member, storage: right_storage, state: right_state }) => {
-            std::ptr::eq(*left_suffix, *right_suffix) && left_declaration == right_declaration && std::ptr::eq(*left_member, *right_member) && left_storage == right_storage && left_state == right_state
+        (AccessPathStep::StructMember { suffix: left_suffix, declaration: left_declaration, member: left_member, field: left_field, storage: left_storage, state: left_state },
+         AccessPathStep::StructMember { suffix: right_suffix, declaration: right_declaration, member: right_member, field: right_field, storage: right_storage, state: right_state }) => {
+            std::ptr::eq(*left_suffix, *right_suffix) && left_declaration == right_declaration && std::ptr::eq(*left_member, *right_member) && left_field == right_field && left_storage == right_storage && left_state == right_state
         }
         (AccessPathStep::TupleMember { suffix: left_suffix, declaration: left_declaration, member: left_member, position: left_position, state: left_state },
          AccessPathStep::TupleMember { suffix: right_suffix, declaration: right_declaration, member: right_member, position: right_position, state: right_state }) => {
@@ -1800,6 +1885,9 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
             }
             ExpressionKind::Parenthesized(inner) => {
                 let state = self.expression(inner); self.replace_if_changed(expression, state);
+            }
+            ExpressionKind::Conversion { operand, .. } => {
+                self.expression(operand);
             }
             ExpressionKind::Unary { operator, operand, .. } => {
                 let operand = self.expression(operand);
@@ -2081,18 +2169,28 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
 
     fn retype_member(&mut self, expression: &'ast Expression, value: &'ast Expression, member: Member) {
         let TypeState::Resolved(receiver) = self.state(value) else { return; };
-        let state = match (self.analysis.types.get(receiver), member) {
-            (ResolvedType::Nominal(declaration), Member::Named(name)) => match &self.analysis.type_definition(*declaration).kind {
-                TypeDefinitionKind::Struct(members) => members.iter().find(|field| self.analysis.identifier_text(field.name.span) == self.analysis.identifier_text(name.span)).map(|field| field.ty),
+        let mut projection = None;
+        let state = match (self.analysis.types.get(receiver).clone(), member) {
+            (ResolvedType::Nominal(declaration), Member::Named(name)) => match self.analysis.type_definition(declaration).kind.clone() {
+                TypeDefinitionKind::Struct(members) => members.iter().enumerate().find(|(_, field)| self.analysis.identifier_text(field.name.span) == self.analysis.identifier_text(name.span)).map(|(field, member)| {
+                    if let TypeState::Resolved(result) = member.ty { projection = Some(ProjectionKind::Struct { declaration, field, storage: member.storage, result }); }
+                    member.ty
+                }),
                 _ => None,
             },
-            (ResolvedType::Nominal(declaration), Member::TupleIndex(span)) => match &self.analysis.type_definition(*declaration).kind {
-                TypeDefinitionKind::Tuple(members) => self.analysis.identifier_text(span).replace('_', "").parse::<usize>().ok().and_then(|index| members.get(index)).map(|field| field.ty),
+            (ResolvedType::Nominal(declaration), Member::TupleIndex(span)) => match self.analysis.type_definition(declaration).kind.clone() {
+                TypeDefinitionKind::Tuple(members) => self.analysis.identifier_text(span).replace('_', "").parse::<usize>().ok().and_then(|position| members.get(position).map(|member| (position, member))).map(|(position, member)| {
+                    if let TypeState::Resolved(result) = member.ty { projection = Some(ProjectionKind::Tuple { declaration, position, result }); }
+                    member.ty
+                }),
                 _ => None,
             },
             _ => None,
         };
         if let Some(state) = state {
+            if self.analysis.projection(expression).is_none() && let Some(kind) = projection {
+                self.analysis.projections.push(ProjectionResolution { node: expression, kind });
+            }
             self.replace_if_changed(expression, state);
         } else if matches!(self.state(expression), TypeState::Deferred(_)) {
             self.error(expression.span, "member is not available on the narrowed alternative");
@@ -2103,13 +2201,19 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
     fn retype_index(&mut self, expression: &'ast Expression, value: &'ast Expression, index: &'ast Expression) {
         let (TypeState::Resolved(value), TypeState::Resolved(index)) = (self.state(value), self.state(index)) else { return; };
         let int = self.analysis.types.primitive(PrimitiveType::Int);
-        let result = match self.analysis.types.get(value) {
-            ResolvedType::List(element) if index == int => Some(*element),
-            ResolvedType::Map { key, value } if index == *key => Some(*value),
-            ResolvedType::Primitive(PrimitiveType::Str) if index == int => Some(self.analysis.types.primitive(PrimitiveType::Char)),
-            _ => None,
+        let (result, projection) = match self.analysis.types.get(value).clone() {
+            ResolvedType::List(element) if index == int => (Some(element), Some(ProjectionKind::List { element })),
+            ResolvedType::Map { key, value } if index == key => (Some(value), Some(ProjectionKind::Map { key, value })),
+            ResolvedType::Primitive(PrimitiveType::Str) if index == int => {
+                let character = self.analysis.types.primitive(PrimitiveType::Char);
+                (Some(character), Some(ProjectionKind::String { result: character }))
+            }
+            _ => (None, None),
         };
         if let Some(result) = result {
+            if self.analysis.projection(expression).is_none() {
+                self.analysis.projections.push(ProjectionResolution { node: expression, kind: projection.unwrap() });
+            }
             self.replace_if_changed(expression, TypeState::Resolved(result));
         } else if matches!(self.state(expression), TypeState::Deferred(_)) {
             self.error(expression.span, "index operation is not defined for the narrowed alternative");
@@ -2178,8 +2282,8 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
                 (ResolvedType::Map { key, value }, crate::ast::AssignmentTargetSuffixKind::Index(_)) => { state = TypeState::Resolved(*value); AccessPathStep::MapIndex { suffix, key: *key, value: *value, state } }
                 (ResolvedType::Nominal(declaration), crate::ast::AssignmentTargetSuffixKind::Member(Member::Named(name))) => {
                     let TypeDefinitionKind::Struct(members) = &self.analysis.type_definition(*declaration).kind else { break; };
-                    let Some(member) = members.iter().find(|member| self.analysis.identifier_text(member.name.span) == self.analysis.identifier_text(name.span)) else { break; };
-                    state = member.ty; AccessPathStep::StructMember { suffix, declaration: *declaration, member: member.node, storage: member.storage, state }
+                    let Some((field, member)) = members.iter().enumerate().find(|(_, member)| self.analysis.identifier_text(member.name.span) == self.analysis.identifier_text(name.span)) else { break; };
+                    state = member.ty; AccessPathStep::StructMember { suffix, declaration: *declaration, member: member.node, field, storage: member.storage, state }
                 }
                 (ResolvedType::Nominal(declaration), crate::ast::AssignmentTargetSuffixKind::Member(Member::TupleIndex(span))) => {
                     let TypeDefinitionKind::Tuple(members) = &self.analysis.type_definition(*declaration).kind else { break; };
@@ -2754,6 +2858,7 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
             | ExpressionKind::TypedEmptyList(_)
             | ExpressionKind::TypedEmptyMap(_) => FlowSummary::fallthrough(),
             ExpressionKind::Parenthesized(inner)
+            | ExpressionKind::Conversion { operand: inner, .. }
             | ExpressionKind::Unary { operand: inner, .. } => self.expression(inner),
             ExpressionKind::Try { value: inner, .. } => {
                 let mut flow = self.expression(inner);
@@ -3060,6 +3165,7 @@ impl<'analysis, 'diagnostics, 'source, 'ast>
             | ExpressionKind::TypedEmptyList(_)
             | ExpressionKind::TypedEmptyMap(_) => {}
             ExpressionKind::Parenthesized(inner)
+            | ExpressionKind::Conversion { operand: inner, .. }
             | ExpressionKind::Unary { operand: inner, .. }
             | ExpressionKind::Try { value: inner, .. } => self.visit_expression(inner),
             ExpressionKind::List(elements) => {

@@ -214,6 +214,10 @@ pub enum ExpressionKind {
     String(Vec<u8>),
     Character(u8),
     Boolean(bool),
+    Conversion {
+        destination: PrimitiveType,
+        operand: Box<Expression>,
+    },
     Parenthesized(Box<Expression>),
     List(Vec<Expression>),
     Map(Vec<MapEntry>),
