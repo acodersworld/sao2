@@ -2245,26 +2245,27 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
             ExpressionKind::Parenthesized(inner) => self.infer_expression(inner),
             ExpressionKind::Conversion { destination, operand } => {
                 let operand_state = self.infer_expression(operand);
-                let TypeState::Resolved(source) = operand_state else {
-                    return self.non_value_operand(expression, operand_state);
-                };
-                let destination = self.analysis.types.primitive(*destination);
-                let int = self.analysis.types.primitive(PrimitiveType::Int);
-                let float = self.analysis.types.primitive(PrimitiveType::Float);
-                if !((source == int && destination == float)
-                    || (source == float && destination == int))
-                {
-                    self.analysis.error(
-                        expression.span,
-                        "numeric conversion must be int(float) or float(int)",
-                    )
+                if let TypeState::Resolved(source) = operand_state {
+                    let destination = self.analysis.types.primitive(*destination);
+                    let int = self.analysis.types.primitive(PrimitiveType::Int);
+                    let float = self.analysis.types.primitive(PrimitiveType::Float);
+                    if !((source == int && destination == float)
+                        || (source == float && destination == int))
+                    {
+                        self.analysis.error(
+                            expression.span,
+                            "numeric conversion must be int(float) or float(int)",
+                        )
+                    } else {
+                        self.analysis.numeric_conversions.push(NumericConversionResolution {
+                            node: expression,
+                            source,
+                            destination,
+                        });
+                        TypeState::Resolved(destination)
+                    }
                 } else {
-                    self.analysis.numeric_conversions.push(NumericConversionResolution {
-                        node: expression,
-                        source,
-                        destination,
-                    });
-                    TypeState::Resolved(destination)
+                    self.non_value_operand(expression, operand_state)
                 }
             }
             ExpressionKind::List(elements) => {
@@ -2969,49 +2970,48 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
                 match (kind, member) {
                     (TypeDefinitionKind::Struct(members), Member::Named(name)) => {
                         let spelling = self.analysis.identifier_text(name.span).to_owned();
-                        members
+                        let selected = members
                             .iter()
                             .enumerate()
                             .find(|(_, field)| {
                                 self.analysis.identifier_text(field.name.span) == spelling.as_str()
-                            })
-                            .map_or_else(
-                                || {
-                                    self.analysis.error(
-                                        name.span,
-                                        format!("struct has no member '{spelling}'"),
-                                    )
-                                },
-                                |(field, member)| {
-                                    if let TypeState::Resolved(result) = member.ty {
-                                        self.analysis.projections.push(ProjectionResolution {
-                                            node: expression,
-                                            kind: ProjectionKind::Struct {
-                                                declaration,
-                                                field,
-                                                storage: member.storage,
-                                                result,
-                                            },
-                                        });
-                                    }
-                                    member.ty
-                                },
-                            )
+                            });
+                        match selected {
+                            Some((field, member)) => {
+                                if let TypeState::Resolved(result) = member.ty {
+                                    self.analysis.projections.push(ProjectionResolution {
+                                        node: expression,
+                                        kind: ProjectionKind::Struct {
+                                            declaration,
+                                            field,
+                                            storage: member.storage,
+                                            result,
+                                        },
+                                    });
+                                }
+                                member.ty
+                            }
+                            None => self.analysis.error(
+                                name.span,
+                                format!("struct has no member '{spelling}'"),
+                            ),
+                        }
                     }
                     (TypeDefinitionKind::Tuple(members), Member::TupleIndex(span)) => {
                         let index = self.parse_tuple_index(span);
-                        index.and_then(|position| members.get(position).map(|member| (position, member))).map_or_else(
-                                || self.analysis.error(span, "tuple member index is out of range"),
-                                |(position, member)| {
-                                    if let TypeState::Resolved(result) = member.ty {
-                                        self.analysis.projections.push(ProjectionResolution {
-                                            node: expression,
-                                            kind: ProjectionKind::Tuple { declaration, position, result },
-                                        });
-                                    }
-                                    member.ty
-                                },
-                            )
+                        let selected = index.and_then(|position| members.get(position).map(|member| (position, member)));
+                        match selected {
+                            Some((position, member)) => {
+                                if let TypeState::Resolved(result) = member.ty {
+                                    self.analysis.projections.push(ProjectionResolution {
+                                        node: expression,
+                                        kind: ProjectionKind::Tuple { declaration, position, result },
+                                    });
+                                }
+                                member.ty
+                            }
+                            None => self.analysis.error(span, "tuple member index is out of range"),
+                        }
                     }
                     (TypeDefinitionKind::Union { .. }, _) => {
                         self.defer_expression(expression, DeferredReason::FlowDependentType)
@@ -3599,9 +3599,33 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
                 self.resolve_typed_empty(expression, ty, expected)
             }
             ExpressionKind::Parenthesized(inner) => self.resolve_expression(inner, expected),
-            ExpressionKind::Conversion { operand, .. } => {
-                self.resolve_expression(operand, None);
-                self.coerce(expression, current, expected)
+            ExpressionKind::Conversion { destination, operand } => {
+                let operand = self.resolve_expression(operand, None);
+                let state = if let TypeState::Resolved(source) = operand {
+                    let destination = self.analysis.types.primitive(*destination);
+                    let int = self.analysis.types.primitive(PrimitiveType::Int);
+                    let float = self.analysis.types.primitive(PrimitiveType::Float);
+                    if (source == int && destination == float)
+                        || (source == float && destination == int)
+                    {
+                        if self.analysis.numeric_conversion(expression).is_none() {
+                            self.analysis.numeric_conversions.push(NumericConversionResolution {
+                                node: expression,
+                                source,
+                                destination,
+                            });
+                        }
+                        TypeState::Resolved(destination)
+                    } else {
+                        self.analysis.error(
+                            expression.span,
+                            "numeric conversion must be int(float) or float(int)",
+                        )
+                    }
+                } else {
+                    self.operand_state(expression, operand, current)
+                };
+                self.coerce(expression, state, expected)
             }
             ExpressionKind::Block(block) => self.resolve_block(block, expected),
             ExpressionKind::If {
@@ -3838,32 +3862,34 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
                 match (self.analysis.type_definition(declaration).kind.clone(), member) {
                     (TypeDefinitionKind::Struct(members), Member::Named(name)) => {
                         let spelling = self.analysis.identifier_text(name.span).to_owned();
-                        members.iter().enumerate().find(|(_, field)| {
+                        let selected = members.iter().enumerate().find(|(_, field)| {
                             self.analysis.identifier_text(field.name.span) == spelling.as_str()
-                        }).map_or_else(
-                            || self.analysis.error(name.span, format!("struct has no member '{spelling}'")),
-                            |(field, member)| {
+                        });
+                        match selected {
+                            Some((field, member)) => {
                                 if let TypeState::Resolved(result) = member.ty
                                     && self.analysis.projection(expression).is_none()
                                 {
                                     self.analysis.projections.push(ProjectionResolution { node: expression, kind: ProjectionKind::Struct { declaration, field, storage: member.storage, result } });
                                 }
                                 member.ty
-                            },
-                        )
+                            }
+                            None => self.analysis.error(name.span, format!("struct has no member '{spelling}'")),
+                        }
                     }
                     (TypeDefinitionKind::Tuple(members), Member::TupleIndex(span)) => {
-                        self.parse_tuple_index(span).and_then(|position| members.get(position).map(|member| (position, member))).map_or_else(
-                            || self.analysis.error(span, "tuple member index is out of range"),
-                            |(position, member)| {
+                        let selected = self.parse_tuple_index(span).and_then(|position| members.get(position).map(|member| (position, member)));
+                        match selected {
+                            Some((position, member)) => {
                                 if let TypeState::Resolved(result) = member.ty
                                     && self.analysis.projection(expression).is_none()
                                 {
                                     self.analysis.projections.push(ProjectionResolution { node: expression, kind: ProjectionKind::Tuple { declaration, position, result } });
                                 }
                                 member.ty
-                            },
-                        )
+                            }
+                            None => self.analysis.error(span, "tuple member index is out of range"),
+                        }
                     }
                     (TypeDefinitionKind::Union { .. }, _) => current,
                     (TypeDefinitionKind::Invalid, _) => TypeState::Error,

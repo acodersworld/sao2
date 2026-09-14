@@ -939,7 +939,7 @@ impl<'a, 'source, 'ast> HandoffValidator<'a, 'source, 'ast> {
             }
         }
         for expression in &self.subjects.expressions {
-            if self.subjects.call_callees.iter().any(|callee| std::ptr::eq(*callee, *expression)) {
+            if self.is_non_value_callee_syntax(expression) {
                 continue;
             }
             let Some(annotation) = self.analysis.expression_annotation(expression) else {
@@ -984,7 +984,7 @@ impl<'a, 'source, 'ast> HandoffValidator<'a, 'source, 'ast> {
                 }
             }
             let applicable_projection = matches!(&expression.kind, ExpressionKind::Index { .. } | ExpressionKind::Member { .. })
-                && !self.subjects.call_callees.iter().any(|callee| std::ptr::eq(*callee, *expression))
+                && !self.is_non_value_callee_syntax(expression)
                 && matches!(self.analysis.expression_annotation(expression).map(|item| item.state), Some(TypeState::Resolved(_)));
             let count = self.analysis.projections.iter().filter(|item| std::ptr::eq(item.node, *expression)).count();
             if count != usize::from(applicable_projection) {
@@ -996,7 +996,7 @@ impl<'a, 'source, 'ast> HandoffValidator<'a, 'source, 'ast> {
         }
         for projection in &self.analysis.projections {
             if !self.contains_expression(projection.node)
-                || self.subjects.call_callees.iter().any(|callee| std::ptr::eq(*callee, projection.node))
+                || self.is_non_value_callee_syntax(projection.node)
                 || !self.projection_valid(projection)
             {
                 return Err(handoff_error("value projection resolution is contradictory or cross-linked"));
@@ -1484,6 +1484,28 @@ impl<'a, 'source, 'ast> HandoffValidator<'a, 'source, 'ast> {
 
     fn contains_expression(&self, node: &Expression) -> bool {
         self.subjects.expressions.iter().any(|item| std::ptr::eq(*item, node))
+    }
+
+    fn is_non_value_callee_syntax(&self, node: &Expression) -> bool {
+        self.subjects
+            .call_callees
+            .iter()
+            .any(|callee| std::ptr::eq(*callee, node))
+            || self.subjects.calls.iter().any(|call| {
+                if !matches!(
+                    self.analysis.call_resolution(call).map(|resolution| resolution.target),
+                    Some(CallTarget::QualifiedConstructor(_))
+                ) {
+                    return false;
+                }
+                let ExpressionKind::Call { callee, .. } = &call.kind else {
+                    return false;
+                };
+                matches!(
+                    &callee.kind,
+                    ExpressionKind::Member { value, .. } if std::ptr::eq(value.as_ref(), node)
+                )
+            })
     }
 
     fn contains_statement(&self, node: &Statement) -> bool {
@@ -1996,11 +2018,14 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
                 }
             }
             ExpressionKind::Call { callee, arguments } => {
-                match &callee.kind {
-                    ExpressionKind::Member { value, .. } => { self.expression(value); }
-                    ExpressionKind::Identifier(_) => {}
-                    _ if self.analysis.expression_annotation(callee).is_some() => { self.expression(callee); }
-                    _ => {}
+                let target = self.analysis.call_resolution(expression).map(|call| call.target);
+                if !matches!(target, Some(CallTarget::QualifiedConstructor(_))) {
+                    match &callee.kind {
+                        ExpressionKind::Member { value, .. } => { self.expression(value); }
+                        ExpressionKind::Identifier(_) => {}
+                        _ if self.analysis.expression_annotation(callee).is_some() => { self.expression(callee); }
+                        _ => {}
+                    }
                 }
                 for argument in arguments { self.expression(argument_value(argument)); }
                 self.retype_call(expression, callee, arguments);
@@ -2243,7 +2268,15 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
                     self.replace_if_changed(expression, result);
                     return;
                 }
-                _ => {}
+                CallTarget::Callable(CallableId::Constructor(_))
+                | CallTarget::QualifiedConstructor(_)
+                | CallTarget::ErrorConstructor => return,
+                CallTarget::Builtin(_)
+                | CallTarget::Expression => {}
+                CallTarget::Binding(_)
+                | CallTarget::AmbiguousErrorConstructor { .. }
+                | CallTarget::Ambiguous { .. }
+                | CallTarget::Unknown => return,
             }
         }
         let ExpressionKind::Member { value: receiver, member: Member::Named(name) } = &callee.kind else { return; };

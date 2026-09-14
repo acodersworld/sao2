@@ -1,4 +1,4 @@
-//! Straight-line lowering from the validated frontend handoff to owned IR.
+//! Control-flow lowering from the validated frontend handoff to owned IR.
 
 use std::fmt;
 
@@ -9,14 +9,15 @@ use crate::analysis::{
 };
 use crate::ast::{
     self, Argument, ArgumentKind, AssignmentOperator, Expression, ExpressionKind, PrimitiveType,
-    Statement, StatementKind,
+    Statement, StatementBody, StatementBodyKind, StatementKind, ExpressionBody,
+    ExpressionBodyKind,
 };
 use crate::ir;
-use crate::semantic::{MutabilityOperation, MutabilityPath, MutabilitySubject, SemanticResult};
+use crate::semantic::{FallthroughKind, FlowSubject, MutabilityOperation, MutabilityPath, MutabilitySubject, SemanticResult};
 use crate::source::Span;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PendingStage { Stage3, Stage4 }
+pub(crate) enum PendingStage { Stage4 }
 
 #[derive(Debug)]
 pub(crate) enum LoweringError {
@@ -188,22 +189,27 @@ impl<'a, 'source, 'ast> Lowerer<'a, 'source, 'ast> {
         let entry = function.add_block();
         function.entry = Some(entry);
         {
-            let mut body = BodyLowerer { owner: self, function: &mut function, block: entry, bindings };
+            let mut body = BodyLowerer { owner: self, function: &mut function, function_id: signature.id, block: Some(entry), bindings, loops: Vec::new() };
+            let expected_fallthrough = body.block_falls_through(&signature.node.body)?;
             body.block(&signature.node.body)?;
-            let value = if let Some(value) = signature.node.body.value.as_deref() {
-                body.expression(value)?
-            } else {
-                let frontend_unit = body.owner.analysis.types.unit();
-                let unit = body.owner.map_type(frontend_unit)?;
-                let value = ir::Operand::Constant(ir::Constant { ty: unit, value: ir::ConstantValue::Unit });
-                let completion_injection = body.semantic_completion(signature.id, &signature.node.body).and_then(|item| item.unit_injection.clone());
-                if let Some(alternative) = completion_injection.as_ref() {
+            let value = if body.block.is_some() {
+                if let Some(value_expression) = signature.node.body.value.as_deref() {
+                    body.expression(value_expression)?
+                } else {
+                    let completion_injection = body.semantic_completion(signature.id, &signature.node.body)?.unit_injection.clone();
+                    let frontend_unit = body.owner.analysis.types.unit();
+                    let unit = body.owner.map_type(frontend_unit)?;
+                    let value = ir::Operand::Constant(ir::Constant { ty: unit, value: ir::ConstantValue::Unit });
+                    if let Some(alternative) = completion_injection.as_ref() {
                         let TypeState::Resolved(union) = signature.result else { unreachable!() };
                         body.inject(value, union, alternative, signature.node.body.span)?
-                } else { value }
-            };
-            let location = body.location(signature.node.body.span);
-            body.current_block().terminate(ir::TerminatorKind::Return(value), location);
+                    } else { Some(value) }
+                }
+            } else { None };
+            if expected_fallthrough != body.block.is_some() { return Err(invariant("function-body lowering contradicts its flow summary")); }
+            if let Some(value) = value {
+                body.terminate(ir::TerminatorKind::Return(value), signature.node.body.span)?;
+            }
         }
         self.program.functions[index] = function;
         Ok(())
@@ -213,15 +219,68 @@ impl<'a, 'source, 'ast> Lowerer<'a, 'source, 'ast> {
 struct BodyLowerer<'a, 'b, 'source, 'ast> {
     owner: &'a mut Lowerer<'b, 'source, 'ast>,
     function: &'a mut ir::Function,
-    block: ir::BlockId,
+    function_id: analysis::FunctionId,
+    block: Option<ir::BlockId>,
     bindings: Vec<Option<ir::LocalId>>,
+    loops: Vec<LoopContext<'ast>>,
+}
+
+#[derive(Clone)]
+struct LoopContext<'ast> {
+    source: &'ast Statement,
+    continue_target: ir::BlockId,
+    break_target: ir::BlockId,
+    cleanup: Option<ir::Operand>,
 }
 
 impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
-    fn current_block(&mut self) -> &mut ir::BasicBlock { &mut self.function.blocks[self.block.index()] }
+    fn current_block(&mut self) -> Result<&mut ir::BasicBlock, LoweringError> {
+        let block = self.block.ok_or_else(|| invariant("operation emitted after path termination"))?;
+        Ok(&mut self.function.blocks[block.index()])
+    }
+    fn new_block(&mut self) -> ir::BlockId { self.function.add_block() }
+    fn enter(&mut self, block: ir::BlockId) { self.block = Some(block); }
     fn location(&mut self, span: Span) -> ir::LocationId { self.owner.program.intern_location(ir::ByteSpan::new(span.start, span.end)) }
-    fn semantic_completion(&self, function: analysis::FunctionId, block: &ast::Block) -> Option<&crate::semantic::FunctionCompletion<'ast>> {
-        self.owner.semantic.flow.completions.iter().find(|item| item.function == function && std::ptr::eq(item.body, block))
+    fn semantic_completion(&self, function: analysis::FunctionId, block: &ast::Block) -> Result<&crate::semantic::FunctionCompletion<'ast>, LoweringError> {
+        let matches = self.owner.semantic.flow.completions.iter().filter(|item| item.function == function && std::ptr::eq(item.body, block)).collect::<Vec<_>>();
+        let [completion] = matches.as_slice() else { return Err(invariant("function fallthrough does not have exactly one completion record")); };
+        Ok(*completion)
+    }
+    fn semantic_return(&self, statement: &Statement) -> Result<&crate::semantic::ExplicitReturn<'ast>, LoweringError> {
+        let matches = self.owner.semantic.flow.returns.iter().filter(|item| std::ptr::eq(item.statement, statement)).collect::<Vec<_>>();
+        let [record] = matches.as_slice() else { return Err(invariant("explicit return does not have exactly one flow record")); };
+        if record.function != self.function_id { return Err(invariant("explicit return is linked to the wrong function")); }
+        Ok(*record)
+    }
+    fn semantic_loop_control(&self, statement: &Statement) -> Result<&crate::semantic::LoopControl<'ast>, LoweringError> {
+        let matches = self.owner.semantic.flow.loop_controls.iter().filter(|item| std::ptr::eq(item.statement, statement)).collect::<Vec<_>>();
+        let [record] = matches.as_slice() else { return Err(invariant("loop control does not have exactly one target record")); };
+        Ok(*record)
+    }
+    fn block_falls_through(&self, block: &ast::Block) -> Result<bool, LoweringError> {
+        let matches = self.owner.semantic.flow.summaries.iter().filter(|record| matches!(record.subject, FlowSubject::Block(candidate) if std::ptr::eq(candidate, block))).collect::<Vec<_>>();
+        let [record] = matches.as_slice() else { return Err(invariant("block does not have exactly one flow summary")); };
+        Ok(record.summary.fallthrough != FallthroughKind::None)
+    }
+    fn statement_falls_through(&self, statement: &Statement) -> Result<bool, LoweringError> {
+        let matches = self.owner.semantic.flow.summaries.iter().filter(|record| matches!(record.subject, FlowSubject::Statement(candidate) if std::ptr::eq(candidate, statement))).collect::<Vec<_>>();
+        let [record] = matches.as_slice() else { return Err(invariant("statement does not have exactly one flow summary")); };
+        Ok(record.summary.fallthrough != FallthroughKind::None)
+    }
+    fn expression_falls_through(&self, expression: &Expression) -> Result<bool, LoweringError> {
+        let matches = self.owner.semantic.flow.summaries.iter().filter(|record| matches!(record.subject, FlowSubject::Expression(candidate) if std::ptr::eq(candidate, expression))).collect::<Vec<_>>();
+        let [record] = matches.as_slice() else { return Err(invariant("expression does not have exactly one flow summary")); };
+        Ok(record.summary.fallthrough != FallthroughKind::None)
+    }
+    fn statement_body_falls_through(&self, body: &StatementBody) -> Result<bool, LoweringError> {
+        let matches = self.owner.semantic.flow.summaries.iter().filter(|record| matches!(record.subject, FlowSubject::StatementBody(candidate) if std::ptr::eq(candidate, body))).collect::<Vec<_>>();
+        let [record] = matches.as_slice() else { return Err(invariant("statement body does not have exactly one flow summary")); };
+        Ok(record.summary.fallthrough != FallthroughKind::None)
+    }
+    fn expression_body_falls_through(&self, body: &ExpressionBody) -> Result<bool, LoweringError> {
+        let matches = self.owner.semantic.flow.summaries.iter().filter(|record| matches!(record.subject, FlowSubject::ExpressionBody(candidate) if std::ptr::eq(candidate, body))).collect::<Vec<_>>();
+        let [record] = matches.as_slice() else { return Err(invariant("expression body does not have exactly one flow summary")); };
+        Ok(record.summary.fallthrough != FallthroughKind::None)
     }
     fn ty(&mut self, ty: analysis::TypeId) -> Result<ir::TypeId, LoweringError> { self.owner.map_type(ty) }
     fn definition(&self, definition: analysis::TypeDeclarationId) -> Result<ir::DefinitionId, LoweringError> {
@@ -247,124 +306,146 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         let ty = self.ty(ty)?;
         Ok(self.function.add_local(ty, None, ir::LocalOrigin::Temporary))
     }
-    fn push(&mut self, kind: ir::OperationKind, span: Span) {
+    fn push(&mut self, kind: ir::OperationKind, span: Span) -> Result<(), LoweringError> {
         let location = self.location(span);
-        self.current_block().push(kind, location);
+        self.current_block()?.push(kind, location);
+        Ok(())
+    }
+    fn terminate(&mut self, kind: ir::TerminatorKind, span: Span) -> Result<(), LoweringError> {
+        let location = self.location(span);
+        self.current_block()?.terminate(kind, location);
+        self.block = None;
+        Ok(())
     }
 
     fn block(&mut self, block: &'ast ast::Block) -> Result<(), LoweringError> {
-        for statement in &block.statements { self.statement(statement)?; }
+        self.block_falls_through(block)?;
+        for statement in &block.statements {
+            if self.block.is_none() { break; }
+            self.statement(statement)?;
+        }
         Ok(())
     }
 
     fn statement(&mut self, statement: &'ast Statement) -> Result<(), LoweringError> {
+        let expected_fallthrough = self.statement_falls_through(statement)?;
         match &statement.kind {
             StatementKind::Local { name, initializer, .. } => {
                 let binding = self.owner.analysis.bindings.iter().find_map(|record| match record.node {
                     BindingNode::Local(node) if std::ptr::eq(node, statement) => Some(record.id),
                     _ => None,
                 }).ok_or_else(|| invariant("local declaration lacks a binding identity"))?;
-                let TypeState::Resolved(ty) = self.owner.analysis.binding_type(binding) else { return Err(invariant("local binding has no resolved type")); };
-                let mapped = self.ty(ty)?;
-                let source_name = self.owner.analysis.identifier_text(name.span).to_owned();
-                let local = self.function.add_local(mapped, Some(source_name), ir::LocalOrigin::Binding);
-                self.bindings[binding.index()] = Some(local);
-                let value = self.expression(initializer)?;
-                self.push(ir::OperationKind::Assign { destination: ir::Place::local(local), value }, statement.span);
+                let binding_state = self.owner.analysis.binding_type(binding);
+                if binding_state == TypeState::Never {
+                    if self.expression(initializer)?.is_some() { return Err(invariant("never-typed local initializer did not diverge")); }
+                } else {
+                    let TypeState::Resolved(ty) = binding_state else { return Err(invariant("local binding has no resolved type")); };
+                    let mapped = self.ty(ty)?;
+                    let source_name = self.owner.analysis.identifier_text(name.span).to_owned();
+                    let local = self.function.add_local(mapped, Some(source_name), ir::LocalOrigin::Binding);
+                    self.bindings[binding.index()] = Some(local);
+                    let Some(value) = self.expression(initializer)? else { return Err(invariant("value-typed local initializer diverged")); };
+                    self.push(ir::OperationKind::Assign { destination: ir::Place::local(local), value }, statement.span)?;
+                }
             }
             StatementKind::Assignment { target, operator, value, .. } => self.assignment(target, *operator, value, statement.span)?,
-            StatementKind::Expression(expression) => {
-                if self.is_panic(expression) {
-                    return Err(pending(PendingStage::Stage3, "terminal panic", expression.span));
-                }
-                self.expression(expression)?;
-            }
-            StatementKind::Return(_) => return Err(pending(PendingStage::Stage3, "explicit return", statement.span)),
-            StatementKind::If { .. } => return Err(pending(PendingStage::Stage3, "conditional statement", statement.span)),
-            StatementKind::While { .. } | StatementKind::For { .. } => return Err(pending(PendingStage::Stage3, "loop", statement.span)),
-            StatementKind::Switch { .. } => return Err(pending(PendingStage::Stage3, "switch", statement.span)),
-            StatementKind::Break => return Err(pending(PendingStage::Stage3, "break", statement.span)),
-            StatementKind::Continue => return Err(pending(PendingStage::Stage3, "continue", statement.span)),
-            StatementKind::Block(_) => return Err(pending(PendingStage::Stage3, "statement block", statement.span)),
+            StatementKind::Expression(expression) => { self.expression(expression)?; }
+            StatementKind::Return(value) => self.return_statement(statement, value.as_ref())?,
+            StatementKind::If { branches, else_body } => self.if_statement(branches, else_body.as_ref(), statement.span)?,
+            StatementKind::While { condition, body } => self.while_loop(statement, condition, body)?,
+            StatementKind::For { iterable, body, .. } => self.for_loop(statement, iterable, body)?,
+            StatementKind::Switch { .. } => return Err(pending(PendingStage::Stage4, "switch", statement.span)),
+            StatementKind::Break | StatementKind::Continue => self.loop_control(statement)?,
+            StatementKind::Block(block) => self.statement_block(block)?,
         }
+        if expected_fallthrough != self.block.is_some() { return Err(invariant("statement lowering contradicts its flow summary")); }
         Ok(())
     }
 
-    fn expression(&mut self, expression: &'ast Expression) -> Result<ir::Operand, LoweringError> {
-        let value = self.expression_core(expression)?;
-        if let Some(injection) = self.owner.analysis.union_injection(expression) {
-            let union = injection.union_type;
-            let alternative = injection.alternative.clone();
-            self.inject(value, union, &alternative, expression.span)
-        } else { Ok(value) }
+    fn expression(&mut self, expression: &'ast Expression) -> Result<Option<ir::Operand>, LoweringError> {
+        let expected_fallthrough = self.expression_falls_through(expression)?;
+        let value = if let Some(value) = self.expression_core(expression)? {
+            if let Some(injection) = self.owner.analysis.union_injection(expression) {
+                let union = injection.union_type;
+                let alternative = injection.alternative.clone();
+                self.inject(value, union, &alternative, expression.span)?
+            } else { Some(value) }
+        } else { None };
+        if expected_fallthrough != value.is_some() || expected_fallthrough != self.block.is_some() {
+            return Err(invariant("expression lowering contradicts its flow summary"));
+        }
+        Ok(value)
     }
 
-    fn expression_core(&mut self, expression: &'ast Expression) -> Result<ir::Operand, LoweringError> {
-        match &expression.kind {
+    fn expression_core(&mut self, expression: &'ast Expression) -> Result<Option<ir::Operand>, LoweringError> {
+        let value = match &expression.kind {
             ExpressionKind::Unit => {
                 let ty = self.raw_type(expression)?;
-                self.constant(ty, ir::ConstantValue::Unit)
+                self.constant(ty, ir::ConstantValue::Unit)?
             }
             ExpressionKind::Integer
             | ExpressionKind::Float
             | ExpressionKind::String(_)
             | ExpressionKind::Character(_)
-            | ExpressionKind::Boolean(_) => self.literal_constant(expression),
+            | ExpressionKind::Boolean(_) => self.literal_constant(expression)?,
             ExpressionKind::Identifier(identifier) => {
                 let Some(analysis::NameResolution::Binding(binding)) = self.owner.analysis.name_use(identifier).map(|item| item.resolution) else { return Err(invariant("value identifier is not a binding")); };
                 let local = self.bindings.get(binding.index()).and_then(|item| *item).ok_or_else(|| invariant("binding has not been allocated"))?;
-                Ok(ir::Operand::Copy(ir::Place::local(local)))
+                ir::Operand::Copy(ir::Place::local(local))
             }
-            ExpressionKind::Parenthesized(inner) => self.expression(inner),
+            ExpressionKind::Parenthesized(inner) => return self.expression(inner),
             ExpressionKind::Conversion { operand, .. } => {
                 let resolution = *self.owner.analysis.numeric_conversion(expression).ok_or_else(|| invariant("numeric conversion fact is missing"))?;
                 if !self.owner.analysis.types.contains(resolution.source) || !self.owner.analysis.types.contains(resolution.destination) {
                     return Err(invariant("numeric conversion contains an invalid type identity"));
                 }
                 let conversion = if matches!(self.owner.analysis.types.get(resolution.source), ResolvedType::Primitive(PrimitiveType::Int)) { ir::NumericConversion::IntToFloat } else { ir::NumericConversion::FloatToInt };
-                let operand = self.expression(operand)?;
+                let Some(operand) = self.expression(operand)? else { return Ok(None); };
                 let destination = self.temporary(resolution.destination)?;
-                self.push(ir::OperationKind::Convert { destination, conversion, operand }, expression.span);
-                Ok(ir::Operand::Copy(ir::Place::local(destination)))
+                self.push(ir::OperationKind::Convert { destination, conversion, operand }, expression.span)?;
+                ir::Operand::Copy(ir::Place::local(destination))
             }
             ExpressionKind::Unary { operator, operand, .. } => {
-                let operand = self.expression(operand)?;
+                let Some(operand) = self.expression(operand)? else { return Ok(None); };
                 let result = self.raw_type(expression)?;
                 let destination = self.temporary(result)?;
-                self.push(ir::OperationKind::Unary { destination, operator: map_unary(*operator), operand }, expression.span);
-                Ok(ir::Operand::Copy(ir::Place::local(destination)))
+                self.push(ir::OperationKind::Unary { destination, operator: map_unary(*operator), operand }, expression.span)?;
+                ir::Operand::Copy(ir::Place::local(destination))
             }
             ExpressionKind::Binary { left, operator, right, .. } => {
-                if matches!(operator, ast::BinaryOperator::LogicalAnd | ast::BinaryOperator::LogicalOr) { return Err(pending(PendingStage::Stage3, "short-circuit operator", expression.span)); }
+                if matches!(operator, ast::BinaryOperator::LogicalAnd | ast::BinaryOperator::LogicalOr) {
+                    return self.short_circuit(expression, left, *operator, right);
+                }
                 let left_span = left.span;
-                let left = self.expression(left)?;
+                let Some(left) = self.expression(left)? else { return Ok(None); };
                 let left = self.stabilize(left, left_span)?;
-                let right = self.expression(right)?;
+                let Some(right) = self.expression(right)? else { return Ok(None); };
                 let result = self.raw_type(expression)?;
                 let destination = self.temporary(result)?;
-                self.push(ir::OperationKind::Binary { destination, operator: map_binary(*operator)?, left, right }, expression.span);
-                Ok(ir::Operand::Copy(ir::Place::local(destination)))
+                self.push(ir::OperationKind::Binary { destination, operator: map_binary(*operator)?, left, right }, expression.span)?;
+                ir::Operand::Copy(ir::Place::local(destination))
             }
-            ExpressionKind::List(elements) => self.list(expression, elements),
-            ExpressionKind::Map(entries) => self.map(expression, entries),
+            ExpressionKind::List(elements) => return self.list(expression, elements),
+            ExpressionKind::Map(entries) => return self.map(expression, entries),
             ExpressionKind::TypedEmptyList(_) => {
                 let raw = self.raw_type(expression)?;
                 let ty = self.ty(raw)?;
-                self.aggregate(expression, ir::Aggregate::List { ty, elements: Vec::new() })
+                self.aggregate(expression, ir::Aggregate::List { ty, elements: Vec::new() })?
             }
             ExpressionKind::TypedEmptyMap(_) => {
                 let raw = self.raw_type(expression)?;
                 let ty = self.ty(raw)?;
-                self.aggregate(expression, ir::Aggregate::Map { ty, entries: Vec::new() })
+                self.aggregate(expression, ir::Aggregate::Map { ty, entries: Vec::new() })?
             }
-            ExpressionKind::Call { arguments, .. } => self.call(expression, arguments),
-            ExpressionKind::Member { value, .. } => self.member(expression, value),
-            ExpressionKind::Index { value, index } => self.index(expression, value, index),
-            ExpressionKind::Block(_) => Err(pending(PendingStage::Stage3, "block expression", expression.span)),
-            ExpressionKind::If { .. } => Err(pending(PendingStage::Stage3, "if expression", expression.span)),
-            ExpressionKind::Is { .. } => Err(pending(PendingStage::Stage4, "union test", expression.span)),
-            ExpressionKind::Try { .. } => Err(pending(PendingStage::Stage4, "postfix try", expression.span)),
-        }
+            ExpressionKind::Call { arguments, .. } => return self.call(expression, arguments),
+            ExpressionKind::Member { value, .. } => return self.member(expression, value),
+            ExpressionKind::Index { value, index } => return self.index(expression, value, index),
+            ExpressionKind::Block(block) => return self.block_expression(expression, block),
+            ExpressionKind::If { branches, else_branch } => return self.if_expression(expression, branches, else_branch),
+            ExpressionKind::Is { .. } => return Err(pending(PendingStage::Stage4, "union test", expression.span)),
+            ExpressionKind::Try { .. } => return Err(pending(PendingStage::Stage4, "postfix try", expression.span)),
+        };
+        Ok(Some(value))
     }
 
     fn constant(&mut self, ty: analysis::TypeId, value: ir::ConstantValue) -> Result<ir::Operand, LoweringError> { Ok(ir::Operand::Constant(ir::Constant { ty: self.ty(ty)?, value })) }
@@ -383,7 +464,7 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
     fn aggregate(&mut self, expression: &Expression, aggregate: ir::Aggregate) -> Result<ir::Operand, LoweringError> {
         let result = self.raw_type(expression)?;
         let destination = self.temporary(result)?;
-        self.push(ir::OperationKind::Aggregate { destination, aggregate }, expression.span);
+        self.push(ir::OperationKind::Aggregate { destination, aggregate }, expression.span)?;
         Ok(ir::Operand::Copy(ir::Place::local(destination)))
     }
     fn stabilize(&mut self, operand: ir::Operand, span: Span) -> Result<ir::Operand, LoweringError> {
@@ -395,7 +476,7 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         if stable { return Ok(operand); }
         let ty = self.operand_frontend_type(&operand)?;
         let destination = self.temporary(ty)?;
-        self.push(ir::OperationKind::Copy { destination, operand }, span);
+        self.push(ir::OperationKind::Copy { destination, operand }, span)?;
         Ok(ir::Operand::Copy(ir::Place::local(destination)))
     }
     fn materialize(&mut self, operand: ir::Operand, span: Span) -> Result<ir::Operand, LoweringError> {
@@ -404,7 +485,7 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         }
         let ty = self.operand_frontend_type(&operand)?;
         let destination = self.temporary(ty)?;
-        self.push(ir::OperationKind::Copy { destination, operand }, span);
+        self.push(ir::OperationKind::Copy { destination, operand }, span)?;
         Ok(ir::Operand::Copy(ir::Place::local(destination)))
     }
     fn operand_frontend_type(&self, operand: &ir::Operand) -> Result<analysis::TypeId, LoweringError> {
@@ -419,28 +500,33 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         self.owner.types.iter().position(|item| *item == Some(ir_ty)).map(analysis::TypeId::from_index).ok_or_else(|| invariant("IR operand type has no frontend mapping"))
     }
 
-    fn list(&mut self, expression: &'ast Expression, elements: &'ast [Expression]) -> Result<ir::Operand, LoweringError> {
+    fn list(&mut self, expression: &'ast Expression, elements: &'ast [Expression]) -> Result<Option<ir::Operand>, LoweringError> {
         let mut values = Vec::new();
-        for element in elements { let value = self.expression(element)?; values.push(self.stabilize(value, element.span)?); }
+        for element in elements { let Some(value) = self.expression(element)? else { return Ok(None); }; values.push(self.stabilize(value, element.span)?); }
         let raw = self.raw_type(expression)?;
         let ty = self.ty(raw)?;
-        self.aggregate(expression, ir::Aggregate::List { ty, elements: values })
+        Ok(Some(self.aggregate(expression, ir::Aggregate::List { ty, elements: values })?))
     }
-    fn map(&mut self, expression: &'ast Expression, entries: &'ast [ast::MapEntry]) -> Result<ir::Operand, LoweringError> {
+    fn map(&mut self, expression: &'ast Expression, entries: &'ast [ast::MapEntry]) -> Result<Option<ir::Operand>, LoweringError> {
         let mut values = Vec::new();
         for entry in entries {
-            let key = self.expression(&entry.key)?; let key = self.stabilize(key, entry.key.span)?;
-            let value = self.expression(&entry.value)?; let value = self.stabilize(value, entry.value.span)?;
+            let Some(key) = self.expression(&entry.key)? else { return Ok(None); }; let key = self.stabilize(key, entry.key.span)?;
+            let Some(value) = self.expression(&entry.value)? else { return Ok(None); }; let value = self.stabilize(value, entry.value.span)?;
             values.push((key, value));
         }
         let raw = self.raw_type(expression)?;
         let ty = self.ty(raw)?;
-        self.aggregate(expression, ir::Aggregate::Map { ty, entries: values })
+        Ok(Some(self.aggregate(expression, ir::Aggregate::Map { ty, entries: values })?))
     }
 
-    fn call(&mut self, expression: &'ast Expression, arguments: &'ast [Argument]) -> Result<ir::Operand, LoweringError> {
+    fn call(&mut self, expression: &'ast Expression, arguments: &'ast [Argument]) -> Result<Option<ir::Operand>, LoweringError> {
         let resolution = *self.owner.analysis.call_resolution(expression).ok_or_else(|| invariant("call target fact is missing"))?;
-        if matches!(resolution.target, CallTarget::Callable(CallableId::Intrinsic(IntrinsicId::Panic))) { return Err(pending(PendingStage::Stage3, "terminal panic", expression.span)); }
+        if matches!(resolution.target, CallTarget::Callable(CallableId::Intrinsic(IntrinsicId::Panic))) {
+            let [argument] = arguments else { return Err(invariant("panic call does not have exactly one argument")); };
+            let Some(message) = self.expression(argument_value(argument))? else { return Ok(None); };
+            self.terminate(ir::TerminatorKind::Panic(message), expression.span)?;
+            return Ok(None);
+        }
         if let Some(constructor) = self.owner.analysis.constructor(expression) {
             let kind = constructor.kind.clone();
             return self.constructor(expression, arguments, &kind);
@@ -448,10 +534,10 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         let receiver = if let CallTarget::Builtin(_) = resolution.target {
             let ExpressionKind::Member { value, .. } = &resolution.callee.kind else { return Err(invariant("built-in call has no receiver")); };
             let receiver_span = value.span;
-            let value = self.expression(value)?; Some(self.stabilize(value, receiver_span)?)
+            let Some(value) = self.expression(value)? else { return Ok(None); }; Some(self.stabilize(value, receiver_span)?)
         } else { None };
         let mut lowered = Vec::new();
-        for argument in arguments { let value = argument_value(argument); let operand = self.expression(value)?; lowered.push(self.stabilize(operand, value.span)?); }
+        for argument in arguments { let value = argument_value(argument); let Some(operand) = self.expression(value)? else { return Ok(None); }; lowered.push(self.stabilize(operand, value.span)?); }
         let result = self.raw_type(expression)?;
         let destination = self.temporary(result)?;
         let kind = match resolution.target {
@@ -461,13 +547,13 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
             CallTarget::Builtin(method) => ir::OperationKind::Builtin { destination, method: map_builtin(method), receiver: receiver.unwrap(), arguments: lowered },
             _ => return Err(invariant("call retained an unsupported target")),
         };
-        self.push(kind, expression.span);
-        Ok(ir::Operand::Copy(ir::Place::local(destination)))
+        self.push(kind, expression.span)?;
+        Ok(Some(ir::Operand::Copy(ir::Place::local(destination))))
     }
 
-    fn constructor(&mut self, expression: &'ast Expression, arguments: &'ast [Argument], kind: &ConstructorKind) -> Result<ir::Operand, LoweringError> {
+    fn constructor(&mut self, expression: &'ast Expression, arguments: &'ast [Argument], kind: &ConstructorKind) -> Result<Option<ir::Operand>, LoweringError> {
         let mut values = Vec::new();
-        for argument in arguments { let value = argument_value(argument); let operand = self.expression(value)?; values.push(self.stabilize(operand, value.span)?); }
+        for argument in arguments { let value = argument_value(argument); let Some(operand) = self.expression(value)? else { return Ok(None); }; values.push(self.stabilize(operand, value.span)?); }
         match kind {
             ConstructorKind::Struct { declaration, argument_members } => {
                 if values.len() != argument_members.len() { return Err(invariant("struct argument mapping has the wrong length")); }
@@ -477,11 +563,11 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
                 }).collect::<Result<Vec<_>, _>>()?;
                 fields.sort_by_key(|(field, _)| field.index());
                 let definition = self.definition(*declaration)?;
-                self.aggregate(expression, ir::Aggregate::Struct { definition, fields })
+                Ok(Some(self.aggregate(expression, ir::Aggregate::Struct { definition, fields })?))
             }
             ConstructorKind::Tuple(declaration) => {
                 let definition = self.definition(*declaration)?;
-                self.aggregate(expression, ir::Aggregate::Tuple { definition, elements: values })
+                Ok(Some(self.aggregate(expression, ir::Aggregate::Tuple { definition, elements: values })?))
             }
             ConstructorKind::Union { declaration, alternative } | ConstructorKind::TaggedUnion { declaration, alternative } => {
                 let [payload] = values.as_slice() else { return Err(invariant("union constructor does not have one payload")); };
@@ -497,12 +583,12 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         }
     }
 
-    fn inject(&mut self, payload: ir::Operand, union: analysis::TypeId, alternative: &UnionAlternative, span: Span) -> Result<ir::Operand, LoweringError> {
+    fn inject(&mut self, payload: ir::Operand, union: analysis::TypeId, alternative: &UnionAlternative, span: Span) -> Result<Option<ir::Operand>, LoweringError> {
         let destination = self.temporary(union)?;
         let alternative = self.alternative_id(union, alternative)?;
         let union_type = self.ty(union)?;
-        self.push(ir::OperationKind::UnionInject { destination, union_type, alternative, payload }, span);
-        Ok(ir::Operand::Copy(ir::Place::local(destination)))
+        self.push(ir::OperationKind::UnionInject { destination, union_type, alternative, payload }, span)?;
+        Ok(Some(ir::Operand::Copy(ir::Place::local(destination))))
     }
     fn alternative_id(&self, union: analysis::TypeId, alternative: &UnionAlternative) -> Result<ir::AlternativeId, LoweringError> {
         let alternatives: &[UnionAlternative] = match self.owner.analysis.types.get(union) {
@@ -518,8 +604,8 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         }
     }
 
-    fn member(&mut self, expression: &'ast Expression, value: &'ast Expression) -> Result<ir::Operand, LoweringError> {
-        let receiver = self.expression(value)?; let receiver = self.stabilize(receiver, value.span)?;
+    fn member(&mut self, expression: &'ast Expression, value: &'ast Expression) -> Result<Option<ir::Operand>, LoweringError> {
+        let Some(receiver) = self.expression(value)? else { return Ok(None); }; let receiver = self.stabilize(receiver, value.span)?;
         let ir::Operand::Copy(mut place) = receiver else { return Err(invariant("member receiver did not materialize to a place")); };
         let projection = self.owner.analysis.projection(expression).ok_or_else(|| invariant("member projection fact is missing"))?.kind;
         match projection {
@@ -527,17 +613,17 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
             ProjectionKind::Tuple { declaration, position, .. } => place.projections.push(ir::Projection::TupleField { definition: self.definition(declaration)?, field: self.field(declaration, position)? }),
             _ => return Err(invariant("member expression has a non-member projection")),
         }
-        Ok(ir::Operand::Copy(place))
+        Ok(Some(ir::Operand::Copy(place)))
     }
-    fn index(&mut self, expression: &'ast Expression, value: &'ast Expression, index: &'ast Expression) -> Result<ir::Operand, LoweringError> {
-        let receiver = self.expression(value)?; let receiver = self.stabilize(receiver, value.span)?;
-        let index_value = self.expression(index)?; let index_value = self.materialize(index_value, index.span)?;
+    fn index(&mut self, expression: &'ast Expression, value: &'ast Expression, index: &'ast Expression) -> Result<Option<ir::Operand>, LoweringError> {
+        let Some(receiver) = self.expression(value)? else { return Ok(None); }; let receiver = self.stabilize(receiver, value.span)?;
+        let Some(index_value) = self.expression(index)? else { return Ok(None); }; let index_value = self.materialize(index_value, index.span)?;
         let projection = self.owner.analysis.projection(expression).ok_or_else(|| invariant("index projection fact is missing"))?.kind;
         if let ProjectionKind::String { .. } = projection {
             let result = self.raw_type(expression)?;
             let destination = self.temporary(result)?;
-            self.push(ir::OperationKind::StringIndex { destination, string: receiver, index: index_value }, expression.span);
-            return Ok(ir::Operand::Copy(ir::Place::local(destination)));
+            self.push(ir::OperationKind::StringIndex { destination, string: receiver, index: index_value }, expression.span)?;
+            return Ok(Some(ir::Operand::Copy(ir::Place::local(destination))));
         }
         let ir::Operand::Copy(mut place) = receiver else { return Err(invariant("index receiver did not materialize to a place")); };
         let ir::Operand::Copy(index_place) = index_value else { return Err(invariant("dynamic index did not materialize to a local")); };
@@ -547,7 +633,310 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
             ProjectionKind::Map { .. } => place.projections.push(ir::Projection::MapIndex { key: index_place.local }),
             _ => return Err(invariant("index expression has a non-index projection")),
         }
-        Ok(ir::Operand::Copy(place))
+        Ok(Some(ir::Operand::Copy(place)))
+    }
+
+    fn statement_body(&mut self, body: &'ast StatementBody) -> Result<(), LoweringError> {
+        let expected_fallthrough = self.statement_body_falls_through(body)?;
+        match &body.kind {
+            StatementBodyKind::Block(block) => self.statement_block(block),
+            StatementBodyKind::Statement(statement) => self.statement(statement),
+        }?;
+        if expected_fallthrough != self.block.is_some() { return Err(invariant("statement-body lowering contradicts its flow summary")); }
+        Ok(())
+    }
+
+    fn statement_block(&mut self, block: &'ast ast::Block) -> Result<(), LoweringError> {
+        let expected_fallthrough = self.block_falls_through(block)?;
+        self.block(block)?;
+        if self.block.is_some() && let Some(value) = block.value.as_deref() { self.expression(value)?; }
+        if expected_fallthrough != self.block.is_some() { return Err(invariant("statement-block lowering contradicts its flow summary")); }
+        Ok(())
+    }
+
+    fn expression_body(&mut self, body: &'ast ExpressionBody) -> Result<Option<ir::Operand>, LoweringError> {
+        let expected_fallthrough = self.expression_body_falls_through(body)?;
+        let value = match &body.kind {
+            ExpressionBodyKind::Expression(expression) => self.expression(expression),
+            ExpressionBodyKind::Block(block) => self.block_value(block),
+        }?;
+        if expected_fallthrough != value.is_some() || expected_fallthrough != self.block.is_some() {
+            return Err(invariant("expression-body lowering contradicts its flow summary"));
+        }
+        Ok(value)
+    }
+
+    fn block_value(&mut self, block: &'ast ast::Block) -> Result<Option<ir::Operand>, LoweringError> {
+        let expected_fallthrough = self.block_falls_through(block)?;
+        self.block(block)?;
+        let value = if self.block.is_none() { None } else if let Some(value) = block.value.as_deref() {
+            self.expression(value)?
+        } else {
+            let unit = self.owner.analysis.types.unit();
+            Some(self.constant(unit, ir::ConstantValue::Unit)?)
+        };
+        if expected_fallthrough != value.is_some() || expected_fallthrough != self.block.is_some() {
+            return Err(invariant("expression-block lowering contradicts its flow summary"));
+        }
+        Ok(value)
+    }
+
+    fn block_expression(&mut self, _expression: &'ast Expression, block: &'ast ast::Block) -> Result<Option<ir::Operand>, LoweringError> {
+        self.block_value(block)
+    }
+
+    fn return_statement(&mut self, statement: &'ast Statement, value: Option<&'ast Expression>) -> Result<(), LoweringError> {
+        let record = self.semantic_return(statement)?;
+        if record.value.is_some() != value.is_some()
+            || record.value.zip(value).is_some_and(|(recorded, actual)| !std::ptr::eq(recorded, actual))
+        {
+            return Err(invariant("explicit return record contradicts its syntax"));
+        }
+        let expected_state = value.map_or(TypeState::Resolved(self.owner.analysis.types.unit()), |expression| {
+            self.owner.analysis.expression_annotation(expression).map_or(TypeState::Error, |annotation| annotation.state)
+        });
+        if record.value_state != expected_state { return Err(invariant("explicit return record has a contradictory value type")); }
+        let injection = record.unit_injection.clone();
+        let value = if let Some(expression) = value {
+            let Some(value) = self.expression(expression)? else { return Ok(()); };
+            value
+        } else {
+            let unit = self.owner.analysis.types.unit();
+            let value = self.constant(unit, ir::ConstantValue::Unit)?;
+            if let Some(alternative) = injection.as_ref() {
+                let result = self.owner.analysis.function_signature(self.function_id).result;
+                let TypeState::Resolved(union) = result else { return Err(invariant("return function result is unresolved")); };
+                self.inject(value, union, alternative, statement.span)?.ok_or_else(|| invariant("unit return injection diverged"))?
+            } else { value }
+        };
+        self.emit_active_cleanups(statement.span)?;
+        self.terminate(ir::TerminatorKind::Return(value), statement.span)
+    }
+
+    fn emit_active_cleanups(&mut self, span: Span) -> Result<(), LoweringError> {
+        let cleanups = self.loops.iter().rev().filter_map(|context| context.cleanup.clone()).collect::<Vec<_>>();
+        for iterable in cleanups { self.push(ir::OperationKind::EndIteration { iterable }, span)?; }
+        Ok(())
+    }
+
+    fn loop_control(&mut self, statement: &'ast Statement) -> Result<(), LoweringError> {
+        let target = self.semantic_loop_control(statement)?.target;
+        let context = self.loops.iter().rev().find(|context| std::ptr::eq(context.source, target)).ok_or_else(|| invariant("loop control target is not active"))?;
+        let destination = match &statement.kind {
+            StatementKind::Break => context.break_target,
+            StatementKind::Continue => context.continue_target,
+            _ => return Err(invariant("non-loop-control reached loop-control lowering")),
+        };
+        self.terminate(ir::TerminatorKind::Jump(destination), statement.span)
+    }
+
+    fn if_statement(
+        &mut self,
+        branches: &'ast [ast::ConditionalStatementBranch],
+        else_body: Option<&'ast StatementBody>,
+        span: Span,
+    ) -> Result<(), LoweringError> {
+        let mut fallthrough = Vec::new();
+        for branch in branches {
+            let Some(condition) = self.expression(&branch.condition)? else {
+                self.merge_paths(fallthrough)?;
+                return Ok(());
+            };
+            let condition_block = self.block.ok_or_else(|| invariant("conditional lost its condition block"))?;
+            let body_block = self.new_block();
+            let false_block = self.new_block();
+            let location = self.location(branch.condition.span);
+            self.function.blocks[condition_block.index()].terminate(ir::TerminatorKind::Branch { condition, then_block: body_block, else_block: false_block }, location);
+            self.enter(body_block);
+            self.statement_body(&branch.body)?;
+            if let Some(block) = self.block.take() { fallthrough.push((block, branch.body.span)); }
+            self.enter(false_block);
+        }
+        if let Some(body) = else_body {
+            self.statement_body(body)?;
+            if let Some(block) = self.block.take() { fallthrough.push((block, body.span)); }
+        } else if let Some(block) = self.block.take() {
+            fallthrough.push((block, span));
+        }
+        self.merge_paths(fallthrough)?;
+        Ok(())
+    }
+
+    fn if_expression(
+        &mut self,
+        expression: &'ast Expression,
+        branches: &'ast [ast::ConditionalExpressionBranch],
+        else_branch: &'ast ExpressionBody,
+    ) -> Result<Option<ir::Operand>, LoweringError> {
+        let result = self.temporary(self.raw_type(expression)?)?;
+        let mut fallthrough = Vec::new();
+        for branch in branches {
+            let Some(condition) = self.expression(&branch.condition)? else {
+                return if self.merge_paths(fallthrough)? {
+                    Ok(Some(ir::Operand::Copy(ir::Place::local(result))))
+                } else { Ok(None) };
+            };
+            let condition_block = self.block.ok_or_else(|| invariant("if expression lost its condition block"))?;
+            let body_block = self.new_block();
+            let false_block = self.new_block();
+            let location = self.location(branch.condition.span);
+            self.function.blocks[condition_block.index()].terminate(ir::TerminatorKind::Branch { condition, then_block: body_block, else_block: false_block }, location);
+            self.enter(body_block);
+            if let Some(value) = self.expression_body(&branch.body)? {
+                self.push(ir::OperationKind::Assign { destination: ir::Place::local(result), value }, branch.body.span)?;
+                fallthrough.push((self.block.take().unwrap(), branch.body.span));
+            }
+            self.enter(false_block);
+        }
+        if let Some(value) = self.expression_body(else_branch)? {
+            self.push(ir::OperationKind::Assign { destination: ir::Place::local(result), value }, else_branch.span)?;
+            fallthrough.push((self.block.take().unwrap(), else_branch.span));
+        }
+        if self.merge_paths(fallthrough)? { Ok(Some(ir::Operand::Copy(ir::Place::local(result)))) } else { Ok(None) }
+    }
+
+    fn merge_paths(&mut self, paths: Vec<(ir::BlockId, Span)>) -> Result<bool, LoweringError> {
+        if paths.is_empty() { self.block = None; return Ok(false); }
+        let merge = self.new_block();
+        for (block, edge_span) in paths {
+            let location = self.location(edge_span);
+            self.function.blocks[block.index()].terminate(ir::TerminatorKind::Jump(merge), location);
+        }
+        self.enter(merge);
+        Ok(true)
+    }
+
+    fn short_circuit(
+        &mut self,
+        expression: &'ast Expression,
+        left: &'ast Expression,
+        operator: ast::BinaryOperator,
+        right: &'ast Expression,
+    ) -> Result<Option<ir::Operand>, LoweringError> {
+        let Some(left_value) = self.expression(left)? else { return Ok(None); };
+        let left_value = self.stabilize(left_value, left.span)?;
+        let result = self.temporary(self.raw_type(expression)?)?;
+        self.push(ir::OperationKind::Copy { destination: result, operand: left_value.clone() }, left.span)?;
+        let condition_block = self.block.ok_or_else(|| invariant("short-circuit expression lost its condition block"))?;
+        let right_block = self.new_block();
+        self.enter(right_block);
+        let right_value = self.expression(right)?;
+        if let Some(value) = right_value {
+            self.push(ir::OperationKind::Assign { destination: ir::Place::local(result), value }, right.span)?;
+        }
+        let right_fallthrough = self.block.take();
+        let merge = self.new_block();
+        let (then_block, else_block) = if operator == ast::BinaryOperator::LogicalAnd { (right_block, merge) } else { (merge, right_block) };
+        let location = self.location(expression.span);
+        self.function.blocks[condition_block.index()].terminate(ir::TerminatorKind::Branch { condition: left_value, then_block, else_block }, location);
+        if let Some(block) = right_fallthrough {
+            let location = self.location(right.span);
+            self.function.blocks[block.index()].terminate(ir::TerminatorKind::Jump(merge), location);
+        }
+        self.enter(merge);
+        Ok(Some(ir::Operand::Copy(ir::Place::local(result))))
+    }
+
+    fn while_loop(
+        &mut self,
+        statement: &'ast Statement,
+        condition: &'ast Expression,
+        body: &'ast StatementBody,
+    ) -> Result<(), LoweringError> {
+        let condition_block = self.new_block();
+        self.terminate(ir::TerminatorKind::Jump(condition_block), statement.span)?;
+        self.enter(condition_block);
+        let Some(condition_value) = self.expression(condition)? else { return Ok(()); };
+        let body_block = self.new_block();
+        let exit_block = self.new_block();
+        self.terminate(ir::TerminatorKind::Branch { condition: condition_value, then_block: body_block, else_block: exit_block }, condition.span)?;
+        self.loops.push(LoopContext { source: statement, continue_target: condition_block, break_target: exit_block, cleanup: None });
+        self.enter(body_block);
+        self.statement_body(body)?;
+        self.loops.pop();
+        if self.block.is_some() { self.terminate(ir::TerminatorKind::Jump(condition_block), body.span)?; }
+        self.enter(exit_block);
+        Ok(())
+    }
+
+    fn for_loop(
+        &mut self,
+        statement: &'ast Statement,
+        iterable_expression: &'ast Expression,
+        body: &'ast StatementBody,
+    ) -> Result<(), LoweringError> {
+        let binding = self.owner.analysis.bindings.iter().find_map(|record| match record.node {
+            BindingNode::Loop(candidate) if std::ptr::eq(candidate, statement) => Some(record.id),
+            _ => None,
+        }).ok_or_else(|| invariant("for loop lacks a binding identity"))?;
+        let TypeState::Resolved(binding_type) = self.owner.analysis.binding_type(binding) else { return Err(invariant("for-loop binding type is unresolved")); };
+        let source_name = match &statement.kind {
+            StatementKind::For { binding, .. } => self.owner.analysis.identifier_text(binding.span).to_owned(),
+            _ => return Err(invariant("non-for statement reached for-loop lowering")),
+        };
+        let mapped_binding_type = self.ty(binding_type)?;
+        let binding_local = self.function.add_local(mapped_binding_type, Some(source_name), ir::LocalOrigin::Binding);
+        self.bindings[binding.index()] = Some(binding_local);
+        let Some(iterable) = self.expression(iterable_expression)? else { return Ok(()); };
+        let iterable = self.stabilize(iterable, iterable_expression.span)?;
+        let iterable_type = self.operand_frontend_type(&iterable)?;
+        let (element_type, length_method) = match self.owner.analysis.types.get(iterable_type) {
+            ResolvedType::List(element) => (*element, ir::BuiltinMethod::ListLen),
+            ResolvedType::Map { key, .. } => (*key, ir::BuiltinMethod::MapLen),
+            _ => return Err(invariant("for-loop iterable is not a list or map")),
+        };
+        if binding_type != element_type { return Err(invariant("for-loop binding type contradicts its iterable")); }
+        let int = self.owner.analysis.types.primitive(PrimitiveType::Int);
+        let length = self.temporary(int)?;
+        let index = self.temporary(int)?;
+        self.push(ir::OperationKind::BeginIteration { iterable: iterable.clone() }, iterable_expression.span)?;
+        self.push(ir::OperationKind::Builtin { destination: length, method: length_method, receiver: iterable.clone(), arguments: Vec::new() }, iterable_expression.span)?;
+        let zero = self.constant(int, ir::ConstantValue::Integer(0))?;
+        self.push(ir::OperationKind::Assign { destination: ir::Place::local(index), value: zero }, statement.span)?;
+        let header = self.new_block();
+        let body_block = self.new_block();
+        let advance = self.new_block();
+        let cleanup = self.new_block();
+        let exit = self.new_block();
+        self.terminate(ir::TerminatorKind::Jump(header), statement.span)?;
+
+        self.enter(header);
+        let bool_type = self.owner.analysis.types.primitive(PrimitiveType::Bool);
+        let condition = self.temporary(bool_type)?;
+        self.push(ir::OperationKind::Binary {
+            destination: condition,
+            operator: ir::BinaryOperator::Less,
+            left: ir::Operand::Copy(ir::Place::local(index)),
+            right: ir::Operand::Copy(ir::Place::local(length)),
+        }, statement.span)?;
+        self.terminate(ir::TerminatorKind::Branch { condition: ir::Operand::Copy(ir::Place::local(condition)), then_block: body_block, else_block: cleanup }, statement.span)?;
+
+        self.loops.push(LoopContext { source: statement, continue_target: advance, break_target: cleanup, cleanup: Some(iterable.clone()) });
+        self.enter(body_block);
+        self.push(ir::OperationKind::IterationValue {
+            destination: binding_local,
+            iterable: iterable.clone(),
+            index: ir::Operand::Copy(ir::Place::local(index)),
+        }, statement.span)?;
+        self.statement_body(body)?;
+        self.loops.pop();
+        if self.block.is_some() { self.terminate(ir::TerminatorKind::Jump(advance), body.span)?; }
+
+        self.enter(advance);
+        let one = self.constant(int, ir::ConstantValue::Integer(1))?;
+        self.push(ir::OperationKind::Binary {
+            destination: index,
+            operator: ir::BinaryOperator::Add,
+            left: ir::Operand::Copy(ir::Place::local(index)),
+            right: one,
+        }, statement.span)?;
+        self.terminate(ir::TerminatorKind::Jump(header), statement.span)?;
+
+        self.enter(cleanup);
+        self.push(ir::OperationKind::EndIteration { iterable }, statement.span)?;
+        self.terminate(ir::TerminatorKind::Jump(exit), statement.span)?;
+        self.enter(exit);
+        Ok(())
     }
 
     fn assignment(&mut self, target: &'ast ast::AssignmentTarget, operator: AssignmentOperator, value: &'ast Expression, span: Span) -> Result<(), LoweringError> {
@@ -591,26 +980,28 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
                 AccessPathStep::TupleMember { declaration, position, .. } => place.projections.push(ir::Projection::TupleField { definition: self.definition(*declaration)?, field: self.field(*declaration, *position)? }),
                 AccessPathStep::ListIndex { suffix, .. } | AccessPathStep::MapIndex { suffix, .. } => {
                     let ast::AssignmentTargetSuffixKind::Index(index) = &suffix.kind else { return Err(invariant("index path step has no index syntax")); };
-                    let index_value = self.expression(index)?; let index_value = self.materialize(index_value, index.span)?;
+                    let Some(index_value) = self.expression(index)? else { return Ok(()); }; let index_value = self.materialize(index_value, index.span)?;
                     let ir::Operand::Copy(index_place) = index_value else { return Err(invariant("assignment index did not materialize")); };
                     let projection = if matches!(step, AccessPathStep::ListIndex { .. }) { ir::Projection::ListIndex { index: index_place.local } } else { ir::Projection::MapIndex { key: index_place.local } };
                     place.projections.push(projection);
                 }
             }
         }
-        let assigned = if operator == AssignmentOperator::Assign { self.expression(value)? } else {
+        let assigned = if operator == AssignmentOperator::Assign {
+            let Some(value) = self.expression(value)? else { return Ok(()); };
+            value
+        } else {
             let old_type = match annotation.state { TypeState::Resolved(ty) => ty, _ => return Err(invariant("compound assignment target type is unresolved")) };
             let old_local = self.temporary(old_type)?;
-            self.push(ir::OperationKind::Copy { destination: old_local, operand: ir::Operand::Copy(place.clone()) }, target.span);
-            let right = self.expression(value)?;
+            self.push(ir::OperationKind::Copy { destination: old_local, operand: ir::Operand::Copy(place.clone()) }, target.span)?;
+            let Some(right) = self.expression(value)? else { return Ok(()); };
             let result = self.temporary(old_type)?;
-            self.push(ir::OperationKind::Binary { destination: result, operator: map_assignment(operator)?, left: ir::Operand::Copy(ir::Place::local(old_local)), right }, span);
+            self.push(ir::OperationKind::Binary { destination: result, operator: map_assignment(operator)?, left: ir::Operand::Copy(ir::Place::local(old_local)), right }, span)?;
             ir::Operand::Copy(ir::Place::local(result))
         };
-        self.push(ir::OperationKind::Assign { destination: place, value: assigned }, span);
+        self.push(ir::OperationKind::Assign { destination: place, value: assigned }, span)?;
         Ok(())
     }
-    fn is_panic(&self, expression: &Expression) -> bool { matches!(self.owner.analysis.call_resolution(expression).map(|item| item.target), Some(CallTarget::Callable(CallableId::Intrinsic(IntrinsicId::Panic)))) }
 }
 
 fn projected_ir_type(program: &ir::Program, ty: ir::TypeId, projection: &ir::Projection) -> Result<ir::TypeId, LoweringError> {
@@ -679,12 +1070,85 @@ mod tests {
     }
 
     #[test]
-    fn reports_each_deferred_stage_explicitly() {
-        let control = lower_text("fn main() { if true: println(); }").unwrap_err();
-        assert!(matches!(control, LoweringError::PendingStage { stage: PendingStage::Stage3, .. }));
-
+    fn reports_remaining_deferred_stage_explicitly() {
         let error_flow = lower_text("type Result(int | Error(str)); fn main() { value := Result(1); value?; }").unwrap_err();
         assert!(matches!(error_flow, LoweringError::PendingStage { stage: PendingStage::Stage4, .. }));
+    }
+
+    #[test]
+    fn lowers_conditionals_short_circuit_returns_and_panic() {
+        let text = concat!(
+            "fn choose(flag bool) int { if flag: return 1; else: return 2; } ",
+            "fn value(flag bool) int { (if flag: 3 else: 4) } ",
+            "fn stops() bool { true || panic(\"not reached\") } ",
+            "fn main() int { choose(true) + value(false) }",
+        );
+        let first = lower_text(text).expect("control flow must lower");
+        let second = lower_text(text).expect("control flow must lower deterministically");
+        let rendered = first.render();
+        assert_eq!(rendered, second.render());
+        assert!(rendered.contains("branch"));
+        assert!(rendered.contains("panic const"));
+        assert!(rendered.contains("return"));
+        assert!(first.validate().is_ok());
+    }
+
+    #[test]
+    fn lowers_while_and_indexed_iteration_with_cleanup() {
+        let text = concat!(
+            "fn first(values [int], table {int: int}) int { ",
+            "while false: continue; ",
+            "for value in values { for key in table { return value; } } ",
+            "return 0; } ",
+            "fn main() int { first([1, 2], {3: 4}) }",
+        );
+        let program = lower_text(text).expect("loops must lower");
+        let rendered = program.render();
+        assert!(rendered.contains("begin-iteration"));
+        assert!(rendered.contains("iteration-value"));
+        assert!(rendered.matches("end-iteration").count() >= 4);
+        assert!(rendered.contains("less"));
+        assert!(program.validate().is_ok());
+    }
+
+    #[test]
+    fn missing_flow_facts_are_lowering_invariants() {
+        let source = SourceFile::new(PathBuf::from("flow.sao2"), "fn main() { if true: return; }".to_owned());
+        let syntax = crate::parser::parse(&source).unwrap();
+        let mut analysis = crate::analysis::analyze(&source, &syntax);
+        let mut semantic = crate::semantic::analyze(&mut analysis);
+        assert!(semantic.diagnostics.is_empty());
+        semantic.flow.summaries.clear();
+        assert!(matches!(lower(&analysis, &semantic), Err(LoweringError::Invariant(_))));
+    }
+
+    #[test]
+    fn corrupted_return_completion_and_loop_targets_are_invariants() {
+        {
+            let source = SourceFile::new(PathBuf::from("return.sao2"), "fn main() { return; }".to_owned());
+            let syntax = crate::parser::parse(&source).unwrap();
+            let mut analysis = crate::analysis::analyze(&source, &syntax);
+            let mut semantic = crate::semantic::analyze(&mut analysis);
+            semantic.flow.returns.clear();
+            assert!(matches!(lower(&analysis, &semantic), Err(LoweringError::Invariant(_))));
+        }
+        {
+            let source = SourceFile::new(PathBuf::from("completion.sao2"), "fn main() {}".to_owned());
+            let syntax = crate::parser::parse(&source).unwrap();
+            let mut analysis = crate::analysis::analyze(&source, &syntax);
+            let mut semantic = crate::semantic::analyze(&mut analysis);
+            semantic.flow.completions.clear();
+            assert!(matches!(lower(&analysis, &semantic), Err(LoweringError::Invariant(_))));
+        }
+        {
+            let source = SourceFile::new(PathBuf::from("loop.sao2"), "fn main() { while true: break; }".to_owned());
+            let syntax = crate::parser::parse(&source).unwrap();
+            let mut analysis = crate::analysis::analyze(&source, &syntax);
+            let mut semantic = crate::semantic::analyze(&mut analysis);
+            let control = semantic.flow.loop_controls[0].statement;
+            semantic.flow.loop_controls[0].target = control;
+            assert!(matches!(lower(&analysis, &semantic), Err(LoweringError::Invariant(_))));
+        }
     }
 
     #[test]

@@ -329,6 +329,9 @@ pub(crate) enum OperationKind {
     Call { destination: LocalId, function: FunctionId, arguments: Vec<Operand> },
     Intrinsic { destination: LocalId, intrinsic: Intrinsic, arguments: Vec<Operand> },
     Builtin { destination: LocalId, method: BuiltinMethod, receiver: Operand, arguments: Vec<Operand> },
+    BeginIteration { iterable: Operand },
+    EndIteration { iterable: Operand },
+    IterationValue { destination: LocalId, iterable: Operand, index: Operand },
     Check(RuntimeCheck),
 }
 
@@ -528,6 +531,9 @@ impl Renderer<'_, '_> {
             OperationKind::Call { destination, function, arguments } => format!("{destination} = call {function}({})", self.operands(arguments)),
             OperationKind::Intrinsic { destination, intrinsic, arguments } => format!("{destination} = intrinsic {}({})", intrinsic_name(*intrinsic), self.operands(arguments)),
             OperationKind::Builtin { destination, method, receiver, arguments } => format!("{destination} = builtin {} {}({})", builtin_name(*method), self.operand(receiver), self.operands(arguments)),
+            OperationKind::BeginIteration { iterable } => format!("begin-iteration {}", self.operand(iterable)),
+            OperationKind::EndIteration { iterable } => format!("end-iteration {}", self.operand(iterable)),
+            OperationKind::IterationValue { destination, iterable, index } => format!("{destination} = iteration-value {}, {}", self.operand(iterable), self.operand(index)),
             OperationKind::Check(check) => format!("check {}", self.check(check)),
         }
     }
@@ -795,6 +801,9 @@ mod tests {
         entry.push(OperationKind::Builtin { destination: unit_temp, method: BuiltinMethod::MapRemoveKey, receiver: Operand::Copy(Place::local(map_local)), arguments: vec![integer(&types, 1)] }, location);
         entry.push(OperationKind::Builtin { destination: int_temp, method: BuiltinMethod::MapLen, receiver: Operand::Copy(Place::local(map_local)), arguments: vec![] }, location);
         entry.push(OperationKind::Builtin { destination: int_temp, method: BuiltinMethod::StrLen, receiver: Operand::Copy(Place::local(string_local)), arguments: vec![] }, location);
+        entry.push(OperationKind::BeginIteration { iterable: Operand::Copy(Place::local(list_local)) }, location);
+        entry.push(OperationKind::IterationValue { destination: int_temp, iterable: Operand::Copy(Place::local(list_local)), index: Operand::Copy(Place::local(index)) }, location);
+        entry.push(OperationKind::EndIteration { iterable: Operand::Copy(Place::local(list_local)) }, location);
         entry.push(OperationKind::Check(RuntimeCheck::IntegerOverflow { operation: IntegerOperation::Add, left: integer(&types, 1), right: integer(&types, 2) }), location);
         entry.push(OperationKind::Check(RuntimeCheck::IntegerNegation { operand: Operand::Copy(Place::local(input)) }), location);
         entry.push(OperationKind::Check(RuntimeCheck::Division { left: Operand::Copy(Place::local(float_temp)), right: constant(types.float, ConstantValue::Float(0)) }), location);
@@ -818,6 +827,8 @@ mod tests {
         assert!(rendered.contains("bb5:\n    jump bb3"));
         assert!(rendered.contains("const ty3 b\"p\\n\\0\""));
         assert!(rendered.contains("switch copy _8 -> [alt0: bb3, alt1: bb4]"));
+        assert!(rendered.contains("begin-iteration copy _9"));
+        assert!(rendered.contains("_2 = iteration-value copy _9, copy _1"));
     }
 
     #[test]
@@ -874,6 +885,19 @@ mod tests {
         assert_eq!(error.block, Some(block));
         assert_eq!(error.site, Some(OperationSite::Operation(0)));
         assert_eq!(error.to_string(), "invalid IR in fn0 bb0 op0: copy type does not match destination");
+    }
+
+    #[test]
+    fn validates_iteration_operation_types() {
+        let (mut program, types, location) = program();
+        let mut function = Function::new("main", types.int);
+        let block = function.add_block();
+        function.entry = Some(block);
+        function.blocks[block.index()].push(OperationKind::BeginIteration { iterable: integer(&types, 1) }, location);
+        function.blocks[block.index()].terminate(TerminatorKind::Return(integer(&types, 0)), location);
+        let main = program.add_function(function);
+        program.entry = Some(main);
+        assert_eq!(program.validate().unwrap_err().message, "iteration operand is not a list or map");
     }
 
     #[test]
@@ -1239,6 +1263,23 @@ impl<'a> Validator<'a> {
                 self.destination(function, *destination, unit, "intrinsic call")
             }
             Builtin { destination, method, receiver, arguments } => self.validate_builtin(function, *destination, *method, receiver, arguments),
+            BeginIteration { iterable } | EndIteration { iterable } => {
+                let ty = self.operand_type(function, iterable)?;
+                if !matches!(self.ty(ty)?, Type::List(_) | Type::Map { .. }) {
+                    return Err(self.error("iteration operand is not a list or map"));
+                }
+                Ok(())
+            }
+            IterationValue { destination, iterable, index } => {
+                let iterable_ty = self.operand_type(function, iterable)?;
+                let result = match self.ty(iterable_ty)? {
+                    Type::List(element) => *element,
+                    Type::Map { key, .. } => *key,
+                    _ => return Err(self.error("iteration operand is not a list or map")),
+                };
+                self.expect_operand(function, index, self.primitive(PrimitiveType::Int)?, "iteration index")?;
+                self.destination(function, *destination, result, "iteration value")
+            }
             Check(check) => self.validate_check(function, check),
         }
     }
