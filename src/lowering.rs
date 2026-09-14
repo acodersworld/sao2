@@ -13,27 +13,18 @@ use crate::ast::{
     ExpressionBodyKind,
 };
 use crate::ir;
-use crate::semantic::{FallthroughKind, FlowSubject, MutabilityOperation, MutabilityPath, MutabilitySubject, SemanticResult};
+use crate::semantic::{FallthroughKind, FlowSubject, MutabilityOperation, MutabilityPath, MutabilitySubject, SemanticResult, TryAction};
 use crate::source::Span;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PendingStage { Stage4 }
 
 #[derive(Debug)]
 pub(crate) enum LoweringError {
     Invariant(String),
-    PendingStage { stage: PendingStage, construct: &'static str, span: Span },
 }
 
 impl fmt::Display for LoweringError {
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invariant(message) => write!(output, "IR lowering invariant violated: {message}"),
-            Self::PendingStage { stage, construct, span } => write!(
-                output,
-                "{construct} at bytes {}..{} awaits {:?} lowering",
-                span.start, span.end, stage,
-            ),
         }
     }
 }
@@ -189,7 +180,7 @@ impl<'a, 'source, 'ast> Lowerer<'a, 'source, 'ast> {
         let entry = function.add_block();
         function.entry = Some(entry);
         {
-            let mut body = BodyLowerer { owner: self, function: &mut function, function_id: signature.id, block: Some(entry), bindings, loops: Vec::new() };
+            let mut body = BodyLowerer { owner: self, function: &mut function, function_id: signature.id, block: Some(entry), bindings, loops: Vec::new(), narrowings: Vec::new(), lowered_tests: Vec::new() };
             let expected_fallthrough = body.block_falls_through(&signature.node.body)?;
             body.block(&signature.node.body)?;
             let value = if body.block.is_some() {
@@ -223,6 +214,26 @@ struct BodyLowerer<'a, 'b, 'source, 'ast> {
     block: Option<ir::BlockId>,
     bindings: Vec<Option<ir::LocalId>>,
     loops: Vec<LoopContext<'ast>>,
+    narrowings: Vec<Narrowing>,
+    lowered_tests: Vec<LoweredTest<'ast>>,
+}
+
+#[derive(Clone)]
+struct Narrowing {
+    binding: analysis::BindingId,
+    union: ir::Operand,
+    alternative: ir::AlternativeId,
+    payload: analysis::TypeId,
+    local: ir::LocalId,
+}
+
+#[derive(Clone)]
+struct LoweredTest<'ast> {
+    expression: &'ast Expression,
+    binding: Option<analysis::BindingId>,
+    union: ir::Operand,
+    alternative: ir::AlternativeId,
+    payload: analysis::TypeId,
 }
 
 #[derive(Clone)]
@@ -255,6 +266,22 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
     fn semantic_loop_control(&self, statement: &Statement) -> Result<&crate::semantic::LoopControl<'ast>, LoweringError> {
         let matches = self.owner.semantic.flow.loop_controls.iter().filter(|item| std::ptr::eq(item.statement, statement)).collect::<Vec<_>>();
         let [record] = matches.as_slice() else { return Err(invariant("loop control does not have exactly one target record")); };
+        Ok(*record)
+    }
+    fn semantic_union_test(&self, expression: &Expression) -> Result<&crate::semantic::UnionTestResolution<'ast>, LoweringError> {
+        let expression = strip_expression_parentheses(expression);
+        let matches = self.owner.semantic.union_tests.iter().filter(|item| std::ptr::eq(item.expression, expression)).collect::<Vec<_>>();
+        let [record] = matches.as_slice() else { return Err(invariant("union test does not have exactly one resolution")); };
+        Ok(*record)
+    }
+    fn semantic_switch(&self, statement: &Statement) -> Result<&crate::semantic::SwitchResolution<'ast>, LoweringError> {
+        let matches = self.owner.semantic.switches.iter().filter(|item| std::ptr::eq(item.statement, statement)).collect::<Vec<_>>();
+        let [record] = matches.as_slice() else { return Err(invariant("switch does not have exactly one resolution")); };
+        Ok(*record)
+    }
+    fn semantic_try(&self, expression: &Expression) -> Result<&crate::semantic::TryResolution<'ast>, LoweringError> {
+        let matches = self.owner.semantic.tries.iter().filter(|item| std::ptr::eq(item.expression, expression)).collect::<Vec<_>>();
+        let [record] = matches.as_slice() else { return Err(invariant("postfix try does not have exactly one resolution")); };
         Ok(*record)
     }
     fn block_falls_through(&self, block: &ast::Block) -> Result<bool, LoweringError> {
@@ -354,7 +381,7 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
             StatementKind::If { branches, else_body } => self.if_statement(branches, else_body.as_ref(), statement.span)?,
             StatementKind::While { condition, body } => self.while_loop(statement, condition, body)?,
             StatementKind::For { iterable, body, .. } => self.for_loop(statement, iterable, body)?,
-            StatementKind::Switch { .. } => return Err(pending(PendingStage::Stage4, "switch", statement.span)),
+            StatementKind::Switch { value, arms, else_body } => self.switch_statement(statement, value, arms, else_body.as_ref())?,
             StatementKind::Break | StatementKind::Continue => self.loop_control(statement)?,
             StatementKind::Block(block) => self.statement_block(block)?,
         }
@@ -390,7 +417,9 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
             | ExpressionKind::Boolean(_) => self.literal_constant(expression)?,
             ExpressionKind::Identifier(identifier) => {
                 let Some(analysis::NameResolution::Binding(binding)) = self.owner.analysis.name_use(identifier).map(|item| item.resolution) else { return Err(invariant("value identifier is not a binding")); };
-                let local = self.bindings.get(binding.index()).and_then(|item| *item).ok_or_else(|| invariant("binding has not been allocated"))?;
+                let expression_type = self.expression_type(expression)?;
+                let local = self.narrowings.iter().rev().find(|entry| entry.binding == binding && entry.payload == expression_type).map(|entry| entry.local)
+                    .or_else(|| self.bindings.get(binding.index()).and_then(|item| *item)).ok_or_else(|| invariant("binding has not been allocated"))?;
                 ir::Operand::Copy(ir::Place::local(local))
             }
             ExpressionKind::Parenthesized(inner) => return self.expression(inner),
@@ -442,10 +471,35 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
             ExpressionKind::Index { value, index } => return self.index(expression, value, index),
             ExpressionKind::Block(block) => return self.block_expression(expression, block),
             ExpressionKind::If { branches, else_branch } => return self.if_expression(expression, branches, else_branch),
-            ExpressionKind::Is { .. } => return Err(pending(PendingStage::Stage4, "union test", expression.span)),
-            ExpressionKind::Try { .. } => return Err(pending(PendingStage::Stage4, "postfix try", expression.span)),
+            ExpressionKind::Is { value, .. } => return self.union_test(expression, value),
+            ExpressionKind::Try { value, .. } => return self.try_expression(expression, value),
         };
         Ok(Some(value))
+    }
+
+    fn union_test(&mut self, expression: &'ast Expression, value: &'ast Expression) -> Result<Option<ir::Operand>, LoweringError> {
+        let resolution = self.semantic_union_test(expression)?.clone();
+        if resolution.operand_union != self.expression_type(value)? || alternative_payload(&resolution.alternative) != resolution.payload {
+            return Err(invariant("union test resolution contradicts its operand"));
+        }
+        let Some(union) = self.expression(value)? else { return Ok(None); };
+        let union = self.stabilize(union, value.span)?;
+        let alternative = self.alternative_id(resolution.operand_union, &resolution.alternative)?;
+        let destination = self.temporary(self.owner.analysis.types.primitive(PrimitiveType::Bool))?;
+        self.push(ir::OperationKind::UnionTest { destination, union: union.clone(), alternative }, expression.span)?;
+        self.lowered_tests.push(LoweredTest { expression, binding: resolution.binding, union, alternative, payload: resolution.payload });
+        Ok(Some(ir::Operand::Copy(ir::Place::local(destination))))
+    }
+
+    fn activate_test_narrowing(&mut self, condition: &'ast Expression, span: Span) -> Result<(), LoweringError> {
+        let condition = strip_expression_parentheses(condition);
+        let Some(test) = self.lowered_tests.iter().rev().find(|item| std::ptr::eq(item.expression, condition)).cloned() else { return Ok(()); };
+        let Some(binding) = test.binding else { return Ok(()); };
+        let local = self.temporary(test.payload)?;
+        self.push(ir::OperationKind::UnionPayload { destination: local, union: test.union.clone(), alternative: test.alternative }, span)?;
+        self.narrowings.retain(|entry| entry.binding != binding);
+        self.narrowings.push(Narrowing { binding, union: test.union, alternative: test.alternative, payload: test.payload, local });
+        Ok(())
     }
 
     fn constant(&mut self, ty: analysis::TypeId, value: ir::ConstantValue) -> Result<ir::Operand, LoweringError> { Ok(ir::Operand::Constant(ir::Constant { ty: self.ty(ty)?, value })) }
@@ -736,10 +790,13 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         else_body: Option<&'ast StatementBody>,
         span: Span,
     ) -> Result<(), LoweringError> {
+        let enclosing_narrowings = self.narrowings.clone();
         let mut fallthrough = Vec::new();
         for branch in branches {
+            let outer_narrowings = self.narrowings.clone();
             let Some(condition) = self.expression(&branch.condition)? else {
                 self.merge_paths(fallthrough)?;
+                self.narrowings = enclosing_narrowings;
                 return Ok(());
             };
             let condition_block = self.block.ok_or_else(|| invariant("conditional lost its condition block"))?;
@@ -748,8 +805,10 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
             let location = self.location(branch.condition.span);
             self.function.blocks[condition_block.index()].terminate(ir::TerminatorKind::Branch { condition, then_block: body_block, else_block: false_block }, location);
             self.enter(body_block);
+            self.activate_test_narrowing(&branch.condition, branch.body.span)?;
             self.statement_body(&branch.body)?;
             if let Some(block) = self.block.take() { fallthrough.push((block, branch.body.span)); }
+            self.narrowings = outer_narrowings;
             self.enter(false_block);
         }
         if let Some(body) = else_body {
@@ -759,6 +818,7 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
             fallthrough.push((block, span));
         }
         self.merge_paths(fallthrough)?;
+        self.narrowings = enclosing_narrowings;
         Ok(())
     }
 
@@ -768,11 +828,15 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         branches: &'ast [ast::ConditionalExpressionBranch],
         else_branch: &'ast ExpressionBody,
     ) -> Result<Option<ir::Operand>, LoweringError> {
+        let enclosing_narrowings = self.narrowings.clone();
         let result = self.temporary(self.raw_type(expression)?)?;
         let mut fallthrough = Vec::new();
         for branch in branches {
+            let outer_narrowings = self.narrowings.clone();
             let Some(condition) = self.expression(&branch.condition)? else {
-                return if self.merge_paths(fallthrough)? {
+                let merged = self.merge_paths(fallthrough)?;
+                self.narrowings = enclosing_narrowings;
+                return if merged {
                     Ok(Some(ir::Operand::Copy(ir::Place::local(result))))
                 } else { Ok(None) };
             };
@@ -782,17 +846,21 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
             let location = self.location(branch.condition.span);
             self.function.blocks[condition_block.index()].terminate(ir::TerminatorKind::Branch { condition, then_block: body_block, else_block: false_block }, location);
             self.enter(body_block);
+            self.activate_test_narrowing(&branch.condition, branch.body.span)?;
             if let Some(value) = self.expression_body(&branch.body)? {
                 self.push(ir::OperationKind::Assign { destination: ir::Place::local(result), value }, branch.body.span)?;
                 fallthrough.push((self.block.take().unwrap(), branch.body.span));
             }
+            self.narrowings = outer_narrowings;
             self.enter(false_block);
         }
         if let Some(value) = self.expression_body(else_branch)? {
             self.push(ir::OperationKind::Assign { destination: ir::Place::local(result), value }, else_branch.span)?;
             fallthrough.push((self.block.take().unwrap(), else_branch.span));
         }
-        if self.merge_paths(fallthrough)? { Ok(Some(ir::Operand::Copy(ir::Place::local(result)))) } else { Ok(None) }
+        let merged = self.merge_paths(fallthrough)?;
+        self.narrowings = enclosing_narrowings;
+        if merged { Ok(Some(ir::Operand::Copy(ir::Place::local(result)))) } else { Ok(None) }
     }
 
     fn merge_paths(&mut self, paths: Vec<(ir::BlockId, Span)>) -> Result<bool, LoweringError> {
@@ -852,7 +920,10 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         self.terminate(ir::TerminatorKind::Branch { condition: condition_value, then_block: body_block, else_block: exit_block }, condition.span)?;
         self.loops.push(LoopContext { source: statement, continue_target: condition_block, break_target: exit_block, cleanup: None });
         self.enter(body_block);
+        let outer_narrowings = self.narrowings.clone();
+        self.activate_test_narrowing(condition, body.span)?;
         self.statement_body(body)?;
+        self.narrowings = outer_narrowings;
         self.loops.pop();
         if self.block.is_some() { self.terminate(ir::TerminatorKind::Jump(condition_block), body.span)?; }
         self.enter(exit_block);
@@ -913,12 +984,14 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
 
         self.loops.push(LoopContext { source: statement, continue_target: advance, break_target: cleanup, cleanup: Some(iterable.clone()) });
         self.enter(body_block);
+        let outer_narrowings = self.narrowings.clone();
         self.push(ir::OperationKind::IterationValue {
             destination: binding_local,
             iterable: iterable.clone(),
             index: ir::Operand::Copy(ir::Place::local(index)),
         }, statement.span)?;
         self.statement_body(body)?;
+        self.narrowings = outer_narrowings;
         self.loops.pop();
         if self.block.is_some() { self.terminate(ir::TerminatorKind::Jump(advance), body.span)?; }
 
@@ -937,6 +1010,129 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         self.terminate(ir::TerminatorKind::Jump(exit), statement.span)?;
         self.enter(exit);
         Ok(())
+    }
+
+    fn switch_statement(
+        &mut self,
+        statement: &'ast Statement,
+        value: &'ast Expression,
+        arms: &'ast [ast::SwitchArm],
+        else_body: Option<&'ast StatementBody>,
+    ) -> Result<(), LoweringError> {
+        let resolution = self.semantic_switch(statement)?.clone();
+        if resolution.operand_union != self.expression_type(value)? || resolution.arms.len() != arms.len() {
+            return Err(invariant("switch resolution contradicts its syntax or operand"));
+        }
+        let Some(union) = self.expression(value)? else { return Ok(()); };
+        let union = self.stabilize(union, value.span)?;
+        let source_alternatives = self.frontend_union_alternatives(resolution.operand_union)?;
+        let arm_blocks = arms.iter().map(|_| self.new_block()).collect::<Vec<_>>();
+        let needs_else = resolution.covered.len() < source_alternatives.len();
+        let else_block = needs_else.then(|| self.new_block());
+        let mut targets = Vec::with_capacity(source_alternatives.len());
+        for alternative in &source_alternatives {
+            let alternative_id = self.alternative_id(resolution.operand_union, alternative)?;
+            let target = resolution.arms.iter().position(|arm| arm.alternative == *alternative)
+                .map(|index| arm_blocks[index])
+                .or(else_block)
+                .ok_or_else(|| invariant("exhaustive switch has no target for an alternative"))?;
+            targets.push((alternative_id, target));
+        }
+        self.terminate(ir::TerminatorKind::Switch { union: union.clone(), targets }, value.span)?;
+
+        let outer_narrowings = self.narrowings.clone();
+        let mut fallthrough = Vec::new();
+        for (index, arm) in arms.iter().enumerate() {
+            self.narrowings = outer_narrowings.clone();
+            self.enter(arm_blocks[index]);
+            let arm_resolution = &resolution.arms[index];
+            if !std::ptr::eq(arm_resolution.arm, arm) { return Err(invariant("switch arm resolution is out of source order")); }
+            if let Some(binding) = resolution.binding {
+                let alternative = self.alternative_id(resolution.operand_union, &arm_resolution.alternative)?;
+                let local = self.temporary(arm_resolution.payload)?;
+                self.push(ir::OperationKind::UnionPayload { destination: local, union: union.clone(), alternative }, arm.label.span)?;
+                self.narrowings.retain(|entry| entry.binding != binding);
+                self.narrowings.push(Narrowing { binding, union: union.clone(), alternative, payload: arm_resolution.payload, local });
+            }
+            self.statement_body(&arm.body)?;
+            if let Some(block) = self.block.take() { fallthrough.push((block, arm.body.span)); }
+        }
+        if let Some(else_block) = else_block {
+            let body = else_body.ok_or_else(|| invariant("switch needs an else target but has no else body"))?;
+            self.narrowings = outer_narrowings.clone();
+            self.enter(else_block);
+            self.statement_body(body)?;
+            if let Some(block) = self.block.take() { fallthrough.push((block, body.span)); }
+        }
+        self.narrowings = outer_narrowings;
+        self.merge_paths(fallthrough)?;
+        Ok(())
+    }
+
+    fn try_expression(&mut self, expression: &'ast Expression, value: &'ast Expression) -> Result<Option<ir::Operand>, LoweringError> {
+        let Some(operand) = self.expression(value)? else { return Ok(None); };
+        let operand = self.stabilize(operand, value.span)?;
+        let resolution = self.semantic_try(expression)?.clone();
+        if resolution.operand_union != self.expression_type(value)? {
+            return Err(invariant("postfix try resolution contradicts its operand"));
+        }
+        let alternatives = self.frontend_union_alternatives(resolution.operand_union)?;
+        let success_count = alternatives.iter().filter(|alternative| !matches!(alternative, UnionAlternative::Error(_))).count();
+        let result_type = resolution.widening.unwrap_or(resolution.success);
+        let result = self.temporary(result_type)?;
+        let blocks = alternatives.iter().map(|_| self.new_block()).collect::<Vec<_>>();
+        let targets = alternatives.iter().zip(&blocks).map(|(alternative, block)| {
+            Ok((self.alternative_id(resolution.operand_union, alternative)?, *block))
+        }).collect::<Result<Vec<_>, LoweringError>>()?;
+        self.terminate(ir::TerminatorKind::Switch { union: operand.clone(), targets }, resolution.operator_span)?;
+        let mut success_paths = Vec::new();
+        for (alternative, block) in alternatives.iter().zip(blocks) {
+            self.enter(block);
+            let alternative_id = self.alternative_id(resolution.operand_union, alternative)?;
+            let payload_type = alternative_payload(alternative);
+            let payload_local = self.temporary(payload_type)?;
+            self.push(ir::OperationKind::UnionPayload { destination: payload_local, union: operand.clone(), alternative: alternative_id }, resolution.operator_span)?;
+            let payload = ir::Operand::Copy(ir::Place::local(payload_local));
+            if matches!(alternative, UnionAlternative::Error(_)) {
+                if *alternative != resolution.source_error { return Err(invariant("postfix try selects a contradictory Error alternative")); }
+                match &resolution.action {
+                    TryAction::Propagate { function, destination_union, destination_error } => {
+                        if *function != self.function_id || alternative_payload(destination_error) != payload_type {
+                            return Err(invariant("postfix try propagation action is contradictory"));
+                        }
+                        let returned = self.inject(payload, *destination_union, destination_error, resolution.operator_span)?.ok_or_else(|| invariant("Error reinjection diverged"))?;
+                        self.emit_active_cleanups(resolution.operator_span)?;
+                        self.terminate(ir::TerminatorKind::Return(returned), resolution.operator_span)?;
+                    }
+                    TryAction::Panic { function } => {
+                        if *function != self.function_id { return Err(invariant("postfix try panic action names the wrong function")); }
+                        self.terminate(ir::TerminatorKind::ErrorPanic(payload), resolution.operator_span)?;
+                    }
+                }
+            } else {
+                let success = if success_count == 1 && resolution.widening.is_none() {
+                    if payload_type != resolution.success { return Err(invariant("single-success try has the wrong result type")); }
+                    payload
+                } else {
+                    self.inject(payload, result_type, alternative, resolution.operator_span)?.ok_or_else(|| invariant("try success injection diverged"))?
+                };
+                self.push(ir::OperationKind::Assign { destination: ir::Place::local(result), value: success }, resolution.operator_span)?;
+                success_paths.push((self.block.take().unwrap(), resolution.operator_span));
+            }
+        }
+        if !self.merge_paths(success_paths)? { return Err(invariant("postfix try has no success path")); }
+        Ok(Some(ir::Operand::Copy(ir::Place::local(result))))
+    }
+
+    fn frontend_union_alternatives(&self, union: analysis::TypeId) -> Result<Vec<UnionAlternative>, LoweringError> {
+        match self.owner.analysis.types.get(union) {
+            ResolvedType::Union(alternatives) => Ok(alternatives.to_vec()),
+            ResolvedType::Nominal(definition) => match &self.owner.analysis.type_definition(*definition).kind {
+                TypeDefinitionKind::Union { alternatives, .. } => Ok(alternatives.to_vec()),
+                _ => Err(invariant("union identity names a non-union nominal")),
+            },
+            _ => Err(invariant("union identity names a non-union type")),
+        }
     }
 
     fn assignment(&mut self, target: &'ast ast::AssignmentTarget, operator: AssignmentOperator, value: &'ast Expression, span: Span) -> Result<(), LoweringError> {
@@ -967,7 +1163,12 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         if authorization.operation != expected_operation {
             return Err(invariant("assignment mutation authorization has the wrong operation"));
         }
-        let root_local = self.bindings.get(root.index()).and_then(|item| *item).ok_or_else(|| invariant("assignment root has not been allocated"))?;
+        let root_local = if annotation.steps.is_empty() {
+            self.bindings.get(root.index()).and_then(|item| *item)
+        } else {
+            self.narrowings.iter().rev().find(|entry| entry.binding == root).map(|entry| entry.local)
+                .or_else(|| self.bindings.get(root.index()).and_then(|item| *item))
+        }.ok_or_else(|| invariant("assignment root has not been allocated"))?;
         let mut place = ir::Place::local(root_local);
         if !annotation.steps.is_empty() {
             let root_operand = self.stabilize(ir::Operand::Copy(place), target.root.span)?;
@@ -1000,6 +1201,7 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
             ir::Operand::Copy(ir::Place::local(result))
         };
         self.push(ir::OperationKind::Assign { destination: place, value: assigned }, span)?;
+        if annotation.steps.is_empty() { self.narrowings.retain(|entry| entry.binding != root); }
         Ok(())
     }
 }
@@ -1014,9 +1216,9 @@ fn projected_ir_type(program: &ir::Program, ty: ir::TypeId, projection: &ir::Pro
 }
 
 fn argument_value(argument: &Argument) -> &Expression { match &argument.kind { ArgumentKind::Positional(value) | ArgumentKind::Named { value, .. } => value } }
+fn strip_expression_parentheses(mut expression: &Expression) -> &Expression { while let ExpressionKind::Parenthesized(inner) = &expression.kind { expression = inner; } expression }
 fn alternative_payload(alternative: &UnionAlternative) -> analysis::TypeId { match alternative { UnionAlternative::Untagged(ty) | UnionAlternative::Tagged { payload: ty, .. } | UnionAlternative::Error(ty) => *ty } }
 fn invariant(message: impl Into<String>) -> LoweringError { LoweringError::Invariant(message.into()) }
-fn pending(stage: PendingStage, construct: &'static str, span: Span) -> LoweringError { LoweringError::PendingStage { stage, construct, span } }
 fn map_primitive(value: PrimitiveType) -> ir::PrimitiveType { match value { PrimitiveType::Int => ir::PrimitiveType::Int, PrimitiveType::Float => ir::PrimitiveType::Float, PrimitiveType::Str => ir::PrimitiveType::Str, PrimitiveType::Bool => ir::PrimitiveType::Bool, PrimitiveType::Char => ir::PrimitiveType::Char } }
 fn map_storage(value: MemberStorage) -> ir::MemberStorage { match value { MemberStorage::Inline => ir::MemberStorage::Inline, MemberStorage::Referenced => ir::MemberStorage::Referenced } }
 fn map_unary(value: ast::UnaryOperator) -> ir::UnaryOperator { match value { ast::UnaryOperator::LogicalNot => ir::UnaryOperator::LogicalNot, ast::UnaryOperator::BitwiseNot => ir::UnaryOperator::BitwiseNot, ast::UnaryOperator::Plus => ir::UnaryOperator::Plus, ast::UnaryOperator::Minus => ir::UnaryOperator::Minus } }
@@ -1070,9 +1272,44 @@ mod tests {
     }
 
     #[test]
-    fn reports_remaining_deferred_stage_explicitly() {
-        let error_flow = lower_text("type Result(int | Error(str)); fn main() { value := Result(1); value?; }").unwrap_err();
-        assert!(matches!(error_flow, LoweringError::PendingStage { stage: PendingStage::Stage4, .. }));
+    fn lowers_postfix_try_without_a_pending_stage() {
+        let program = lower_text("type Result(int | Error(str)); fn main() { value := Result(1); value?; }").expect("postfix try must lower");
+        assert!(program.render().contains("error-panic"));
+    }
+
+    #[test]
+    fn lowers_union_tests_narrowing_and_exhaustive_switches() {
+        let text = concat!(
+            "type Value(A(int) | B(str)); ",
+            "fn inspect(value Value) int { ",
+            "if value is A { narrowed := value; println(narrowed); } ",
+            "switch value { A: return value; B: println(value); } ",
+            "0 } fn main() int { inspect(Value.A(1)) }",
+        );
+        let first = lower_text(text).expect("union control flow must lower");
+        let second = lower_text(text).expect("union control flow must be deterministic");
+        let rendered = first.render();
+        assert_eq!(rendered, second.render());
+        assert!(rendered.contains("union-test"));
+        assert!(rendered.contains("payload alt"));
+        assert!(rendered.contains("switch"));
+        assert!(first.validate().is_ok());
+    }
+
+    #[test]
+    fn lowers_try_success_unions_propagation_and_iteration_cleanup() {
+        let text = concat!(
+            "type Many(A(int) | B(str) | Error(char)); ",
+            "fn pass(value Many) A(int) | B(str) | Error(char) { value? } ",
+            "fn in_loop(values [Many]) () | Error(char) { for value in values { value?; } } ",
+            "fn main() { pass(Many.A(1)); }",
+        );
+        let program = lower_text(text).expect("postfix try propagation must lower");
+        let rendered = program.render();
+        assert!(rendered.matches("switch").count() >= 2);
+        assert!(rendered.contains("inject"));
+        assert!(rendered.contains("end-iteration"));
+        assert!(program.validate().is_ok());
     }
 
     #[test]

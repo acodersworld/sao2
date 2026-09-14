@@ -322,7 +322,7 @@ pub(crate) enum OperationKind {
     Convert { destination: LocalId, conversion: NumericConversion, operand: Operand },
     Aggregate { destination: LocalId, aggregate: Aggregate },
     UnionInject { destination: LocalId, union_type: TypeId, alternative: AlternativeId, payload: Operand },
-    Discriminant { destination: LocalId, union: Operand },
+    UnionTest { destination: LocalId, union: Operand, alternative: AlternativeId },
     UnionPayload { destination: LocalId, union: Operand, alternative: AlternativeId },
     StringIndex { destination: LocalId, string: Operand, index: Operand },
     Assign { destination: Place, value: Operand },
@@ -348,6 +348,7 @@ pub(crate) enum TerminatorKind {
     Switch { union: Operand, targets: Vec<(AlternativeId, BlockId)> },
     Return(Operand),
     Panic(Operand),
+    ErrorPanic(Operand),
     Unreachable,
 }
 
@@ -524,7 +525,7 @@ impl Renderer<'_, '_> {
             OperationKind::Convert { destination, conversion, operand } => format!("{destination} = {} {}", conversion_name(*conversion), self.operand(operand)),
             OperationKind::Aggregate { destination, aggregate } => format!("{destination} = {}", self.aggregate(aggregate)),
             OperationKind::UnionInject { destination, union_type, alternative, payload } => format!("{destination} = inject {union_type}.{alternative} {}", self.operand(payload)),
-            OperationKind::Discriminant { destination, union } => format!("{destination} = discriminant {}", self.operand(union)),
+            OperationKind::UnionTest { destination, union, alternative } => format!("{destination} = union-test {alternative} {}", self.operand(union)),
             OperationKind::UnionPayload { destination, union, alternative } => format!("{destination} = payload {alternative} {}", self.operand(union)),
             OperationKind::StringIndex { destination, string, index } => format!("{destination} = string-index {}, {}", self.operand(string), self.operand(index)),
             OperationKind::Assign { destination, value } => format!("assign {} = {}", self.place(destination), self.operand(value)),
@@ -568,6 +569,7 @@ impl Renderer<'_, '_> {
             TerminatorKind::Switch { union, targets } => format!("switch {} -> [{}]", self.operand(union), targets.iter().map(|(alternative, block)| format!("{alternative}: {block}")).collect::<Vec<_>>().join(", ")),
             TerminatorKind::Return(value) => format!("return {}", self.operand(value)),
             TerminatorKind::Panic(message) => format!("panic {}", self.operand(message)),
+            TerminatorKind::ErrorPanic(payload) => format!("error-panic {}", self.operand(payload)),
             TerminatorKind::Unreachable => "unreachable".to_owned(),
         }
     }
@@ -770,7 +772,7 @@ mod tests {
         let map_local = main.add_local(map_type, Some("lookup".to_owned()), LocalOrigin::Binding);
         let string_local = main.add_local(types.string, None, LocalOrigin::Temporary);
         let character_temp = main.add_local(types.character, None, LocalOrigin::Temporary);
-        let blocks = (0..6).map(|_| main.add_block()).collect::<Vec<_>>();
+        let blocks = (0..7).map(|_| main.add_block()).collect::<Vec<_>>();
         main.entry = Some(blocks[0]);
         let entry = &mut main.blocks[blocks[0].index()];
         entry.push(OperationKind::Copy { destination: int_temp, operand: Operand::Copy(Place::local(input)) }, location);
@@ -787,7 +789,7 @@ mod tests {
         entry.push(OperationKind::Aggregate { destination: list_local, aggregate: Aggregate::List { ty: list_type, elements: vec![integer(&types, 1)] } }, location);
         entry.push(OperationKind::Aggregate { destination: map_local, aggregate: Aggregate::Map { ty: map_type, entries: vec![(integer(&types, 1), constant(types.string, ConstantValue::String(b"one".to_vec())))] } }, location);
         entry.push(OperationKind::UnionInject { destination: choice_local, union_type: choice_type, alternative: choice_a, payload: Operand::Copy(Place::local(input)) }, location);
-        entry.push(OperationKind::Discriminant { destination: int_temp, union: Operand::Copy(Place::local(choice_local)) }, location);
+        entry.push(OperationKind::UnionTest { destination: bool_temp, union: Operand::Copy(Place::local(choice_local)), alternative: choice_a }, location);
         entry.push(OperationKind::UnionPayload { destination: int_temp, union: Operand::Copy(Place::local(choice_local)), alternative: choice_a }, location);
         entry.push(OperationKind::StringIndex { destination: character_temp, string: Operand::Copy(Place::local(string_local)), index: Operand::Copy(Place::local(index)) }, location);
         entry.push(OperationKind::Assign { destination: Place::projected(point_local, vec![Projection::StructField { definition: point_definition, field: point_x, storage: MemberStorage::Inline }]), value: integer(&types, 3) }, location);
@@ -819,12 +821,14 @@ mod tests {
         main.blocks[blocks[3].index()].terminate(TerminatorKind::Return(Operand::Copy(Place::local(input))), location);
         main.blocks[blocks[4].index()].terminate(TerminatorKind::Unreachable, location);
         main.blocks[blocks[5].index()].terminate(TerminatorKind::Jump(blocks[3]), location);
+        main.blocks[blocks[6].index()].terminate(TerminatorKind::ErrorPanic(integer(&types, 7)), location);
         let main_id = program.add_function(main);
         program.entry = Some(main_id);
 
         assert!(program.validate().is_ok());
         let rendered = program.render();
         assert!(rendered.contains("bb5:\n    jump bb3"));
+        assert!(rendered.contains("bb6:\n    error-panic const ty1 7"));
         assert!(rendered.contains("const ty3 b\"p\\n\\0\""));
         assert!(rendered.contains("switch copy _8 -> [alt0: bb3, alt1: bb4]"));
         assert!(rendered.contains("begin-iteration copy _9"));
@@ -1120,6 +1124,9 @@ impl<'a> Validator<'a> {
                     if index + 1 != alternatives.len() {
                         return Err(self.error(format!("{owner} Error alternative is not last")));
                     }
+                    if !matches!(self.ty(alternative.payload)?, Type::Primitive(_)) {
+                        return Err(self.error(format!("{owner} Error payload is not primitive")));
+                    }
                 }
             }
         }
@@ -1217,10 +1224,10 @@ impl<'a> Validator<'a> {
                 self.expect_operand(function, payload, expected, "union payload")?;
                 self.destination(function, *destination, *union_type, "union injection")
             }
-            Discriminant { destination, union } => {
+            UnionTest { destination, union, alternative } => {
                 let union_ty = self.operand_type(function, union)?;
-                self.union_alternatives(union_ty)?;
-                self.destination(function, *destination, self.primitive(PrimitiveType::Int)?, "discriminant")
+                self.alternative(union_ty, *alternative)?;
+                self.destination(function, *destination, self.primitive(PrimitiveType::Bool)?, "union test")
             }
             UnionPayload { destination, union, alternative } => {
                 let union_ty = self.operand_type(function, union)?;
@@ -1388,10 +1395,15 @@ impl<'a> Validator<'a> {
                     if !seen.insert(*alternative) { return Err(self.error("switch repeats an alternative")); }
                     self.block_in(function, *block)?;
                 }
+                if seen.len() != alternatives.len() { return Err(self.error("switch does not cover every alternative")); }
                 Ok(())
             }
             TerminatorKind::Return(value) => self.expect_operand(function, value, function.result, "return value"),
             TerminatorKind::Panic(message) => self.expect_operand(function, message, self.primitive(PrimitiveType::Str)?, "panic message"),
+            TerminatorKind::ErrorPanic(payload) => {
+                let ty = self.operand_type(function, payload)?;
+                if matches!(self.ty(ty)?, Type::Primitive(_)) { Ok(()) } else { Err(self.error("Error panic payload is not primitive")) }
+            }
             TerminatorKind::Unreachable => Ok(()),
         }
     }

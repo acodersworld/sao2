@@ -111,8 +111,8 @@ Define the complete operation vocabulary now so later stages add lowering
 without redesigning the core representation:
 
 - copying an operand, unary and binary computation, numeric conversion,
-  aggregate construction, union injection, discriminant extraction, and union
-  payload extraction;
+  aggregate construction, union injection, target-independent union testing,
+  and union payload extraction;
 - assignment to a place, direct function calls, intrinsic calls, and built-in
   list, map, and string methods; and
 - explicit integer overflow and negation, division, remainder, shift-range,

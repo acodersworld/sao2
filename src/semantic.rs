@@ -164,6 +164,7 @@ pub(crate) struct TryResolution<'ast> {
     pub(crate) operand_union: TypeId,
     pub(crate) source_error: UnionAlternative,
     pub(crate) success: TypeId,
+    pub(crate) widening: Option<TypeId>,
     pub(crate) action: TryAction,
 }
 
@@ -860,11 +861,20 @@ impl<'a, 'source, 'ast> HandoffValidator<'a, 'source, 'ast> {
             let member_states_valid = match &definition.kind {
                 TypeDefinitionKind::Struct(members) => members.iter().all(|member| matches!(member.ty, TypeState::Resolved(ty) if self.analysis.types.contains(ty))),
                 TypeDefinitionKind::Tuple(members) => members.iter().all(|member| matches!(member.ty, TypeState::Resolved(ty) if self.analysis.types.contains(ty))),
-                TypeDefinitionKind::Union { alternatives, .. } => alternatives.iter().all(|alternative| self.analysis.types.contains(alternative_payload(alternative))),
+                TypeDefinitionKind::Union { alternatives, .. } => alternatives.iter().all(|alternative| {
+                    self.analysis.types.contains(alternative_payload(alternative)) && self.error_payload_is_primitive(alternative)
+                }),
                 TypeDefinitionKind::Invalid => false,
             };
             if !member_states_valid {
                 return Err(handoff_error("type definition retains an invalid member or alternative type"));
+            }
+        }
+        for (_, ty) in self.analysis.types.iter() {
+            if let ResolvedType::Union(alternatives) = ty
+                && alternatives.iter().any(|alternative| !self.error_payload_is_primitive(alternative))
+            {
+                return Err(handoff_error("canonical union contains a non-primitive Error payload"));
             }
         }
         for entry in &self.analysis.type_names {
@@ -1136,10 +1146,14 @@ impl<'a, 'source, 'ast> HandoffValidator<'a, 'source, 'ast> {
             }
         }
         for resolution in &self.semantic.union_tests {
+            let ExpressionKind::Is { value, .. } = &resolution.expression.kind else {
+                return Err(handoff_error("union test resolution refers to a non-test expression"));
+            };
             if !self.contains_expression(resolution.expression)
                 || !self.union_has_alternative(resolution.operand_union, &resolution.alternative)
                 || alternative_payload(&resolution.alternative) != resolution.payload
-                || resolution.binding.is_some_and(|id| id.index() >= self.analysis.bindings.len())
+                || self.analysis.expression_annotation(value).map(|item| item.state) != Some(TypeState::Resolved(resolution.operand_union))
+                || resolution.binding != exact_binding(self.analysis, value)
             {
                 return Err(handoff_error("union test resolution is contradictory or cross-linked"));
             }
@@ -1156,11 +1170,13 @@ impl<'a, 'source, 'ast> HandoffValidator<'a, 'source, 'ast> {
             {
                 return Err(handoff_error("switch resolution is incomplete or cross-linked"));
             }
-            let StatementKind::Switch { arms, else_body, .. } = &resolution.statement.kind else {
+            let StatementKind::Switch { value, arms, else_body } = &resolution.statement.kind else {
                 return Err(handoff_error("switch resolution refers to a non-switch statement"));
             };
             if resolution.arms.len() != arms.len()
                 || resolution.else_body.map(|body| body as *const _) != else_body.as_ref().map(|body| body as *const _)
+                || self.analysis.expression_annotation(value).map(|item| item.state) != Some(TypeState::Resolved(resolution.operand_union))
+                || resolution.binding != exact_binding(self.analysis, value)
             {
                 return Err(handoff_error("switch arm or else coverage is incomplete"));
             }
@@ -1194,9 +1210,14 @@ impl<'a, 'source, 'ast> HandoffValidator<'a, 'source, 'ast> {
             }
         }
         for resolution in &self.semantic.tries {
+            let ExpressionKind::Try { value, operator_span } = &resolution.expression.kind else {
+                return Err(handoff_error("postfix try resolution refers to a non-try expression"));
+            };
             if !self.contains_expression(resolution.expression)
                 || !self.union_has_alternative(resolution.operand_union, &resolution.source_error)
                 || !matches!(resolution.source_error, UnionAlternative::Error(_))
+                || *operator_span != resolution.operator_span
+                || self.analysis.expression_annotation(value).map(|item| item.state) != Some(TypeState::Resolved(resolution.operand_union))
                 || !self.analysis.types.contains(resolution.success)
                 || self.analysis.expression_annotation(resolution.expression).map(|item| item.state) != Some(TypeState::Resolved(resolution.success))
             {
@@ -1213,6 +1234,12 @@ impl<'a, 'source, 'ast> HandoffValidator<'a, 'source, 'ast> {
             };
             if !success_matches {
                 return Err(handoff_error("postfix try success type contradicts its operand alternatives"));
+            }
+            if let Some(widening) = resolution.widening {
+                let Some(destination) = self.union_alternatives(widening) else { return Err(handoff_error("postfix try widening destination is not a union")); };
+                if successes.iter().any(|alternative| !destination.contains(alternative)) {
+                    return Err(handoff_error("postfix try widening destination omits a success alternative"));
+                }
             }
             let Some(function) = self.enclosing_function(resolution.expression) else {
                 return Err(handoff_error("postfix try has no enclosing function"));
@@ -1552,6 +1579,14 @@ impl<'a, 'source, 'ast> HandoffValidator<'a, 'source, 'ast> {
             && self.analysis.types.contains(alternative_payload(alternative))
     }
 
+    fn error_payload_is_primitive(&self, alternative: &UnionAlternative) -> bool {
+        match alternative {
+            UnionAlternative::Error(payload) => self.analysis.types.contains(*payload)
+                && matches!(self.analysis.types.get(*payload), ResolvedType::Primitive(_)),
+            _ => true,
+        }
+    }
+
     fn unit_alternative_for(&self, ty: TypeId) -> Option<&UnionAlternative> {
         let unit = self.analysis.types.unit();
         let mut matches = self.union_alternatives(ty)?.iter().filter(|alternative| matches!(alternative, UnionAlternative::Untagged(payload) if *payload == unit));
@@ -1766,8 +1801,8 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
             StatementKind::Local { initializer, .. } => {
                 let state = self.expression(initializer);
                 if let Some(binding) = self.analysis.local_binding(statement)
-                    && matches!(self.analysis.binding_types[binding.index()].state, TypeState::Deferred(_))
                     && matches!(state, TypeState::Resolved(_))
+                    && self.analysis.binding_types[binding.index()].state != state
                 {
                     self.analysis.binding_types[binding.index()].state = state;
                 }
@@ -2099,7 +2134,7 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
             TryAction::Propagate { function, destination_union, destination_error: destination_error.clone() }
         };
         self.replace_expression_state(expression, TypeState::Resolved(success));
-        self.tries.push(TryResolution { expression, operator_span, operand_union, source_error: source_error.clone(), success, action });
+        self.tries.push(TryResolution { expression, operator_span, operand_union, source_error: source_error.clone(), success, widening: None, action });
     }
 
     fn resolve_label(&mut self, label: &'ast Type, style: UnionStyle, alternatives: &[UnionAlternative]) -> Option<UnionAlternative> {
@@ -2386,7 +2421,7 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
         self.analysis.expression_annotation(expression).expect("every expression has a type annotation").state
     }
 
-    fn try_success_widens_to(&self, expression: &'ast Expression, actual: TypeId, expected: TypeId) -> bool {
+    fn try_success_widens_to(&mut self, expression: &'ast Expression, actual: TypeId, expected: TypeId) -> bool {
         let expression = strip_expression_parentheses(expression);
         if !matches!(&expression.kind, ExpressionKind::Try { .. }) {
             return false;
@@ -2397,8 +2432,14 @@ impl<'analysis, 'diagnostics, 'warnings, 'source, 'ast>
         let expected_alternatives = self.union_parts(TypeState::Resolved(expected))
             .map(|(_, _, alternatives)| alternatives)
             .unwrap_or_default();
-        !actual_alternatives.is_empty()
-            && actual_alternatives.iter().all(|alternative| expected_alternatives.contains(alternative))
+        let widens = !actual_alternatives.is_empty()
+            && actual_alternatives.iter().all(|alternative| expected_alternatives.contains(alternative));
+        if widens
+            && let Some(resolution) = self.tries.iter_mut().rev().find(|resolution| std::ptr::eq(resolution.expression, expression))
+        {
+            resolution.widening = Some(expected);
+        }
+        widens
     }
 
     fn expression_body_state(&self, body: &'ast ExpressionBody) -> TypeState {

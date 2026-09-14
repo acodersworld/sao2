@@ -125,11 +125,20 @@ after coverage is known.
 Each reachable postfix `?` has one `TryResolution`. It records the operator
 span, operand union, direct source `Error`, successful type, and action. A single
 success alternative produces its payload directly; multiple alternatives use a
-canonical anonymous union preserving tags and nesting. The action is either
+canonical anonymous union preserving tags and nesting. When contextual typing
+widens those successes into a containing union, that exact destination is also
+recorded. The action is either
 exact-error propagation to the enclosing function or panic in the validated
 `main`. A `Never` operand is the sole case in which a try syntax node has no try
 record. Try flow contains its success path and the corresponding return or
 divergence exit.
+
+Every direct `Error` alternative has exactly one primitive payload (`int`,
+`float`, `str`, `bool`, or `char`); type resolution diagnoses any other payload
+at its type span. Lowering propagates an error by extracting and reinjecting
+that exact payload into the recorded destination alternative, or, for `main`,
+emits a distinct typed Error-panic terminator carrying the payload and the
+recorded `?` location.
 
 ## Diagnostics and lowering contract
 

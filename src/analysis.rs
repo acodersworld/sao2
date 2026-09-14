@@ -1293,8 +1293,13 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
                                 }
                             }
                             match payload_state {
-                                TypeState::Resolved(payload) if tag == "Error" => {
-                                    resolved.push(UnionAlternative::Error(payload));
+                                TypeState::Resolved(payload_type) if tag == "Error" => {
+                                    if !matches!(self.types.get(payload_type), ResolvedType::Primitive(_)) {
+                                        self.error(payload.span, "Error payload must be a primitive type");
+                                        failed = true;
+                                    } else {
+                                        resolved.push(UnionAlternative::Error(payload_type));
+                                    }
                                 }
                                 TypeState::Resolved(payload) => {
                                     resolved.push(UnionAlternative::Tagged {
@@ -4682,6 +4687,18 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
         match state {
             TypeState::Resolved(actual) if actual == expected => state,
             TypeState::Resolved(actual) => {
+                if self.union_alternatives(actual).iter().any(|alternative| {
+                    match alternative {
+                        UnionAlternative::Untagged(payload)
+                        | UnionAlternative::Tagged { payload, .. }
+                        | UnionAlternative::Error(payload) => *payload == expected,
+                    }
+                }) {
+                    // A later union-validation pass may establish this exact
+                    // payload through branch-local narrowing. It will diagnose
+                    // the expression if no such narrowing applies.
+                    return state;
+                }
                 let matches = self.union_alternatives(expected).into_iter().filter(|alternative| {
                     matches!(alternative, UnionAlternative::Untagged(ty) if *ty == actual)
                 }).collect::<Vec<_>>();
@@ -6099,6 +6116,40 @@ mod tests {
         ] {
             assert!(diagnostics.contains(expected), "{diagnostics}");
         }
+    }
+
+    #[test]
+    fn restricts_error_payloads_to_primitives_at_the_payload_span() {
+        let source = source(concat!(
+            "type Pair(int); type Choice(int | str); ",
+            "fn bad_unit() int | Error(()) { 1 } ",
+            "fn bad_list() int | Error([int]) { 1 } ",
+            "fn bad_map() int | Error({int: str}) { 1 } ",
+            "fn bad_tuple() int | Error(Pair) { 1 } ",
+            "fn bad_union() int | Error(Choice) { 1 } ",
+            "fn main() {}",
+        ));
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        let diagnostics = analysis.diagnostics.to_string();
+        assert_eq!(diagnostics.matches("Error payload must be a primitive type").count(), 5, "{diagnostics}");
+        let entries = analysis.diagnostics.into_sorted();
+        for payload in ["()", "[int]", "{int: str}", "Pair", "Choice"] {
+            let start = source.text.find(&format!("Error({payload})")).unwrap() + "Error(".len();
+            assert!(entries.iter().any(|diagnostic| diagnostic.primary_span() == Some(Span::new(start, start + payload.len()))));
+        }
+    }
+
+    #[test]
+    fn permits_each_primitive_error_payload() {
+        let source = source(concat!(
+            "type EInt(() | Error(int)); type EFloat(() | Error(float)); ",
+            "type EStr(() | Error(str)); type EBool(() | Error(bool)); ",
+            "type EChar(() | Error(char)); fn main() {}",
+        ));
+        let program = parser::parse(&source).unwrap();
+        let analysis = analyze(&source, &program);
+        assert!(analysis.diagnostics.is_empty(), "{}", analysis.diagnostics);
     }
 
     #[test]

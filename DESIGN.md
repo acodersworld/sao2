@@ -250,12 +250,18 @@ fn check() () | Error(str) {
 ```
 
 `Error` carries a value describing the failure and must always be the last
-alternative in a union. `Error(Type)` is not a standalone result type. The
+alternative in a union. Its payload must be exactly one primitive type: `int`,
+`float`, `str`, `bool`, or `char`. This restriction applies to named and
+anonymous unions. `Error(Type)` is not a standalone result type. The
 postfix `?` operator unwraps a successful result or immediately returns its
 `Error`, as in Rust. Outside `main`, the enclosing function must return a union
 whose top-level `Error` alternative has exactly the same resolved payload type.
 There is no widening or union injection between error payloads. `main` is the
-exception: using `?` on an error in `main` causes a runtime panic.
+exception: using `?` on an error in `main` causes a typed runtime panic which
+prints `Error(payload)` using the payload primitive's ordinary formatting,
+reports the source location of the `?`, and terminates with a nonzero status.
+This is distinct from the explicit `panic(message)` intrinsic, which continues
+to require a `str` message.
 
 Postfix `?` removes the top-level `Error` alternative from the expression's
 type. If exactly one success alternative remains, the expression has that
