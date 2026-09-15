@@ -252,6 +252,12 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
     fn new_block(&mut self) -> ir::BlockId { self.function.add_block() }
     fn enter(&mut self, block: ir::BlockId) { self.block = Some(block); }
     fn location(&mut self, span: Span) -> ir::LocationId { self.owner.program.intern_location(ir::ByteSpan::new(span.start, span.end)) }
+    fn failure(&mut self, span: Span, operation: ir::FailureOperation) -> Result<ir::FailureSiteId, LoweringError> {
+        let location = self.location(span);
+        let function = self.owner.functions.get(self.function_id.index()).copied().ok_or_else(|| invariant("current function has no IR identity"))?;
+        let (line, column) = self.owner.analysis.source.line_and_column(span.start);
+        Ok(self.owner.program.intern_failure_site(ir::FailureSite { location, function, operation, line, column }))
+    }
     fn semantic_completion(&self, function: analysis::FunctionId, block: &ast::Block) -> Result<&crate::semantic::FunctionCompletion<'ast>, LoweringError> {
         let matches = self.owner.semantic.flow.completions.iter().filter(|item| item.function == function && std::ptr::eq(item.body, block)).collect::<Vec<_>>();
         let [completion] = matches.as_slice() else { return Err(invariant("function fallthrough does not have exactly one completion record")); };
@@ -375,7 +381,7 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
                     self.push(ir::OperationKind::Assign { destination: ir::Place::local(local), value }, statement.span)?;
                 }
             }
-            StatementKind::Assignment { target, operator, value, .. } => self.assignment(target, *operator, value, statement.span)?,
+            StatementKind::Assignment { target, operator, operator_span, value } => self.assignment(target, *operator, *operator_span, value, statement.span)?,
             StatementKind::Expression(expression) => { self.expression(expression)?; }
             StatementKind::Return(value) => self.return_statement(statement, value.as_ref())?,
             StatementKind::If { branches, else_body } => self.if_statement(branches, else_body.as_ref(), statement.span)?,
@@ -430,29 +436,47 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
                 }
                 let conversion = if matches!(self.owner.analysis.types.get(resolution.source), ResolvedType::Primitive(PrimitiveType::Int)) { ir::NumericConversion::IntToFloat } else { ir::NumericConversion::FloatToInt };
                 let Some(operand) = self.expression(operand)? else { return Ok(None); };
+                let operand = if conversion == ir::NumericConversion::FloatToInt { self.stabilize(operand, expression.span)? } else { operand };
+                if conversion == ir::NumericConversion::FloatToInt {
+                    let failure = self.failure(expression.span, ir::FailureOperation::FloatToInt)?;
+                    self.push(ir::OperationKind::Check(ir::RuntimeCheck::NumericConversion { operand: operand.clone(), conversion, failure }), expression.span)?;
+                }
                 let destination = self.temporary(resolution.destination)?;
                 self.push(ir::OperationKind::Convert { destination, conversion, operand }, expression.span)?;
                 ir::Operand::Copy(ir::Place::local(destination))
             }
-            ExpressionKind::Unary { operator, operand, .. } => {
+            ExpressionKind::Unary { operator, operator_span, operand } => {
+                if *operator == ast::UnaryOperator::Minus
+                    && matches!(self.owner.analysis.literal(operand), Some(LiteralValue::Integer(value)) if *value == (i64::MAX as u64) + 1)
+                {
+                    let ty = self.raw_type(expression)?;
+                    self.constant(ty, ir::ConstantValue::Integer(i64::MIN))?
+                } else {
+                let operand_span = operand.span;
                 let Some(operand) = self.expression(operand)? else { return Ok(None); };
                 let result = self.raw_type(expression)?;
+                let operand = if *operator == ast::UnaryOperator::Minus && matches!(self.owner.analysis.types.get(result), ResolvedType::Primitive(PrimitiveType::Int)) { self.stabilize(operand, operand_span)? } else { operand };
+                if *operator == ast::UnaryOperator::Minus && matches!(self.owner.analysis.types.get(result), ResolvedType::Primitive(PrimitiveType::Int)) {
+                    let failure = self.failure(*operator_span, ir::FailureOperation::IntegerNegation)?;
+                    self.push(ir::OperationKind::Check(ir::RuntimeCheck::IntegerNegation { operand: operand.clone(), failure }), *operator_span)?;
+                }
                 let destination = self.temporary(result)?;
                 self.push(ir::OperationKind::Unary { destination, operator: map_unary(*operator), operand }, expression.span)?;
                 ir::Operand::Copy(ir::Place::local(destination))
+                }
             }
-            ExpressionKind::Binary { left, operator, right, .. } => {
+            ExpressionKind::Binary { left, operator, operator_span, right } => {
                 if matches!(operator, ast::BinaryOperator::LogicalAnd | ast::BinaryOperator::LogicalOr) {
                     return self.short_circuit(expression, left, *operator, right);
                 }
                 let left_span = left.span;
                 let Some(left) = self.expression(left)? else { return Ok(None); };
                 let left = self.stabilize(left, left_span)?;
+                let right_span = right.span;
                 let Some(right) = self.expression(right)? else { return Ok(None); };
+                let right = self.stabilize(right, right_span)?;
                 let result = self.raw_type(expression)?;
-                let destination = self.temporary(result)?;
-                self.push(ir::OperationKind::Binary { destination, operator: map_binary(*operator)?, left, right }, expression.span)?;
-                ir::Operand::Copy(ir::Place::local(destination))
+                self.checked_binary(result, map_binary(*operator)?, left, right, *operator_span, expression.span)?
             }
             ExpressionKind::List(elements) => return self.list(expression, elements),
             ExpressionKind::Map(entries) => return self.map(expression, entries),
@@ -505,7 +529,7 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
     fn constant(&mut self, ty: analysis::TypeId, value: ir::ConstantValue) -> Result<ir::Operand, LoweringError> { Ok(ir::Operand::Constant(ir::Constant { ty: self.ty(ty)?, value })) }
     fn literal_constant(&mut self, expression: &Expression) -> Result<ir::Operand, LoweringError> {
         let value = match self.owner.analysis.literal(expression).cloned() {
-            Some(LiteralValue::Integer(value)) => ir::ConstantValue::Integer(value),
+            Some(LiteralValue::Integer(value)) => ir::ConstantValue::Integer(i64::try_from(value).map_err(|_| invariant("positive integer literal exceeds signed int range"))?),
             Some(LiteralValue::Float(value)) => ir::ConstantValue::Float(value.to_bits()),
             Some(LiteralValue::String(value)) => ir::ConstantValue::String(value.into_vec()),
             Some(LiteralValue::Character(value)) => ir::ConstantValue::Character(value),
@@ -541,6 +565,55 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         let destination = self.temporary(ty)?;
         self.push(ir::OperationKind::Copy { destination, operand }, span)?;
         Ok(ir::Operand::Copy(ir::Place::local(destination)))
+    }
+    fn checked_binary(
+        &mut self,
+        result: analysis::TypeId,
+        operator: ir::BinaryOperator,
+        left: ir::Operand,
+        right: ir::Operand,
+        failure_span: Span,
+        operation_span: Span,
+    ) -> Result<ir::Operand, LoweringError> {
+        let is_int = matches!(self.owner.analysis.types.get(result), ResolvedType::Primitive(PrimitiveType::Int));
+        let is_float = matches!(self.owner.analysis.types.get(result), ResolvedType::Primitive(PrimitiveType::Float));
+        let failure_operation = match (operator, is_int, is_float) {
+            (ir::BinaryOperator::Add, true, _) => Some(ir::FailureOperation::IntegerAdd),
+            (ir::BinaryOperator::Subtract, true, _) => Some(ir::FailureOperation::IntegerSubtract),
+            (ir::BinaryOperator::Multiply, true, _) => Some(ir::FailureOperation::IntegerMultiply),
+            (ir::BinaryOperator::Divide, true, _) => Some(ir::FailureOperation::IntegerDivision),
+            (ir::BinaryOperator::Remainder, true, _) => Some(ir::FailureOperation::IntegerRemainder),
+            (ir::BinaryOperator::ShiftLeft, true, _) => Some(ir::FailureOperation::ShiftLeft),
+            (ir::BinaryOperator::ShiftRight, true, _) => Some(ir::FailureOperation::ShiftRight),
+            (ir::BinaryOperator::Add, _, true) => Some(ir::FailureOperation::FloatAdd),
+            (ir::BinaryOperator::Subtract, _, true) => Some(ir::FailureOperation::FloatSubtract),
+            (ir::BinaryOperator::Multiply, _, true) => Some(ir::FailureOperation::FloatMultiply),
+            (ir::BinaryOperator::Divide, _, true) => Some(ir::FailureOperation::FloatDivision),
+            _ => None,
+        };
+        let failure = if let Some(operation) = failure_operation { Some(self.failure(failure_span, operation)?) } else { None };
+        if let Some(failure) = failure {
+            let check = match operator {
+                ir::BinaryOperator::Add if is_int => Some(ir::RuntimeCheck::IntegerOverflow { operation: ir::IntegerOperation::Add, left: left.clone(), right: right.clone(), failure }),
+                ir::BinaryOperator::Subtract if is_int => Some(ir::RuntimeCheck::IntegerOverflow { operation: ir::IntegerOperation::Subtract, left: left.clone(), right: right.clone(), failure }),
+                ir::BinaryOperator::Multiply if is_int => Some(ir::RuntimeCheck::IntegerOverflow { operation: ir::IntegerOperation::Multiply, left: left.clone(), right: right.clone(), failure }),
+                ir::BinaryOperator::Divide => Some(ir::RuntimeCheck::Division { left: left.clone(), right: right.clone(), failure }),
+                ir::BinaryOperator::Remainder => Some(ir::RuntimeCheck::Remainder { left: left.clone(), right: right.clone(), failure }),
+                ir::BinaryOperator::ShiftLeft | ir::BinaryOperator::ShiftRight => Some(ir::RuntimeCheck::ShiftRange { amount: right.clone(), failure }),
+                _ => None,
+            };
+            if let Some(check) = check { self.push(ir::OperationKind::Check(check), failure_span)?; }
+            if operator == ir::BinaryOperator::ShiftLeft && is_int {
+                self.push(ir::OperationKind::Check(ir::RuntimeCheck::IntegerOverflow { operation: ir::IntegerOperation::ShiftLeft, left: left.clone(), right: right.clone(), failure }), failure_span)?;
+            }
+        }
+        let destination = self.temporary(result)?;
+        self.push(ir::OperationKind::Binary { destination, operator, left, right }, operation_span)?;
+        let operand = ir::Operand::Copy(ir::Place::local(destination));
+        if is_float && matches!(operator, ir::BinaryOperator::Add | ir::BinaryOperator::Subtract | ir::BinaryOperator::Multiply | ir::BinaryOperator::Divide) {
+            self.push(ir::OperationKind::Check(ir::RuntimeCheck::FiniteFloat { operand: operand.clone(), failure: failure.expect("float arithmetic has a failure site") }), failure_span)?;
+        }
+        Ok(operand)
     }
     fn operand_frontend_type(&self, operand: &ir::Operand) -> Result<analysis::TypeId, LoweringError> {
         let ir_ty = match operand {
@@ -578,7 +651,8 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         if matches!(resolution.target, CallTarget::Callable(CallableId::Intrinsic(IntrinsicId::Panic))) {
             let [argument] = arguments else { return Err(invariant("panic call does not have exactly one argument")); };
             let Some(message) = self.expression(argument_value(argument))? else { return Ok(None); };
-            self.terminate(ir::TerminatorKind::Panic(message), expression.span)?;
+            let failure = self.failure(expression.span, ir::FailureOperation::ExplicitPanic)?;
+            self.terminate(ir::TerminatorKind::Panic { message, failure }, expression.span)?;
             return Ok(None);
         }
         if let Some(constructor) = self.owner.analysis.constructor(expression) {
@@ -596,9 +670,22 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         let destination = self.temporary(result)?;
         let kind = match resolution.target {
             CallTarget::Callable(CallableId::Function(function)) => ir::OperationKind::Call { destination, function: self.owner.functions.get(function.index()).copied().ok_or_else(|| invariant("callee has no IR mapping"))?, arguments: lowered },
-            CallTarget::Callable(CallableId::Intrinsic(IntrinsicId::Print)) => ir::OperationKind::Intrinsic { destination, intrinsic: ir::Intrinsic::Print, arguments: lowered },
-            CallTarget::Callable(CallableId::Intrinsic(IntrinsicId::Println)) => ir::OperationKind::Intrinsic { destination, intrinsic: ir::Intrinsic::Println, arguments: lowered },
-            CallTarget::Builtin(method) => ir::OperationKind::Builtin { destination, method: map_builtin(method), receiver: receiver.unwrap(), arguments: lowered },
+            CallTarget::Callable(CallableId::Intrinsic(IntrinsicId::Print)) => ir::OperationKind::Intrinsic { destination, intrinsic: ir::Intrinsic::Print, arguments: lowered, failure: self.failure(expression.span, ir::FailureOperation::Output)? },
+            CallTarget::Callable(CallableId::Intrinsic(IntrinsicId::Println)) => ir::OperationKind::Intrinsic { destination, intrinsic: ir::Intrinsic::Println, arguments: lowered, failure: self.failure(expression.span, ir::FailureOperation::Output)? },
+            CallTarget::Builtin(method) => {
+                let receiver = receiver.unwrap();
+                let failure_operation = match method {
+                    BuiltinMethod::ListAppend => Some(ir::FailureOperation::ListAppend),
+                    BuiltinMethod::ListRemoveIndex => Some(ir::FailureOperation::ListRemoveIndex),
+                    BuiltinMethod::MapRemoveKey => Some(ir::FailureOperation::MapRemoveKey),
+                    _ => None,
+                };
+                let failure = failure_operation.map(|operation| self.failure(expression.span, operation)).transpose()?;
+                if let Some(failure) = failure {
+                    self.push(ir::OperationKind::Check(ir::RuntimeCheck::IterationUnlocked { receiver: receiver.clone(), failure }), expression.span)?;
+                }
+                ir::OperationKind::Builtin { destination, method: map_builtin(method), receiver, arguments: lowered, failure }
+            }
             _ => return Err(invariant("call retained an unsupported target")),
         };
         self.push(kind, expression.span)?;
@@ -676,15 +763,22 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         if let ProjectionKind::String { .. } = projection {
             let result = self.raw_type(expression)?;
             let destination = self.temporary(result)?;
-            self.push(ir::OperationKind::StringIndex { destination, string: receiver, index: index_value }, expression.span)?;
+            let failure = self.failure(index.span, ir::FailureOperation::StringIndex)?;
+            self.push(ir::OperationKind::StringIndex { destination, string: receiver, index: index_value, failure }, expression.span)?;
             return Ok(Some(ir::Operand::Copy(ir::Place::local(destination))));
         }
         let ir::Operand::Copy(mut place) = receiver else { return Err(invariant("index receiver did not materialize to a place")); };
         let ir::Operand::Copy(index_place) = index_value else { return Err(invariant("dynamic index did not materialize to a local")); };
         if !index_place.projections.is_empty() { return Err(invariant("dynamic index retained projections")); }
         match projection {
-            ProjectionKind::List { .. } => place.projections.push(ir::Projection::ListIndex { index: index_place.local }),
-            ProjectionKind::Map { .. } => place.projections.push(ir::Projection::MapIndex { key: index_place.local }),
+            ProjectionKind::List { .. } => {
+                let failure = self.failure(index.span, ir::FailureOperation::ListIndex)?;
+                place.projections.push(ir::Projection::ListIndex { index: index_place.local, failure });
+            }
+            ProjectionKind::Map { .. } => {
+                let failure = self.failure(index.span, ir::FailureOperation::MapIndex)?;
+                place.projections.push(ir::Projection::MapIndex { key: index_place.local, failure });
+            }
             _ => return Err(invariant("index expression has a non-index projection")),
         }
         Ok(Some(ir::Operand::Copy(place)))
@@ -961,7 +1055,7 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         let length = self.temporary(int)?;
         let index = self.temporary(int)?;
         self.push(ir::OperationKind::BeginIteration { iterable: iterable.clone() }, iterable_expression.span)?;
-        self.push(ir::OperationKind::Builtin { destination: length, method: length_method, receiver: iterable.clone(), arguments: Vec::new() }, iterable_expression.span)?;
+        self.push(ir::OperationKind::Builtin { destination: length, method: length_method, receiver: iterable.clone(), arguments: Vec::new(), failure: None }, iterable_expression.span)?;
         let zero = self.constant(int, ir::ConstantValue::Integer(0))?;
         self.push(ir::OperationKind::Assign { destination: ir::Place::local(index), value: zero }, statement.span)?;
         let header = self.new_block();
@@ -997,6 +1091,13 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
 
         self.enter(advance);
         let one = self.constant(int, ir::ConstantValue::Integer(1))?;
+        let advance_failure = self.failure(statement.span, ir::FailureOperation::IntegerAdd)?;
+        self.push(ir::OperationKind::Check(ir::RuntimeCheck::IntegerOverflow {
+            operation: ir::IntegerOperation::Add,
+            left: ir::Operand::Copy(ir::Place::local(index)),
+            right: one.clone(),
+            failure: advance_failure,
+        }), statement.span)?;
         self.push(ir::OperationKind::Binary {
             destination: index,
             operator: ir::BinaryOperator::Add,
@@ -1106,7 +1207,8 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
                     }
                     TryAction::Panic { function } => {
                         if *function != self.function_id { return Err(invariant("postfix try panic action names the wrong function")); }
-                        self.terminate(ir::TerminatorKind::ErrorPanic(payload), resolution.operator_span)?;
+                        let failure = self.failure(resolution.operator_span, ir::FailureOperation::UnhandledError)?;
+                        self.terminate(ir::TerminatorKind::ErrorPanic { payload, failure }, resolution.operator_span)?;
                     }
                 }
             } else {
@@ -1135,7 +1237,7 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         }
     }
 
-    fn assignment(&mut self, target: &'ast ast::AssignmentTarget, operator: AssignmentOperator, value: &'ast Expression, span: Span) -> Result<(), LoweringError> {
+    fn assignment(&mut self, target: &'ast ast::AssignmentTarget, operator: AssignmentOperator, operator_span: Span, value: &'ast Expression, span: Span) -> Result<(), LoweringError> {
         let annotation = self.owner.analysis.assignment_target(target).ok_or_else(|| invariant("assignment target fact is missing"))?.clone();
         let root = annotation.root.ok_or_else(|| invariant("assignment target has no root"))?;
         let authorizations = self.owner.semantic.mutability.iter().filter(|resolution| {
@@ -1183,7 +1285,11 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
                     let ast::AssignmentTargetSuffixKind::Index(index) = &suffix.kind else { return Err(invariant("index path step has no index syntax")); };
                     let Some(index_value) = self.expression(index)? else { return Ok(()); }; let index_value = self.materialize(index_value, index.span)?;
                     let ir::Operand::Copy(index_place) = index_value else { return Err(invariant("assignment index did not materialize")); };
-                    let projection = if matches!(step, AccessPathStep::ListIndex { .. }) { ir::Projection::ListIndex { index: index_place.local } } else { ir::Projection::MapIndex { key: index_place.local } };
+                    let projection = if matches!(step, AccessPathStep::ListIndex { .. }) {
+                        ir::Projection::ListIndex { index: index_place.local, failure: self.failure(suffix.span, ir::FailureOperation::ListIndex)? }
+                    } else {
+                        ir::Projection::MapIndex { key: index_place.local, failure: self.failure(suffix.span, ir::FailureOperation::MapIndex)? }
+                    };
                     place.projections.push(projection);
                 }
             }
@@ -1196,9 +1302,8 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
             let old_local = self.temporary(old_type)?;
             self.push(ir::OperationKind::Copy { destination: old_local, operand: ir::Operand::Copy(place.clone()) }, target.span)?;
             let Some(right) = self.expression(value)? else { return Ok(()); };
-            let result = self.temporary(old_type)?;
-            self.push(ir::OperationKind::Binary { destination: result, operator: map_assignment(operator)?, left: ir::Operand::Copy(ir::Place::local(old_local)), right }, span)?;
-            ir::Operand::Copy(ir::Place::local(result))
+            let right = self.stabilize(right, value.span)?;
+            self.checked_binary(old_type, map_assignment(operator)?, ir::Operand::Copy(ir::Place::local(old_local)), right, operator_span, span)?
         };
         self.push(ir::OperationKind::Assign { destination: place, value: assigned }, span)?;
         if annotation.steps.is_empty() { self.narrowings.retain(|entry| entry.binding != root); }
@@ -1345,6 +1450,61 @@ mod tests {
         assert!(rendered.contains("iteration-value"));
         assert!(rendered.matches("end-iteration").count() >= 4);
         assert!(rendered.contains("less"));
+        assert!(program.validate().is_ok());
+    }
+
+    #[test]
+    fn lowers_runtime_failures_with_ordered_checks_and_compact_sites() {
+        let text = concat!(
+            "fn main() int { ",
+            "a := 8; b := 2; x := 4.0; ",
+            "sum := a + b; difference := a - b; product := a * b; ",
+            "quotient := a / b; remainder := a % b; shifted := a << b; other := a >> b; ",
+            "float_quotient := x / 2.0; converted := int(float_quotient); ",
+            "var items := [sum]; var table := {a: quotient}; ",
+            "items[0] = table[a]; items.append(converted); items.removeIndex(-1); table.removeKey(a); ",
+            "println(\"index\"[-1]); shifted + other + difference + product + remainder }",
+        );
+        let program = lower_text(text).expect("runtime checks must lower");
+        let rendered = program.render();
+        assert!(rendered.contains("integer-add-overflow"));
+        assert!(rendered.contains("check division"));
+        assert!(rendered.contains("check shift-range"));
+        assert!(rendered.contains("check finite-float"));
+        assert!(rendered.contains("check numeric-float-to-int"));
+        assert!(rendered.contains("iteration-unlocked"));
+        assert!(rendered.contains("list-index"));
+        assert!(rendered.contains("map-index"));
+        assert!(rendered.contains("string-index"));
+        assert!(rendered.contains(" output\n") || rendered.contains(" output\r\n") || rendered.contains(" output"));
+        assert!(program.validate().is_ok());
+    }
+
+    #[test]
+    fn lowers_signed_minimum_without_a_spurious_negation_check() {
+        let program = lower_text("fn main() int { -9223372036854775808 }").expect("signed minimum must lower");
+        let rendered = program.render();
+        assert!(rendered.contains("const ty"));
+        assert!(rendered.contains(" -9223372036854775808"));
+        assert!(!rendered.contains("integer-negation"));
+        assert!(program.validate().is_ok());
+    }
+
+    #[test]
+    fn compound_indexing_checks_the_read_and_write_and_mutation_checks_the_lock() {
+        let program = lower_text(concat!(
+            "fn update(var items [int], delta int) int { items[0] += delta; 0 } ",
+            "fn main() { var items := [1]; update(items, 2); ",
+            "for item in items { items.append(item); break; } }",
+        )).expect("checked mutations must lower");
+        let rendered = program.render();
+        let compound_site = program.failure_sites.iter().enumerate()
+            .find(|(_, site)| site.operation == ir::FailureOperation::ListIndex)
+            .map(|(index, _)| format!("! fail{index}"))
+            .expect("compound list access must have a failure site");
+        assert_eq!(rendered.matches(&compound_site).count(), 2);
+        assert!(rendered.contains("iteration-unlocked"));
+        assert!(rendered.contains("list-append"));
         assert!(program.validate().is_ok());
     }
 

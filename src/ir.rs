@@ -34,6 +34,7 @@ index_id!(BlockId, "bb");
 index_id!(FieldId, "field");
 index_id!(AlternativeId, "alt");
 index_id!(LocationId, "loc");
+index_id!(FailureSiteId, "fail");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SourceMetadata {
@@ -240,14 +241,14 @@ impl Place {
 pub(crate) enum Projection {
     StructField { definition: DefinitionId, field: FieldId, storage: MemberStorage },
     TupleField { definition: DefinitionId, field: FieldId },
-    ListIndex { index: LocalId },
-    MapIndex { key: LocalId },
+    ListIndex { index: LocalId, failure: FailureSiteId },
+    MapIndex { key: LocalId, failure: FailureSiteId },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ConstantValue {
     Unit,
-    Integer(u64),
+    Integer(i64),
     Float(u64),
     String(Vec<u8>),
     Character(u8),
@@ -295,17 +296,34 @@ pub(crate) enum BuiltinMethod {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IntegerOperation { Add, Subtract, Multiply, ShiftLeft }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum FailureOperation {
+    IntegerAdd, IntegerSubtract, IntegerMultiply, IntegerNegation,
+    IntegerDivision, IntegerRemainder, ShiftLeft, ShiftRight,
+    FloatAdd, FloatSubtract, FloatMultiply, FloatDivision, FloatToInt,
+    ListIndex, MapIndex, StringIndex, ListAppend, ListRemoveIndex,
+    MapRemoveKey, Output, ExplicitPanic, UnhandledError,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct FailureSite {
+    pub(crate) location: LocationId,
+    pub(crate) function: FunctionId,
+    pub(crate) operation: FailureOperation,
+    pub(crate) line: usize,
+    pub(crate) column: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum RuntimeCheck {
-    IntegerOverflow { operation: IntegerOperation, left: Operand, right: Operand },
-    IntegerNegation { operand: Operand },
-    Division { left: Operand, right: Operand },
-    Remainder { left: Operand, right: Operand },
-    ShiftRange { amount: Operand },
-    FiniteFloat { operand: Operand },
-    NumericConversion { operand: Operand, conversion: NumericConversion },
-    IndexBounds { collection: Operand, index: Operand },
-    MissingMapKey { map: Operand, key: Operand },
+    IntegerOverflow { operation: IntegerOperation, left: Operand, right: Operand, failure: FailureSiteId },
+    IntegerNegation { operand: Operand, failure: FailureSiteId },
+    Division { left: Operand, right: Operand, failure: FailureSiteId },
+    Remainder { left: Operand, right: Operand, failure: FailureSiteId },
+    ShiftRange { amount: Operand, failure: FailureSiteId },
+    FiniteFloat { operand: Operand, failure: FailureSiteId },
+    NumericConversion { operand: Operand, conversion: NumericConversion, failure: FailureSiteId },
+    IterationUnlocked { receiver: Operand, failure: FailureSiteId },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -324,11 +342,11 @@ pub(crate) enum OperationKind {
     UnionInject { destination: LocalId, union_type: TypeId, alternative: AlternativeId, payload: Operand },
     UnionTest { destination: LocalId, union: Operand, alternative: AlternativeId },
     UnionPayload { destination: LocalId, union: Operand, alternative: AlternativeId },
-    StringIndex { destination: LocalId, string: Operand, index: Operand },
+    StringIndex { destination: LocalId, string: Operand, index: Operand, failure: FailureSiteId },
     Assign { destination: Place, value: Operand },
     Call { destination: LocalId, function: FunctionId, arguments: Vec<Operand> },
-    Intrinsic { destination: LocalId, intrinsic: Intrinsic, arguments: Vec<Operand> },
-    Builtin { destination: LocalId, method: BuiltinMethod, receiver: Operand, arguments: Vec<Operand> },
+    Intrinsic { destination: LocalId, intrinsic: Intrinsic, arguments: Vec<Operand>, failure: FailureSiteId },
+    Builtin { destination: LocalId, method: BuiltinMethod, receiver: Operand, arguments: Vec<Operand>, failure: Option<FailureSiteId> },
     BeginIteration { iterable: Operand },
     EndIteration { iterable: Operand },
     IterationValue { destination: LocalId, iterable: Operand, index: Operand },
@@ -347,8 +365,8 @@ pub(crate) enum TerminatorKind {
     Branch { condition: Operand, then_block: BlockId, else_block: BlockId },
     Switch { union: Operand, targets: Vec<(AlternativeId, BlockId)> },
     Return(Operand),
-    Panic(Operand),
-    ErrorPanic(Operand),
+    Panic { message: Operand, failure: FailureSiteId },
+    ErrorPanic { payload: Operand, failure: FailureSiteId },
     Unreachable,
 }
 
@@ -360,6 +378,7 @@ pub(crate) struct Program {
     pub(crate) functions: Vec<Function>,
     pub(crate) entry: Option<FunctionId>,
     pub(crate) locations: Vec<ByteSpan>,
+    pub(crate) failure_sites: Vec<FailureSite>,
 }
 
 impl Program {
@@ -367,7 +386,7 @@ impl Program {
         Self {
             source: SourceMetadata { filename: filename.into(), byte_len },
             types: Vec::new(), definitions: Vec::new(), functions: Vec::new(),
-            entry: None, locations: Vec::new(),
+            entry: None, locations: Vec::new(), failure_sites: Vec::new(),
         }
     }
 
@@ -398,6 +417,15 @@ impl Program {
         }
         let id = LocationId(self.locations.len());
         self.locations.push(span);
+        id
+    }
+
+    pub(crate) fn intern_failure_site(&mut self, site: FailureSite) -> FailureSiteId {
+        if let Some(index) = self.failure_sites.iter().position(|item| item.location == site.location && item.function == site.function && item.operation == site.operation) {
+            return FailureSiteId(index);
+        }
+        let id = FailureSiteId(self.failure_sites.len());
+        self.failure_sites.push(site);
         id
     }
 
@@ -454,6 +482,9 @@ impl Renderer<'_, '_> {
         let _ = writeln!(self.output, "source \"{}\" bytes {}", escape_text(&self.program.source.filename.to_string_lossy()), self.program.source.byte_len);
         for (index, span) in self.program.locations.iter().enumerate() {
             let _ = writeln!(self.output, "  loc{index} = {}..{}", span.start, span.end);
+        }
+        for (index, site) in self.program.failure_sites.iter().enumerate() {
+            let _ = writeln!(self.output, "  fail{index} = {} {} {} at {}:{}", site.location, site.function, failure_operation_name(site.operation), site.line, site.column);
         }
         for (index, ty) in self.program.types.iter().enumerate() {
             let _ = writeln!(self.output, "type ty{index} = {}", self.ty(ty));
@@ -527,11 +558,14 @@ impl Renderer<'_, '_> {
             OperationKind::UnionInject { destination, union_type, alternative, payload } => format!("{destination} = inject {union_type}.{alternative} {}", self.operand(payload)),
             OperationKind::UnionTest { destination, union, alternative } => format!("{destination} = union-test {alternative} {}", self.operand(union)),
             OperationKind::UnionPayload { destination, union, alternative } => format!("{destination} = payload {alternative} {}", self.operand(union)),
-            OperationKind::StringIndex { destination, string, index } => format!("{destination} = string-index {}, {}", self.operand(string), self.operand(index)),
+            OperationKind::StringIndex { destination, string, index, failure } => format!("{destination} = string-index {}, {} ! {failure}", self.operand(string), self.operand(index)),
             OperationKind::Assign { destination, value } => format!("assign {} = {}", self.place(destination), self.operand(value)),
             OperationKind::Call { destination, function, arguments } => format!("{destination} = call {function}({})", self.operands(arguments)),
-            OperationKind::Intrinsic { destination, intrinsic, arguments } => format!("{destination} = intrinsic {}({})", intrinsic_name(*intrinsic), self.operands(arguments)),
-            OperationKind::Builtin { destination, method, receiver, arguments } => format!("{destination} = builtin {} {}({})", builtin_name(*method), self.operand(receiver), self.operands(arguments)),
+            OperationKind::Intrinsic { destination, intrinsic, arguments, failure } => format!("{destination} = intrinsic {}({}) ! {failure}", intrinsic_name(*intrinsic), self.operands(arguments)),
+            OperationKind::Builtin { destination, method, receiver, arguments, failure } => {
+                let failure = failure.map_or_else(String::new, |site| format!(" ! {site}"));
+                format!("{destination} = builtin {} {}({}){failure}", builtin_name(*method), self.operand(receiver), self.operands(arguments))
+            }
             OperationKind::BeginIteration { iterable } => format!("begin-iteration {}", self.operand(iterable)),
             OperationKind::EndIteration { iterable } => format!("end-iteration {}", self.operand(iterable)),
             OperationKind::IterationValue { destination, iterable, index } => format!("{destination} = iteration-value {}, {}", self.operand(iterable), self.operand(index)),
@@ -550,15 +584,14 @@ impl Renderer<'_, '_> {
 
     fn check(&self, check: &RuntimeCheck) -> String {
         match check {
-            RuntimeCheck::IntegerOverflow { operation, left, right } => format!("integer-{} {}, {}", integer_operation_name(*operation), self.operand(left), self.operand(right)),
-            RuntimeCheck::IntegerNegation { operand } => format!("integer-negation {}", self.operand(operand)),
-            RuntimeCheck::Division { left, right } => format!("division {}, {}", self.operand(left), self.operand(right)),
-            RuntimeCheck::Remainder { left, right } => format!("remainder {}, {}", self.operand(left), self.operand(right)),
-            RuntimeCheck::ShiftRange { amount } => format!("shift-range {}", self.operand(amount)),
-            RuntimeCheck::FiniteFloat { operand } => format!("finite-float {}", self.operand(operand)),
-            RuntimeCheck::NumericConversion { operand, conversion } => format!("numeric-{} {}", conversion_name(*conversion), self.operand(operand)),
-            RuntimeCheck::IndexBounds { collection, index } => format!("index-bounds {}, {}", self.operand(collection), self.operand(index)),
-            RuntimeCheck::MissingMapKey { map, key } => format!("missing-map-key {}, {}", self.operand(map), self.operand(key)),
+            RuntimeCheck::IntegerOverflow { operation, left, right, failure } => format!("integer-{} {}, {} ! {failure}", integer_operation_name(*operation), self.operand(left), self.operand(right)),
+            RuntimeCheck::IntegerNegation { operand, failure } => format!("integer-negation {} ! {failure}", self.operand(operand)),
+            RuntimeCheck::Division { left, right, failure } => format!("division {}, {} ! {failure}", self.operand(left), self.operand(right)),
+            RuntimeCheck::Remainder { left, right, failure } => format!("remainder {}, {} ! {failure}", self.operand(left), self.operand(right)),
+            RuntimeCheck::ShiftRange { amount, failure } => format!("shift-range {} ! {failure}", self.operand(amount)),
+            RuntimeCheck::FiniteFloat { operand, failure } => format!("finite-float {} ! {failure}", self.operand(operand)),
+            RuntimeCheck::NumericConversion { operand, conversion, failure } => format!("numeric-{} {} ! {failure}", conversion_name(*conversion), self.operand(operand)),
+            RuntimeCheck::IterationUnlocked { receiver, failure } => format!("iteration-unlocked {} ! {failure}", self.operand(receiver)),
         }
     }
 
@@ -568,8 +601,8 @@ impl Renderer<'_, '_> {
             TerminatorKind::Branch { condition, then_block, else_block } => format!("branch {} -> {then_block}, {else_block}", self.operand(condition)),
             TerminatorKind::Switch { union, targets } => format!("switch {} -> [{}]", self.operand(union), targets.iter().map(|(alternative, block)| format!("{alternative}: {block}")).collect::<Vec<_>>().join(", ")),
             TerminatorKind::Return(value) => format!("return {}", self.operand(value)),
-            TerminatorKind::Panic(message) => format!("panic {}", self.operand(message)),
-            TerminatorKind::ErrorPanic(payload) => format!("error-panic {}", self.operand(payload)),
+            TerminatorKind::Panic { message, failure } => format!("panic {} ! {failure}", self.operand(message)),
+            TerminatorKind::ErrorPanic { payload, failure } => format!("error-panic {} ! {failure}", self.operand(payload)),
             TerminatorKind::Unreachable => "unreachable".to_owned(),
         }
     }
@@ -598,8 +631,8 @@ impl Renderer<'_, '_> {
             match projection {
                 Projection::StructField { definition, field, storage } => { let _ = write!(rendered, ".{definition}.{field}:{}", storage_name(*storage)); }
                 Projection::TupleField { definition, field } => { let _ = write!(rendered, ".{definition}.{field}"); }
-                Projection::ListIndex { index } => { let _ = write!(rendered, "[{index}]"); }
-                Projection::MapIndex { key } => { let _ = write!(rendered, "[key {key}]"); }
+                Projection::ListIndex { index, failure } => { let _ = write!(rendered, "[{index} ! {failure}]"); }
+                Projection::MapIndex { key, failure } => { let _ = write!(rendered, "[key {key} ! {failure}]"); }
             }
         }
         rendered
@@ -635,6 +668,25 @@ fn conversion_name(value: NumericConversion) -> &'static str { match value { Num
 fn intrinsic_name(value: Intrinsic) -> &'static str { match value { Intrinsic::Print => "print", Intrinsic::Println => "println" } }
 fn builtin_name(value: BuiltinMethod) -> &'static str { match value { BuiltinMethod::ListAppend => "list.append", BuiltinMethod::ListRemoveIndex => "list.remove-index", BuiltinMethod::ListLen => "list.len", BuiltinMethod::MapRemoveKey => "map.remove-key", BuiltinMethod::MapLen => "map.len", BuiltinMethod::StrLen => "str.len" } }
 fn integer_operation_name(value: IntegerOperation) -> &'static str { match value { IntegerOperation::Add => "add-overflow", IntegerOperation::Subtract => "subtract-overflow", IntegerOperation::Multiply => "multiply-overflow", IntegerOperation::ShiftLeft => "shift-left-overflow" } }
+fn failure_operation_name(value: FailureOperation) -> &'static str { match value {
+    FailureOperation::IntegerAdd => "integer-add", FailureOperation::IntegerSubtract => "integer-subtract",
+    FailureOperation::IntegerMultiply => "integer-multiply", FailureOperation::IntegerNegation => "integer-negation",
+    FailureOperation::IntegerDivision => "integer-division", FailureOperation::IntegerRemainder => "integer-remainder",
+    FailureOperation::ShiftLeft => "shift-left", FailureOperation::ShiftRight => "shift-right",
+    FailureOperation::FloatAdd => "float-add", FailureOperation::FloatSubtract => "float-subtract",
+    FailureOperation::FloatMultiply => "float-multiply", FailureOperation::FloatDivision => "float-division",
+    FailureOperation::FloatToInt => "float-to-int", FailureOperation::ListIndex => "list-index",
+    FailureOperation::MapIndex => "map-index", FailureOperation::StringIndex => "string-index",
+    FailureOperation::ListAppend => "list-append", FailureOperation::ListRemoveIndex => "list-remove-index",
+    FailureOperation::MapRemoveKey => "map-remove-key", FailureOperation::Output => "output",
+    FailureOperation::ExplicitPanic => "explicit-panic", FailureOperation::UnhandledError => "unhandled-error",
+} }
+fn runtime_check_failure(check: &RuntimeCheck) -> FailureSiteId { match check {
+    RuntimeCheck::IntegerOverflow { failure, .. } | RuntimeCheck::IntegerNegation { failure, .. }
+    | RuntimeCheck::Division { failure, .. } | RuntimeCheck::Remainder { failure, .. }
+    | RuntimeCheck::ShiftRange { failure, .. } | RuntimeCheck::FiniteFloat { failure, .. }
+    | RuntimeCheck::NumericConversion { failure, .. } | RuntimeCheck::IterationUnlocked { failure, .. } => *failure,
+} }
 
 #[cfg(test)]
 mod tests {
@@ -667,7 +719,7 @@ mod tests {
         Operand::Constant(Constant { ty, value })
     }
 
-    fn integer(types: &CoreTypes, value: u64) -> Operand {
+    fn integer(types: &CoreTypes, value: i64) -> Operand {
         constant(types.int, ConstantValue::Integer(value))
     }
 
@@ -757,6 +809,16 @@ mod tests {
         identity.entry = Some(identity_block);
         identity.blocks[identity_block.index()].terminate(TerminatorKind::Return(Operand::Copy(Place::local(identity_parameter))), location);
         let identity_id = program.add_function(identity);
+        let main_identity = FunctionId::from_index(1);
+        let site = |program: &mut Program, operation| program.intern_failure_site(FailureSite { location, function: main_identity, operation, line: 1, column: 5 });
+        let list_index_failure = site(&mut program, FailureOperation::ListIndex);
+        let map_index_failure = site(&mut program, FailureOperation::MapIndex);
+        let string_index_failure = site(&mut program, FailureOperation::StringIndex);
+        let output_failure = site(&mut program, FailureOperation::Output);
+        let append_failure = site(&mut program, FailureOperation::ListAppend);
+        let remove_failure = site(&mut program, FailureOperation::MapRemoveKey);
+        let panic_failure = site(&mut program, FailureOperation::ExplicitPanic);
+        let error_failure = site(&mut program, FailureOperation::UnhandledError);
 
         let mut main = Function::new("main", types.int);
         let input = main.add_local(types.int, Some("input".to_owned()), LocalOrigin::Parameter);
@@ -776,8 +838,8 @@ mod tests {
         main.entry = Some(blocks[0]);
         let entry = &mut main.blocks[blocks[0].index()];
         entry.push(OperationKind::Copy { destination: int_temp, operand: Operand::Copy(Place::local(input)) }, location);
-        entry.push(OperationKind::Unary { destination: int_temp, operator: UnaryOperator::Minus, operand: integer(&types, 1) }, location);
-        entry.push(OperationKind::Binary { destination: int_temp, operator: BinaryOperator::Add, left: Operand::Copy(Place::local(input)), right: integer(&types, 1) }, location);
+        entry.push(OperationKind::Unary { destination: int_temp, operator: UnaryOperator::Plus, operand: integer(&types, 1) }, location);
+        entry.push(OperationKind::Binary { destination: int_temp, operator: BinaryOperator::BitwiseAnd, left: Operand::Copy(Place::local(input)), right: integer(&types, 1) }, location);
         entry.push(OperationKind::Convert { destination: float_temp, conversion: NumericConversion::IntToFloat, operand: Operand::Copy(Place::local(input)) }, location);
         entry.push(OperationKind::Aggregate { destination: point_local, aggregate: Aggregate::Struct { definition: point_definition, fields: vec![
             (point_x, Operand::Copy(Place::local(input))),
@@ -791,37 +853,30 @@ mod tests {
         entry.push(OperationKind::UnionInject { destination: choice_local, union_type: choice_type, alternative: choice_a, payload: Operand::Copy(Place::local(input)) }, location);
         entry.push(OperationKind::UnionTest { destination: bool_temp, union: Operand::Copy(Place::local(choice_local)), alternative: choice_a }, location);
         entry.push(OperationKind::UnionPayload { destination: int_temp, union: Operand::Copy(Place::local(choice_local)), alternative: choice_a }, location);
-        entry.push(OperationKind::StringIndex { destination: character_temp, string: Operand::Copy(Place::local(string_local)), index: Operand::Copy(Place::local(index)) }, location);
+        entry.push(OperationKind::StringIndex { destination: character_temp, string: Operand::Copy(Place::local(string_local)), index: Operand::Copy(Place::local(index)), failure: string_index_failure }, location);
         entry.push(OperationKind::Assign { destination: Place::projected(point_local, vec![Projection::StructField { definition: point_definition, field: point_x, storage: MemberStorage::Inline }]), value: integer(&types, 3) }, location);
         entry.push(OperationKind::Copy { destination: int_temp, operand: Operand::Copy(Place::projected(pair_local, vec![Projection::TupleField { definition: pair_definition, field: pair_first }])) }, location);
-        entry.push(OperationKind::Assign { destination: Place::projected(list_local, vec![Projection::ListIndex { index }]), value: integer(&types, 4) }, location);
-        entry.push(OperationKind::Assign { destination: Place::projected(map_local, vec![Projection::MapIndex { key: index }]), value: constant(types.string, ConstantValue::String(b"four".to_vec())) }, location);
+        entry.push(OperationKind::Assign { destination: Place::projected(list_local, vec![Projection::ListIndex { index, failure: list_index_failure }]), value: integer(&types, 4) }, location);
+        entry.push(OperationKind::Assign { destination: Place::projected(map_local, vec![Projection::MapIndex { key: index, failure: map_index_failure }]), value: constant(types.string, ConstantValue::String(b"four".to_vec())) }, location);
         entry.push(OperationKind::Call { destination: int_temp, function: identity_id, arguments: vec![Operand::Copy(Place::local(input))] }, location);
-        entry.push(OperationKind::Intrinsic { destination: unit_temp, intrinsic: Intrinsic::Print, arguments: vec![Operand::Copy(Place::local(pair_local))] }, location);
-        entry.push(OperationKind::Builtin { destination: unit_temp, method: BuiltinMethod::ListAppend, receiver: Operand::Copy(Place::local(list_local)), arguments: vec![integer(&types, 2)] }, location);
-        entry.push(OperationKind::Builtin { destination: int_temp, method: BuiltinMethod::ListLen, receiver: Operand::Copy(Place::local(list_local)), arguments: vec![] }, location);
-        entry.push(OperationKind::Builtin { destination: unit_temp, method: BuiltinMethod::MapRemoveKey, receiver: Operand::Copy(Place::local(map_local)), arguments: vec![integer(&types, 1)] }, location);
-        entry.push(OperationKind::Builtin { destination: int_temp, method: BuiltinMethod::MapLen, receiver: Operand::Copy(Place::local(map_local)), arguments: vec![] }, location);
-        entry.push(OperationKind::Builtin { destination: int_temp, method: BuiltinMethod::StrLen, receiver: Operand::Copy(Place::local(string_local)), arguments: vec![] }, location);
+        entry.push(OperationKind::Intrinsic { destination: unit_temp, intrinsic: Intrinsic::Print, arguments: vec![Operand::Copy(Place::local(pair_local))], failure: output_failure }, location);
+        entry.push(OperationKind::Check(RuntimeCheck::IterationUnlocked { receiver: Operand::Copy(Place::local(list_local)), failure: append_failure }), location);
+        entry.push(OperationKind::Builtin { destination: unit_temp, method: BuiltinMethod::ListAppend, receiver: Operand::Copy(Place::local(list_local)), arguments: vec![integer(&types, 2)], failure: Some(append_failure) }, location);
+        entry.push(OperationKind::Builtin { destination: int_temp, method: BuiltinMethod::ListLen, receiver: Operand::Copy(Place::local(list_local)), arguments: vec![], failure: None }, location);
+        entry.push(OperationKind::Check(RuntimeCheck::IterationUnlocked { receiver: Operand::Copy(Place::local(map_local)), failure: remove_failure }), location);
+        entry.push(OperationKind::Builtin { destination: unit_temp, method: BuiltinMethod::MapRemoveKey, receiver: Operand::Copy(Place::local(map_local)), arguments: vec![integer(&types, 1)], failure: Some(remove_failure) }, location);
+        entry.push(OperationKind::Builtin { destination: int_temp, method: BuiltinMethod::MapLen, receiver: Operand::Copy(Place::local(map_local)), arguments: vec![], failure: None }, location);
+        entry.push(OperationKind::Builtin { destination: int_temp, method: BuiltinMethod::StrLen, receiver: Operand::Copy(Place::local(string_local)), arguments: vec![], failure: None }, location);
         entry.push(OperationKind::BeginIteration { iterable: Operand::Copy(Place::local(list_local)) }, location);
         entry.push(OperationKind::IterationValue { destination: int_temp, iterable: Operand::Copy(Place::local(list_local)), index: Operand::Copy(Place::local(index)) }, location);
         entry.push(OperationKind::EndIteration { iterable: Operand::Copy(Place::local(list_local)) }, location);
-        entry.push(OperationKind::Check(RuntimeCheck::IntegerOverflow { operation: IntegerOperation::Add, left: integer(&types, 1), right: integer(&types, 2) }), location);
-        entry.push(OperationKind::Check(RuntimeCheck::IntegerNegation { operand: Operand::Copy(Place::local(input)) }), location);
-        entry.push(OperationKind::Check(RuntimeCheck::Division { left: Operand::Copy(Place::local(float_temp)), right: constant(types.float, ConstantValue::Float(0)) }), location);
-        entry.push(OperationKind::Check(RuntimeCheck::Remainder { left: integer(&types, 2), right: integer(&types, 1) }), location);
-        entry.push(OperationKind::Check(RuntimeCheck::ShiftRange { amount: Operand::Copy(Place::local(index)) }), location);
-        entry.push(OperationKind::Check(RuntimeCheck::FiniteFloat { operand: Operand::Copy(Place::local(float_temp)) }), location);
-        entry.push(OperationKind::Check(RuntimeCheck::NumericConversion { operand: Operand::Copy(Place::local(float_temp)), conversion: NumericConversion::FloatToInt }), location);
-        entry.push(OperationKind::Check(RuntimeCheck::IndexBounds { collection: Operand::Copy(Place::local(string_local)), index: Operand::Copy(Place::local(index)) }), location);
-        entry.push(OperationKind::Check(RuntimeCheck::MissingMapKey { map: Operand::Copy(Place::local(map_local)), key: Operand::Copy(Place::local(index)) }), location);
         entry.terminate(TerminatorKind::Branch { condition: Operand::Copy(Place::local(bool_temp)), then_block: blocks[1], else_block: blocks[2] }, location);
         main.blocks[blocks[1].index()].terminate(TerminatorKind::Switch { union: Operand::Copy(Place::local(choice_local)), targets: vec![(choice_a, blocks[3]), (choice_b, blocks[4])] }, location);
-        main.blocks[blocks[2].index()].terminate(TerminatorKind::Panic(constant(types.string, ConstantValue::String(b"failed".to_vec()))), location);
+        main.blocks[blocks[2].index()].terminate(TerminatorKind::Panic { message: constant(types.string, ConstantValue::String(b"failed".to_vec())), failure: panic_failure }, location);
         main.blocks[blocks[3].index()].terminate(TerminatorKind::Return(Operand::Copy(Place::local(input))), location);
         main.blocks[blocks[4].index()].terminate(TerminatorKind::Unreachable, location);
         main.blocks[blocks[5].index()].terminate(TerminatorKind::Jump(blocks[3]), location);
-        main.blocks[blocks[6].index()].terminate(TerminatorKind::ErrorPanic(integer(&types, 7)), location);
+        main.blocks[blocks[6].index()].terminate(TerminatorKind::ErrorPanic { payload: integer(&types, 7), failure: error_failure }, location);
         let main_id = program.add_function(main);
         program.entry = Some(main_id);
 
@@ -1004,6 +1059,52 @@ mod tests {
         });
         assert_eq!(program.validate().unwrap_err().message, "constant value does not agree with its type");
     }
+
+    #[test]
+    fn validates_failure_sites_and_required_numeric_check_order() {
+        let (mut program, types, location) = program();
+        let function_id = FunctionId::from_index(0);
+        let failure = program.intern_failure_site(FailureSite {
+            location,
+            function: function_id,
+            operation: FailureOperation::IntegerAdd,
+            line: 1,
+            column: 5,
+        });
+        let mut function = Function::new("main", types.int);
+        let result = function.add_local(types.int, None, LocalOrigin::Temporary);
+        let block = function.add_block();
+        function.entry = Some(block);
+        let left = integer(&types, i64::MIN);
+        let right = integer(&types, 1);
+        function.blocks[block.index()].push(OperationKind::Check(RuntimeCheck::IntegerOverflow {
+            operation: IntegerOperation::Add,
+            left: left.clone(),
+            right: right.clone(),
+            failure,
+        }), location);
+        function.blocks[block.index()].push(OperationKind::Binary {
+            destination: result,
+            operator: BinaryOperator::Add,
+            left,
+            right,
+        }, location);
+        function.blocks[block.index()].terminate(TerminatorKind::Return(Operand::Copy(Place::local(result))), location);
+        let main = program.add_function(function);
+        program.entry = Some(main);
+
+        assert!(program.validate().is_ok());
+        assert!(program.render().contains("fail0 = loc0 fn0 integer-add at 1:5"));
+        assert!(program.render().contains("const ty1 -9223372036854775808"));
+
+        let mut missing_check = program.clone();
+        missing_check.functions[main.index()].blocks[block.index()].operations.remove(0);
+        assert!(missing_check.validate().unwrap_err().message.contains("pre-check"));
+
+        let mut duplicate = program.clone();
+        duplicate.failure_sites.push(duplicate.failure_sites[0]);
+        assert!(duplicate.validate().unwrap_err().message.contains("duplicates"));
+    }
 }
 
 impl<'a> Validator<'a> {
@@ -1031,6 +1132,20 @@ impl<'a> Validator<'a> {
             }
             if program.locations[..index].contains(span) {
                 return Err(self.error(format!("loc{index} duplicates an earlier source location")));
+            }
+        }
+        for (index, failure) in program.failure_sites.iter().enumerate() {
+            if failure.location.index() >= program.locations.len() {
+                return Err(self.error(format!("fail{index} has invalid location {}", failure.location)));
+            }
+            if failure.function.index() >= program.functions.len() {
+                return Err(self.error(format!("fail{index} has invalid function {}", failure.function)));
+            }
+            if failure.line == 0 || failure.column == 0 {
+                return Err(self.error(format!("fail{index} has an invalid line or column")));
+            }
+            if program.failure_sites[..index].iter().any(|earlier| earlier.location == failure.location && earlier.function == failure.function && earlier.operation == failure.operation) {
+                return Err(self.error(format!("fail{index} duplicates an earlier failure site")));
             }
         }
         for (index, ty) in program.types.iter().enumerate() {
@@ -1167,6 +1282,7 @@ impl<'a> Validator<'a> {
                 self.location(operation.location)?;
                 self.validate_operation(function, operation)?;
             }
+            self.validate_check_sequence(function, block)?;
             self.site = Some(OperationSite::Terminator);
             let terminator = block.terminator.as_ref().ok_or_else(|| self.error("block is not terminated"))?;
             self.location(terminator.location)?;
@@ -1174,6 +1290,92 @@ impl<'a> Validator<'a> {
         }
         self.block = None;
         self.site = None;
+        Ok(())
+    }
+
+    fn validate_check_sequence(&self, function: &Function, block: &BasicBlock) -> Result<(), ValidationError> {
+        let int = self.primitive(PrimitiveType::Int)?;
+        let float = self.primitive(PrimitiveType::Float)?;
+        for (index, operation) in block.operations.iter().enumerate() {
+            match &operation.kind {
+                OperationKind::Unary { operator: UnaryOperator::Minus, operand, .. } if self.operand_type(function, operand)? == int => {
+                    if !matches!(index.checked_sub(1).and_then(|i| block.operations.get(i)).map(|op| &op.kind),
+                        Some(OperationKind::Check(RuntimeCheck::IntegerNegation { operand: checked, .. })) if checked == operand)
+                    { return Err(self.error("integer negation lacks its immediately preceding check")); }
+                }
+                OperationKind::Convert { conversion: NumericConversion::FloatToInt, operand, .. } => {
+                    if !matches!(index.checked_sub(1).and_then(|i| block.operations.get(i)).map(|op| &op.kind),
+                        Some(OperationKind::Check(RuntimeCheck::NumericConversion { operand: checked, conversion: NumericConversion::FloatToInt, .. })) if checked == operand)
+                    { return Err(self.error("float-to-int conversion lacks its immediately preceding check")); }
+                }
+                OperationKind::Binary { destination, operator, left, right } => {
+                    let ty = self.operand_type(function, left)?;
+                    let previous = index.checked_sub(1).and_then(|i| block.operations.get(i)).map(|op| &op.kind);
+                    let valid_precheck = match (ty, operator) {
+                        (ty, BinaryOperator::Add) if ty == int => matches!(previous, Some(OperationKind::Check(RuntimeCheck::IntegerOverflow { operation: IntegerOperation::Add, left: a, right: b, .. })) if a == left && b == right),
+                        (ty, BinaryOperator::Subtract) if ty == int => matches!(previous, Some(OperationKind::Check(RuntimeCheck::IntegerOverflow { operation: IntegerOperation::Subtract, left: a, right: b, .. })) if a == left && b == right),
+                        (ty, BinaryOperator::Multiply) if ty == int => matches!(previous, Some(OperationKind::Check(RuntimeCheck::IntegerOverflow { operation: IntegerOperation::Multiply, left: a, right: b, .. })) if a == left && b == right),
+                        (ty, BinaryOperator::Divide) if ty == int || ty == float => matches!(previous, Some(OperationKind::Check(RuntimeCheck::Division { left: a, right: b, .. })) if a == left && b == right),
+                        (ty, BinaryOperator::Remainder) if ty == int => matches!(previous, Some(OperationKind::Check(RuntimeCheck::Remainder { left: a, right: b, .. })) if a == left && b == right),
+                        (ty, BinaryOperator::ShiftRight) if ty == int => matches!(previous, Some(OperationKind::Check(RuntimeCheck::ShiftRange { amount, .. })) if amount == right),
+                        (ty, BinaryOperator::ShiftLeft) if ty == int => matches!(previous, Some(OperationKind::Check(RuntimeCheck::IntegerOverflow { operation: IntegerOperation::ShiftLeft, left: a, right: b, .. })) if a == left && b == right)
+                            && matches!(index.checked_sub(2).and_then(|i| block.operations.get(i)).map(|op| &op.kind), Some(OperationKind::Check(RuntimeCheck::ShiftRange { amount, .. })) if amount == right),
+                        _ => true,
+                    };
+                    if !valid_precheck { return Err(self.error("numeric operation has an invalid or missing pre-check sequence")); }
+                    if ty == float && matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract | BinaryOperator::Multiply | BinaryOperator::Divide) {
+                        let result = Operand::Copy(Place::local(*destination));
+                        let Some(OperationKind::Check(RuntimeCheck::FiniteFloat { operand, failure })) = block.operations.get(index + 1).map(|op| &op.kind) else {
+                            return Err(self.error("float arithmetic lacks its immediately following finite-result check"));
+                        };
+                        if operand != &result { return Err(self.error("float finite-result check names the wrong destination")); }
+                        let expected = match operator { BinaryOperator::Add => FailureOperation::FloatAdd, BinaryOperator::Subtract => FailureOperation::FloatSubtract, BinaryOperator::Multiply => FailureOperation::FloatMultiply, BinaryOperator::Divide => FailureOperation::FloatDivision, _ => unreachable!() };
+                        self.failure_site(*failure, expected)?;
+                    }
+                }
+                OperationKind::Builtin { method, receiver, failure: Some(failure), .. }
+                    if matches!(method, BuiltinMethod::ListAppend | BuiltinMethod::ListRemoveIndex | BuiltinMethod::MapRemoveKey) => {
+                    if !matches!(index.checked_sub(1).and_then(|i| block.operations.get(i)).map(|op| &op.kind),
+                        Some(OperationKind::Check(RuntimeCheck::IterationUnlocked { receiver: checked, failure: site })) if checked == receiver && site == failure)
+                    { return Err(self.error("structural mutation lacks its immediately preceding iteration-lock check")); }
+                }
+                OperationKind::Check(check) => {
+                    let next = block.operations.get(index + 1).map(|op| &op.kind);
+                    let previous = index.checked_sub(1).and_then(|i| block.operations.get(i)).map(|op| &op.kind);
+                    let consumed = match check {
+                        RuntimeCheck::IntegerOverflow { operation, left, right, .. } => matches!(next,
+                            Some(OperationKind::Binary { operator, left: a, right: b, .. })
+                                if a == left && b == right && matches!((operation, operator),
+                                    (IntegerOperation::Add, BinaryOperator::Add)
+                                    | (IntegerOperation::Subtract, BinaryOperator::Subtract)
+                                    | (IntegerOperation::Multiply, BinaryOperator::Multiply)
+                                    | (IntegerOperation::ShiftLeft, BinaryOperator::ShiftLeft))),
+                        RuntimeCheck::IntegerNegation { operand, .. } => matches!(next, Some(OperationKind::Unary { operator: UnaryOperator::Minus, operand: value, .. }) if value == operand),
+                        RuntimeCheck::Division { left, right, .. } => matches!(next, Some(OperationKind::Binary { operator: BinaryOperator::Divide, left: a, right: b, .. }) if a == left && b == right),
+                        RuntimeCheck::Remainder { left, right, .. } => matches!(next, Some(OperationKind::Binary { operator: BinaryOperator::Remainder, left: a, right: b, .. }) if a == left && b == right),
+                        RuntimeCheck::ShiftRange { amount, .. } => matches!(next,
+                            Some(OperationKind::Binary { operator: BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight, right, .. }) if right == amount)
+                            || matches!(next, Some(OperationKind::Check(RuntimeCheck::IntegerOverflow { operation: IntegerOperation::ShiftLeft, right, .. })) if right == amount),
+                        RuntimeCheck::FiniteFloat { operand, .. } => matches!(previous, Some(OperationKind::Binary { destination, .. }) if operand == &Operand::Copy(Place::local(*destination))),
+                        RuntimeCheck::NumericConversion { operand, conversion, .. } => matches!(next, Some(OperationKind::Convert { operand: value, conversion: actual, .. }) if value == operand && actual == conversion),
+                        RuntimeCheck::IterationUnlocked { receiver, failure } => matches!(next, Some(OperationKind::Builtin { receiver: actual, failure: Some(site), .. }) if actual == receiver && site == failure),
+                    };
+                    if !consumed { return Err(self.error("runtime check is not adjacent to its checked operation")); }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn failure_site(&self, id: FailureSiteId, operation: FailureOperation) -> Result<(), ValidationError> {
+        self.failure_site_one_of(id, &[operation])
+    }
+
+    fn failure_site_one_of(&self, id: FailureSiteId, operations: &[FailureOperation]) -> Result<(), ValidationError> {
+        let site = self.program.failure_sites.get(id.index()).ok_or_else(|| self.error(format!("invalid failure-site identity {id}")))?;
+        if Some(site.function) != self.function { return Err(self.error(format!("{id} belongs to a different function"))); }
+        if !operations.contains(&site.operation) { return Err(self.error(format!("{id} operation disagrees with its use"))); }
         Ok(())
     }
 
@@ -1234,9 +1436,10 @@ impl<'a> Validator<'a> {
                 let payload = self.alternative(union_ty, *alternative)?.payload;
                 self.destination(function, *destination, payload, "union payload")
             }
-            StringIndex { destination, string, index } => {
+            StringIndex { destination, string, index, failure } => {
                 self.expect_operand(function, string, self.primitive(PrimitiveType::Str)?, "string index receiver")?;
                 self.expect_operand(function, index, self.primitive(PrimitiveType::Int)?, "string index")?;
+                self.failure_site(*failure, FailureOperation::StringIndex)?;
                 self.destination(function, *destination, self.primitive(PrimitiveType::Char)?, "string index")
             }
             Assign { destination, value } => {
@@ -1252,7 +1455,7 @@ impl<'a> Validator<'a> {
                 }
                 self.destination(function, *destination, callee.result, "call")
             }
-            Intrinsic { destination, intrinsic, arguments } => {
+            Intrinsic { destination, intrinsic, arguments, failure } => {
                 let unit = self.primitive_or_unit(Type::Unit)?;
                 match intrinsic {
                     self::Intrinsic::Print if arguments.len() == 1 => {
@@ -1267,9 +1470,15 @@ impl<'a> Validator<'a> {
                     }
                     _ => return Err(self.error("intrinsic argument count does not match signature")),
                 }
+                self.failure_site(*failure, FailureOperation::Output)?;
+                if self.program.failure_sites[failure.index()].location != operation.location { return Err(self.error("output failure site has the wrong source location")); }
                 self.destination(function, *destination, unit, "intrinsic call")
             }
-            Builtin { destination, method, receiver, arguments } => self.validate_builtin(function, *destination, *method, receiver, arguments),
+            Builtin { destination, method, receiver, arguments, failure } => {
+                self.validate_builtin(function, *destination, *method, receiver, arguments, *failure)?;
+                if let Some(failure) = failure && self.program.failure_sites[failure.index()].location != operation.location { return Err(self.error("built-in failure site has the wrong source location")); }
+                Ok(())
+            }
             BeginIteration { iterable } | EndIteration { iterable } => {
                 let ty = self.operand_type(function, iterable)?;
                 if !matches!(self.ty(ty)?, Type::List(_) | Type::Map { .. }) {
@@ -1287,7 +1496,11 @@ impl<'a> Validator<'a> {
                 self.expect_operand(function, index, self.primitive(PrimitiveType::Int)?, "iteration index")?;
                 self.destination(function, *destination, result, "iteration value")
             }
-            Check(check) => self.validate_check(function, check),
+            Check(check) => {
+                self.validate_check(function, check)?;
+                if self.program.failure_sites[runtime_check_failure(check).index()].location != operation.location { return Err(self.error("runtime check failure site has the wrong source location")); }
+                Ok(())
+            }
         }
     }
 
@@ -1326,7 +1539,7 @@ impl<'a> Validator<'a> {
         }
     }
 
-    fn validate_builtin(&self, function: &Function, destination: LocalId, method: BuiltinMethod, receiver: &Operand, arguments: &[Operand]) -> Result<(), ValidationError> {
+    fn validate_builtin(&self, function: &Function, destination: LocalId, method: BuiltinMethod, receiver: &Operand, arguments: &[Operand], failure: Option<FailureSiteId>) -> Result<(), ValidationError> {
         let receiver_ty = self.operand_type(function, receiver)?;
         let unit = self.primitive_or_unit(Type::Unit)?;
         let int = self.primitive(PrimitiveType::Int)?;
@@ -1339,42 +1552,62 @@ impl<'a> Validator<'a> {
             (BuiltinMethod::StrLen, Type::Primitive(PrimitiveType::Str), []) => int,
             _ => return Err(self.error("built-in receiver or arguments do not match its signature")),
         };
+        let expected_failure = match method {
+            BuiltinMethod::ListAppend => Some(FailureOperation::ListAppend),
+            BuiltinMethod::ListRemoveIndex => Some(FailureOperation::ListRemoveIndex),
+            BuiltinMethod::MapRemoveKey => Some(FailureOperation::MapRemoveKey),
+            BuiltinMethod::ListLen | BuiltinMethod::MapLen | BuiltinMethod::StrLen => None,
+        };
+        match (failure, expected_failure) {
+            (Some(site), Some(operation)) => { self.failure_site(site, operation)?; }
+            (None, None) => {}
+            _ => return Err(self.error("built-in failure attribution does not match its operation")),
+        }
         self.destination(function, destination, result, "built-in call")
     }
 
     fn validate_check(&self, function: &Function, check: &RuntimeCheck) -> Result<(), ValidationError> {
         let int = self.primitive(PrimitiveType::Int)?;
+        let (failure, allowed): (FailureSiteId, &[FailureOperation]) = match check {
+            RuntimeCheck::IntegerOverflow { operation, failure, .. } => (*failure, match operation {
+                IntegerOperation::Add => &[FailureOperation::IntegerAdd], IntegerOperation::Subtract => &[FailureOperation::IntegerSubtract],
+                IntegerOperation::Multiply => &[FailureOperation::IntegerMultiply], IntegerOperation::ShiftLeft => &[FailureOperation::ShiftLeft],
+            }),
+            RuntimeCheck::IntegerNegation { failure, .. } => (*failure, &[FailureOperation::IntegerNegation]),
+            RuntimeCheck::Division { failure, .. } => (*failure, &[FailureOperation::IntegerDivision, FailureOperation::FloatDivision]),
+            RuntimeCheck::Remainder { failure, .. } => (*failure, &[FailureOperation::IntegerRemainder]),
+            RuntimeCheck::ShiftRange { failure, .. } => (*failure, &[FailureOperation::ShiftLeft, FailureOperation::ShiftRight]),
+            RuntimeCheck::FiniteFloat { failure, .. } => (*failure, &[FailureOperation::FloatAdd, FailureOperation::FloatSubtract, FailureOperation::FloatMultiply, FailureOperation::FloatDivision]),
+            RuntimeCheck::NumericConversion { failure, .. } => (*failure, &[FailureOperation::FloatToInt]),
+            RuntimeCheck::IterationUnlocked { failure, .. } => (*failure, &[FailureOperation::ListAppend, FailureOperation::ListRemoveIndex, FailureOperation::MapRemoveKey]),
+        };
+        self.failure_site_one_of(failure, allowed)?;
         match check {
             RuntimeCheck::IntegerOverflow { left, right, .. } => {
                 self.expect_operand(function, left, int, "overflow operand")?;
                 self.expect_operand(function, right, int, "overflow operand")
             }
-            RuntimeCheck::IntegerNegation { operand } | RuntimeCheck::ShiftRange { amount: operand } => self.expect_operand(function, operand, int, "integer check operand"),
-            RuntimeCheck::Division { left, right } => {
+            RuntimeCheck::IntegerNegation { operand, .. } | RuntimeCheck::ShiftRange { amount: operand, .. } => self.expect_operand(function, operand, int, "integer check operand"),
+            RuntimeCheck::Division { left, right, .. } => {
                 let ty = self.operand_type(function, left)?;
                 if !self.is_numeric(ty) { return Err(self.error("division check operand is not numeric")); }
+                let RuntimeCheck::Division { failure, .. } = check else { unreachable!() };
+                self.failure_site(*failure, if ty == int { FailureOperation::IntegerDivision } else { FailureOperation::FloatDivision })?;
                 self.expect_operand(function, right, ty, "division check operand")
             }
-            RuntimeCheck::Remainder { left, right } => {
+            RuntimeCheck::Remainder { left, right, .. } => {
                 self.expect_operand(function, left, int, "remainder operand")?;
                 self.expect_operand(function, right, int, "remainder operand")
             }
-            RuntimeCheck::FiniteFloat { operand } => self.expect_operand(function, operand, self.primitive(PrimitiveType::Float)?, "finite-float operand"),
-            RuntimeCheck::NumericConversion { operand, conversion } => {
+            RuntimeCheck::FiniteFloat { operand, .. } => self.expect_operand(function, operand, self.primitive(PrimitiveType::Float)?, "finite-float operand"),
+            RuntimeCheck::NumericConversion { operand, conversion, .. } => {
                 let source = self.operand_type(function, operand)?;
                 self.conversion_result(*conversion, source).map(|_| ())
             }
-            RuntimeCheck::IndexBounds { collection, index } => {
-                let collection_ty = self.operand_type(function, collection)?;
-                if !matches!(self.ty(collection_ty)?, Type::List(_) | Type::Primitive(PrimitiveType::Str)) {
-                    return Err(self.error("bounds check collection is not a list or string"));
-                }
-                self.expect_operand(function, index, int, "bounds index")
-            }
-            RuntimeCheck::MissingMapKey { map, key } => {
-                let map_ty = self.operand_type(function, map)?;
-                let Type::Map { key: expected, .. } = self.ty(map_ty)? else { return Err(self.error("missing-key check operand is not a map")); };
-                self.expect_operand(function, key, *expected, "map key")
+            RuntimeCheck::IterationUnlocked { receiver, .. } => {
+                let ty = self.operand_type(function, receiver)?;
+                if matches!(self.ty(ty)?, Type::List(_) | Type::Map { .. }) { Ok(()) }
+                else { Err(self.error("iteration-lock check receiver is not a list or map")) }
             }
         }
     }
@@ -1399,8 +1632,14 @@ impl<'a> Validator<'a> {
                 Ok(())
             }
             TerminatorKind::Return(value) => self.expect_operand(function, value, function.result, "return value"),
-            TerminatorKind::Panic(message) => self.expect_operand(function, message, self.primitive(PrimitiveType::Str)?, "panic message"),
-            TerminatorKind::ErrorPanic(payload) => {
+            TerminatorKind::Panic { message, failure } => {
+                self.failure_site(*failure, FailureOperation::ExplicitPanic)?;
+                if self.program.failure_sites[failure.index()].location != terminator.location { return Err(self.error("panic failure site has the wrong source location")); }
+                self.expect_operand(function, message, self.primitive(PrimitiveType::Str)?, "panic message")
+            }
+            TerminatorKind::ErrorPanic { payload, failure } => {
+                self.failure_site(*failure, FailureOperation::UnhandledError)?;
+                if self.program.failure_sites[failure.index()].location != terminator.location { return Err(self.error("Error panic failure site has the wrong source location")); }
                 let ty = self.operand_type(function, payload)?;
                 if matches!(self.ty(ty)?, Type::Primitive(_)) { Ok(()) } else { Err(self.error("Error panic payload is not primitive")) }
             }
@@ -1442,14 +1681,16 @@ impl<'a> Validator<'a> {
                     let DefinitionLayout::Tuple(fields) = &self.definition(*definition)?.layout else { return Err(self.error("tuple projection names a non-tuple definition")); };
                     *fields.get(field.index()).ok_or_else(|| self.error(format!("invalid field identity {field}")))?
                 }
-                Projection::ListIndex { index } => {
+                Projection::ListIndex { index, failure } => {
                     self.expect_local(function, *index, self.primitive(PrimitiveType::Int)?, "list index")?;
+                    self.failure_site(*failure, FailureOperation::ListIndex)?;
                     let Type::List(element) = self.ty(current)? else { return Err(self.error("list-index projection is applied to a non-list")); };
                     *element
                 }
-                Projection::MapIndex { key } => {
+                Projection::MapIndex { key, failure } => {
                     let Type::Map { key: expected, value } = self.ty(current)? else { return Err(self.error("map-index projection is applied to a non-map")); };
                     self.expect_local(function, *key, *expected, "map key")?;
+                    self.failure_site(*failure, FailureOperation::MapIndex)?;
                     *value
                 }
             };
