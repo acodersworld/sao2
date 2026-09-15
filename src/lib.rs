@@ -3,6 +3,8 @@
 #[allow(dead_code)]
 mod analysis;
 mod ast;
+#[allow(dead_code)]
+mod c_backend;
 mod c_emitter;
 mod cli;
 mod compiler;
