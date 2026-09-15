@@ -746,17 +746,138 @@ source construct remains pending lowering.
 
 ## Stage 5: Runtime checks and source locations
 
-Make every required integer overflow, negation, division, remainder, shift,
-float validity, numeric conversion, list or string bounds, and missing-map-key
-failure explicit in evaluation order. Before each structural list or map
-mutation, add an explicit check which panics when the underlying container's
-iteration-lock count is nonzero. Intern compact location IDs that map each
-runtime failure back to its source file, byte span, operation, and enclosing
-function. Keep failure operations target-independent rather than encoding C
-helpers in the core IR.
+Make every required numeric, indexing, missing-key, and structural-mutation
+failure explicit in evaluation order. Keep these operations target-independent:
+the IR records SAO2 semantics and failure attribution rather than C helpers,
+physical container layouts, or host arithmetic behavior.
 
-Exit criterion: all specified runtime failure points are represented explicitly
-and every such operation has a valid compact source location.
+### Compact failure sites
+
+Add `FailureSiteId` as an identity separate from the existing `LocationId` used
+for general operation provenance. Intern an owned failure-site table in first
+lowering order. Each entry contains an existing source location, the enclosing
+`FunctionId`, and a target-independent source operation. The program's source
+metadata supplies the filename. Deduplicate only an identical location,
+function, and operation tuple, so multiple checks belonging to one source
+operation share an ID without conflating equal spans in different functions or
+different operations at one span.
+
+Attach a failure site to every explicit runtime check and to each presently
+panic-capable IR operation: checked list, map, and string access, structural
+built-ins, output intrinsics, explicit `Panic`, and `ErrorPanic`. Use operation
+kinds such as integer addition, float division, list indexing, map removal,
+output, explicit panic, and unhandled Error; do not record backend helper names.
+
+Use the source operator span for unary, binary, shift, and compound-assignment
+failures; the complete conversion expression for float-to-int; the index
+expression or assignment suffix for indexing; the complete call for built-ins,
+output, and explicit panic; and the recorded `?` operator for unhandled Error.
+Render the failure-site table deterministically alongside ordinary locations.
+
+### Checked numeric operations
+
+Emit checks against already-lowered operands so no source expression is
+reevaluated:
+
+- Before integer `+`, `-`, and `*`, check that the mathematical result is in the
+  signed 64-bit range.
+- Before integer unary `-`, reject negation of the signed minimum.
+- Before integer `/`, reject zero and `MIN / -1`; before integer `%`, reject
+  zero and `MIN % -1`.
+- Before either shift, require a count in `0..=63`. For left shift, perform its
+  overflow check after the range check and before the binary operation. Right
+  shift needs no result-overflow check.
+- Before float division, reject either positive or negative zero. After float
+  `+`, `-`, `*`, or `/`, check the destination temporary and panic if it is
+  infinity or NaN. IEEE underflow, subnormal results, and zero remain valid.
+- Before float-to-int conversion, require a value whose truncation toward zero
+  is representable as an `int`. Int-to-float is always finite and needs no
+  check.
+
+Route ordinary binary expressions and compound assignments through the same
+typed check-emission helpers. Compound operations use their assignment-operator
+span. Keep bitwise operations, comparisons, unary plus, integer-to-float, and
+finite float negation free of unnecessary checks.
+
+Represent semantic integer constants as signed `i64` rather than unsigned
+source magnitudes. Lower the syntactic special case
+`-9223372036854775808` directly to `i64::MIN`, without first constructing an
+unrepresentable positive value or emitting a spurious negation failure. A
+subsequent negation of that value is checked normally.
+
+### Atomic container access
+
+Keep list and string indices as their original signed `int` values. The runtime
+operation which performs an access owns negative-index interpretation, bounds
+checking, and failure atomically against the container's current length:
+negative indices add the current length, and the access panics unless the
+resolved position lies in `0..length`. Do not expose a normalized physical
+index or container layout in core IR.
+
+Make checked access explicit by adding a `FailureSiteId` to list and map place
+projections and to `StringIndex`. A list projection checks bounds whenever the
+containing place is actually read or written. A map projection checks that its
+key exists at that same point. This naturally checks a compound assignment once
+for its pre-right-hand-side read and again for its post-right-hand-side write,
+which remains correct if an intervening call mutates an aliased container.
+Simple assignment checks at the final write after the right-hand value has been
+evaluated. Preserve the existing rule that receiver, index or key expressions,
+and right-hand operands themselves are each evaluated once from left to right.
+
+Give `ListRemoveIndex` the raw signed index and make bounds checking and negative
+index interpretation part of that runtime operation. Make missing-key checking
+part of `MapRemoveKey`. A removal operation uses one source failure site for
+both its access failure and its iteration-lock failure while retaining distinct
+failure/check kinds and eventual panic messages.
+
+### Structural mutation during iteration
+
+After evaluating and stabilizing a built-in receiver and its arguments, emit an
+`IterationUnlocked` check immediately before each structural mutation:
+`ListAppend`, `ListRemoveIndex`, and `MapRemoveKey`. The check inspects the
+actual receiver object's internal iteration-lock count and panics when it is
+nonzero, so aliases and calls cannot evade it. Perform the lock check before a
+removal's bounds or missing-key work. List and map element replacement is not
+structural and receives only its normal bounds or key check.
+
+### Validation, tests, and completion
+
+Extend whole-program validation to reject invalid or duplicate failure-site
+entries, invalid location or function identities, and a failure-site operation
+which disagrees with its referencing check or operation. Validate the complete
+required check sequence around each failure-capable numeric operation,
+including pre-check order and the post-result finite-float check. Reject list,
+map, or string accesses without compatible failure sites; structural mutations
+without an immediately preceding lock check over the same receiver; removal
+operations without access-failure attribution; and panic-capable terminators or
+output intrinsics without failure sites.
+
+Add IR and lowering tests covering:
+
+- every integer failure class, shift boundaries, signed-minimum literals and
+  negation, ordinary arithmetic, and compound arithmetic;
+- float division by both zero representations, non-finite results, allowed
+  underflow, and float-to-int limits;
+- positive, negative, empty, and out-of-range list and string indices;
+- missing map keys on reads, replacements, compound assignments, and removal;
+- compound indexed assignments checking both their read and write, including
+  an intervening call which may mutate an alias;
+- direct, nested, and aliased structural mutations during one or more active
+  iterations;
+- deterministic failure-site interning and rendering with exact source span,
+  operation, and enclosing function; and
+- deliberately corrupted operand types, check order, failure-site references,
+  operation attribution, and mutation receiver relationships.
+
+Keep existing frontend diagnostics, warnings, semantic handoff, temporary C
+backend, compiler tests, and executable tests unchanged. Contributor guidance
+prohibits compiling, running tests, or formatting during implementation.
+
+Exit criterion: every currently specified numeric, container-access,
+missing-key, output, explicit-panic, unhandled-Error, and iteration-lock failure
+is target-independently represented at its exact evaluation point; every such
+operation has a valid compact failure site; and no unchecked host-language
+arithmetic or container access is required to recover SAO2 semantics.
 
 ## Stage 6: Pipeline integration and handoff
 
