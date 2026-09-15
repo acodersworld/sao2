@@ -381,12 +381,26 @@ impl<'source> Parser<'source> {
     }
 
     fn parse_block_item(&mut self) -> Result<BlockItem, Diagnostic> {
+        if self.at(&TokenKind::If) {
+            let checkpoint = self.current;
+            let diagnostic_checkpoint = self.diagnostics.len();
+            if let Ok(statement) = self.parse_if_statement() {
+                return Ok(BlockItem::Statement(statement));
+            }
+            self.current = checkpoint;
+            self.diagnostics.truncate(diagnostic_checkpoint);
+            return self.parse_expression_block_item();
+        }
         if self.at_non_expression_statement_start()
             || (self.at(&TokenKind::Identifier) && self.at_next(&TokenKind::Declare))
         {
             return self.parse_statement().map(BlockItem::Statement);
         }
 
+        self.parse_expression_block_item()
+    }
+
+    fn parse_expression_block_item(&mut self) -> Result<BlockItem, Diagnostic> {
         let expression = self.parse_expression()?;
         if let Some((operator, operator_span)) = self.take_assignment_operator() {
             return self
@@ -1974,6 +1988,24 @@ mod tests {
             panic!("expected local declaration");
         };
         assert!(matches!(initializer.kind, ExpressionKind::If { .. }));
+    }
+
+    #[test]
+    fn distinguishes_final_if_expressions_from_if_statements() {
+        let function = function_declaration("fn f() int { if condition: yes else: no }");
+        assert!(function.body.statements.is_empty());
+        assert!(matches!(
+            function.body.value.as_deref().map(|value| &value.kind),
+            Some(ExpressionKind::If { .. })
+        ));
+
+        let function = function_declaration("fn f() { if condition: yes; else: no; }");
+        assert_eq!(function.body.statements.len(), 1);
+        assert!(matches!(
+            function.body.statements[0].kind,
+            StatementKind::If { .. }
+        ));
+        assert!(function.body.value.is_none());
     }
 
     #[test]

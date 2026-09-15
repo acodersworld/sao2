@@ -1,5 +1,5 @@
-// Walking skeleton: milestone 5 supplies a complete semantic proof to the
-// deliberately limited milestone 4 temporary backend.
+// Walking skeleton: milestone 6 constructs and retains validated typed IR while
+// the deliberately limited milestone 4 backend remains active until milestone 7.
 #[allow(dead_code)]
 mod analysis;
 mod ast;

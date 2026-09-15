@@ -1,8 +1,9 @@
 //! Owned typed control-flow IR.
 //!
-//! This module remains intentionally disconnected from the compiler pipeline
-//! until milestone 6, stage 6. It is the owned construction boundary used by
-//! lowering; consequently none of its values borrow the frontend.
+//! Lowering is the sole owned construction boundary for this IR. Milestone 6
+//! validates and retains it alongside the temporary resolved-AST backend;
+//! milestone 7 replaces that backend with IR-based C generation. No IR value
+//! borrows the frontend.
 
 use std::collections::HashSet;
 use std::fmt::{self, Write as _};

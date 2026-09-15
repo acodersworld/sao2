@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use crate::analysis;
 use crate::c_emitter;
 use crate::diagnostic::{Diagnostic, Diagnostics, Warnings};
+use crate::ir;
+use crate::lowering::{self, LoweringError};
 use crate::parser;
 use crate::semantic::{self, SemanticResult};
 use crate::source::SourceFile;
@@ -64,9 +66,10 @@ impl fmt::Display for CompileError {
 }
 
 /// Stable orchestration boundary from loaded SAO2 source through parsing,
-/// name-and-type analysis, semantic analysis, and checked semantic handoff to
-/// generated C. The analyzed-AST-to-C subset remains temporary until the typed
-/// backend replaces it.
+/// name-and-type analysis, semantic analysis, checked semantic handoff, and
+/// typed-IR lowering to generated C. Milestone 6 retains the validated IR
+/// alongside the temporary analyzed-AST backend; milestone 7 replaces that
+/// backend with IR-based C generation.
 pub(crate) fn compile(source: &SourceFile) -> Result<CompileOutput, CompileFailure> {
     compile_into(source, Path::new("build"))
 }
@@ -75,13 +78,23 @@ fn compile_into(
     source: &SourceFile,
     build_directory: &Path,
 ) -> Result<CompileOutput, CompileFailure> {
-    compile_into_with_semantic(source, build_directory, |_| {})
+    compile_into_with_pipeline(source, build_directory, |_| {}, || Ok(()), |_| {})
 }
 
 fn compile_into_with_semantic(
     source: &SourceFile,
     build_directory: &Path,
     inject: impl for<'ast> FnOnce(&mut SemanticResult<'ast>),
+) -> Result<CompileOutput, CompileFailure> {
+    compile_into_with_pipeline(source, build_directory, inject, || Ok(()), |_| {})
+}
+
+fn compile_into_with_pipeline(
+    source: &SourceFile,
+    build_directory: &Path,
+    inject_semantic: impl for<'ast> FnOnce(&mut SemanticResult<'ast>),
+    inject_lowering_failure: impl FnOnce() -> Result<(), LoweringError>,
+    inject_ir: impl FnOnce(&mut ir::Program),
 ) -> Result<CompileOutput, CompileFailure> {
     let program = parser::parse(source).map_err(|diagnostics| CompileFailure {
         error: CompileError::SourceDiagnostics(diagnostics),
@@ -95,7 +108,7 @@ fn compile_into_with_semantic(
         });
     }
     let mut semantic = semantic::analyze(&mut analysis);
-    inject(&mut semantic);
+    inject_semantic(&mut semantic);
     if !semantic.diagnostics.is_empty() {
         return Err(CompileFailure {
             error: CompileError::SourceDiagnostics(semantic.diagnostics),
@@ -105,6 +118,34 @@ fn compile_into_with_semantic(
     if let Err(error) = semantic::validate_handoff(&analysis, &semantic) {
         return Err(CompileFailure {
             error: CompileError::Diagnostic(error),
+            warnings: semantic.warnings,
+        });
+    }
+    let mut ir_program = match lowering::lower(&analysis, &semantic) {
+        Ok(program) => program,
+        Err(error) => {
+            return Err(CompileFailure {
+                error: CompileError::Diagnostic(Diagnostic::compiler(format!(
+                    "typed IR lowering boundary failed: {error}"
+                ))),
+                warnings: semantic.warnings,
+            });
+        }
+    };
+    if let Err(error) = inject_lowering_failure() {
+        return Err(CompileFailure {
+            error: CompileError::Diagnostic(Diagnostic::compiler(format!(
+                "typed IR lowering boundary failed: {error}"
+            ))),
+            warnings: semantic.warnings,
+        });
+    }
+    inject_ir(&mut ir_program);
+    if let Err(error) = ir_program.validate() {
+        return Err(CompileFailure {
+            error: CompileError::Diagnostic(Diagnostic::compiler(format!(
+                "post-lowering IR validation boundary failed: {error}"
+            ))),
             warnings: semantic.warnings,
         });
     }
@@ -146,6 +187,7 @@ fn compile_into_with_semantic(
             warnings: semantic.warnings,
         });
     }
+    drop(ir_program);
     Ok(CompileOutput {
         generated_c: output_path,
         warnings: semantic.warnings,
@@ -159,6 +201,22 @@ fn compile_into_with_semantic_result(
     inject: impl for<'ast> FnOnce(&mut SemanticResult<'ast>),
 ) -> Result<CompileOutput, CompileFailure> {
     compile_into_with_semantic(source, build_directory, inject)
+}
+
+#[cfg(test)]
+fn compile_into_with_invariants(
+    source: &SourceFile,
+    build_directory: &Path,
+    inject_lowering_failure: impl FnOnce() -> Result<(), LoweringError>,
+    inject_ir: impl FnOnce(&mut ir::Program),
+) -> Result<CompileOutput, CompileFailure> {
+    compile_into_with_pipeline(
+        source,
+        build_directory,
+        |_| {},
+        inject_lowering_failure,
+        inject_ir,
+    )
 }
 
 #[cfg(test)]
@@ -203,6 +261,30 @@ mod tests {
             "int64_t sao2_binding_1 = (sao2_binding_0 * INT64_C(3));"
         ));
         assert!(output.contains("sao2_binding_1 += INT64_C(1);"));
+        fs::remove_dir_all(build_directory).unwrap();
+    }
+
+    #[test]
+    fn typed_lowering_preserves_temporary_backend_output_byte_for_byte() {
+        let source = source("fn main() int { value := 6 * 7; println(value); value }");
+        let syntax = parser::parse(&source).unwrap();
+        let mut analysis = analysis::analyze(&source, &syntax);
+        assert!(analysis.diagnostics.is_empty());
+        let semantic = semantic::analyze(&mut analysis);
+        assert!(semantic.diagnostics.is_empty());
+        semantic::validate_handoff(&analysis, &semantic).unwrap();
+        let entry = semantic.entry_point.unwrap();
+        let expected = c_emitter::emit(
+            &source,
+            &syntax,
+            &analysis,
+            analysis.function_signature(entry.function_id()),
+        )
+        .unwrap();
+
+        let build_directory = temporary_directory("lowered-identical-c");
+        let output_path = compile_into(&source, &build_directory).unwrap().generated_c;
+        assert_eq!(fs::read_to_string(&output_path).unwrap(), expected);
         fs::remove_dir_all(build_directory).unwrap();
     }
 
@@ -262,6 +344,31 @@ mod tests {
                 diagnostic.contains(expected),
                 "{text}: {diagnostic}"
             );
+        }
+    }
+
+    #[test]
+    fn complete_language_forms_lower_before_the_temporary_backend_boundary() {
+        for text in [
+            concat!(
+                "fn main() int { var total := 0; while total < 2 { total += 1; } ",
+                "if total == 2: total else: 0 }"
+            ),
+            concat!(
+                "type Result(Value(int) | Error(str)); ",
+                "fn main() { result := Result.Value(1); result?; }"
+            ),
+            concat!(
+                "fn main() int { var values := [8]; var table := {0: 2}; ",
+                "values[0] / table[0] }"
+            ),
+        ] {
+            let build_directory = temporary_directory("lower-before-backend");
+            let failure = compile_into(&source(text), &build_directory).unwrap_err();
+            assert!(failure.to_string().contains("temporary backend"), "{failure}");
+            assert!(!failure.to_string().contains("lowering boundary"), "{failure}");
+            assert!(!failure.to_string().contains("invalid IR"), "{failure}");
+            assert!(!build_directory.exists());
         }
     }
 
@@ -450,6 +557,51 @@ mod tests {
                 assert!(!build_directory.exists());
             }
         }
+    }
+
+    #[test]
+    fn lowering_invariants_are_compiler_failures_and_preserve_warnings_and_output() {
+        let source = source("fn main() int { return 1; after := 2; }");
+        let build_directory = temporary_directory("lowering-invariant");
+        fs::create_dir(&build_directory).unwrap();
+        let output_path = build_directory.join("program.c");
+        fs::write(&output_path, "existing generated C").unwrap();
+
+        let failure = compile_into_with_invariants(
+            &source,
+            &build_directory,
+            || Err(LoweringError::Invariant("synthetic fn0 lowering context".to_owned())),
+            |_| {},
+        )
+        .unwrap_err();
+
+        assert!(failure.to_string().contains("compiler error"));
+        assert!(failure.to_string().contains("typed IR lowering boundary"));
+        assert!(failure.to_string().contains("fn0 lowering context"));
+        assert!(failure.warnings.to_string().contains("unreachable source"));
+        assert_eq!(fs::read_to_string(&output_path).unwrap(), "existing generated C");
+        fs::remove_dir_all(build_directory).unwrap();
+    }
+
+    #[test]
+    fn post_lowering_validation_invariants_preserve_context_and_do_not_write() {
+        let source = source("fn main() int { return 1; after := 2; }");
+        let build_directory = temporary_directory("ir-validation-invariant");
+
+        let failure = compile_into_with_invariants(
+            &source,
+            &build_directory,
+            || Ok(()),
+            |program| program.functions[0].blocks[0].terminator = None,
+        )
+        .unwrap_err();
+
+        let rendered = failure.to_string();
+        assert!(rendered.contains("compiler error"));
+        assert!(rendered.contains("post-lowering IR validation boundary"));
+        assert!(rendered.contains("invalid IR in fn0 bb0"));
+        assert!(failure.warnings.to_string().contains("unreachable source"));
+        assert!(!build_directory.exists());
     }
 
     #[test]

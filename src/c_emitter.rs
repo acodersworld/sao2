@@ -1,7 +1,8 @@
 //! Temporary direct C emitter over the analyzed AST.
 //!
 //! It supports the milestone-4 primitive subset directly over resolved syntax.
-//! Milestone 6 replaces this emitter with typed-IR lowering.
+//! Milestone 6 retains validated typed IR alongside this emitter; milestone 7
+//! replaces it with IR-based C generation.
 
 use std::fmt::Write;
 

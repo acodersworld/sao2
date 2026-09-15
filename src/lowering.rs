@@ -67,6 +67,9 @@ impl<'a, 'source, 'ast> Lowerer<'a, 'source, 'ast> {
         self.reserve_definitions();
         let type_ids = self.analysis.types.iter().map(|(ty, _)| ty).collect::<Vec<_>>();
         for ty in type_ids { self.map_type(ty)?; }
+        for definition in &self.definitions {
+            self.program.intern_type(ir::Type::Nominal(*definition));
+        }
         self.complete_definitions()?;
         self.reserve_functions()?;
         self.program.entry = self.semantic.entry_point.and_then(|entry| self.functions.get(entry.function_id().index()).copied());
@@ -1374,6 +1377,18 @@ mod tests {
         assert_eq!(first.render(), second.render());
         assert!(first.render().contains("inject"));
         assert!(first.render().contains("int-to-float"));
+    }
+
+    #[test]
+    fn lowers_an_unused_nominal_definition_with_its_canonical_type() {
+        let program = lower_text("type Number(int); fn main() { print(\"x\"); }")
+            .expect("unused nominal definitions must lower");
+        assert!(
+            program
+                .types
+                .contains(&ir::Type::Nominal(ir::DefinitionId::from_index(0)))
+        );
+        assert!(program.validate().is_ok());
     }
 
     #[test]
