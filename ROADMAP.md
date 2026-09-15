@@ -105,7 +105,7 @@ Outcome: every accepted program is type-correct and ready for lowering.
 
 ## 6. Typed intermediate representation
 
-Status: current.
+Status: complete.
 
 - Lower the syntax tree into a small typed IR.
 - Make evaluation order, temporary values, and control-flow edges explicit.
@@ -120,6 +120,8 @@ Outcome: language semantics no longer depend on source-level syntax or C
 evaluation details.
 
 ## 7. Complete core C backend
+
+Status: current.
 
 - Replace the temporary direct C emitter with typed-IR-based generation.
 - Emit C declarations for primitive, tuple, union, and function types.

@@ -1,6 +1,6 @@
 # Current Work: Typed Intermediate Representation
 
-Status: in progress.
+Status: complete.
 
 This document expands milestone 6 of `ROADMAP.md`. The objective is to lower a
 validated frontend result into a small, owned, typed control-flow IR before the
