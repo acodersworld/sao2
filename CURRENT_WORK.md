@@ -14,17 +14,56 @@ tuple value operations. Milestone 7 does not change the public CLI or
 
 ## Stage 1: Backend contract and C type model
 
-Replace the temporary emitter with an IR-only construction boundary:
+Add a new private `c_backend` module with an IR-only construction boundary:
 
 ```text
 emit(&ir::Program) -> Result<String, CEmissionError>
 ```
 
-Validate the IR at the boundary. Report deterministic failures with the
-function, block, operation, terminator, or identity context retained by the IR.
-Use stable identity-derived C names rather than source spelling, and render the
-complete translation unit in memory before the caller performs filesystem
-writes.
+Keep the current `c_emitter` and its production compiler call unchanged until
+Stage 5. The new module remains disconnected from production so the walking
+skeleton continues to work while the IR backend is built.
+
+Run `Program::validate` first, followed by capability validation, layout
+planning, and rendering. Never return partial C. Define owned errors for invalid
+input IR, unsupported post-milestone features, and backend invariants such as
+impossible or cyclic layouts. Preserve the context already available from the
+IR: type or definition identity, then function, block, operation, or terminator
+where applicable. When Stage 5 connects the backend, all of these become
+compiler diagnostics rather than new language errors.
+
+### Capability classification
+
+Define the complete milestone-7 capability boundary now, even though later
+stages implement the operation bodies.
+
+- Accept scalar storage for unit, `int`, `float`, `bool`, `char`, and the
+  temporary Stage-7 string slice.
+- Accept tuple declarations and scalar-payload named or anonymous union
+  declarations.
+- Accept function signatures composed of supported scalar, tuple, and union C
+  types.
+- Reserve the validated entry `[str]` parameter for the temporary borrowed-argv
+  ABI. Reject every other list or map signature or local.
+- Accept scalar operations, direct calls, explicit control flow, runtime checks,
+  compatible output and panic operations, and supported union operations.
+- Reject struct definitions, container storage and operations, tuple
+  construction and projection, string indexing and comparison, unsupported
+  printing, and actual use of the entry `args` parameter.
+
+Scan definitions, functions, locals, blocks, operations, and terminators in
+table order and stop at the first error. Do not reject an otherwise supported
+signature merely because Stage 1 has not emitted its body yet.
+
+### C ABI and layout planning
+
+Emit standard headers in fixed order: `<stdbool.h>`, `<stddef.h>`, and
+`<stdint.h>`. Define these fixed helper types:
+
+- a concrete one-byte `sao2_unit`;
+- `{ const unsigned char *bytes; size_t length; }` for the temporary string
+  slice; and
+- `{ int count; char **values; }` for the temporary borrowed-argv view.
 
 Map core types to fixed C representations:
 
@@ -32,37 +71,74 @@ Map core types to fixed C representations:
 - `float` uses `double`;
 - `bool` uses `bool`;
 - `char` uses `uint8_t`; and
-- unit uses a concrete generated struct so it remains a complete C type.
+- unit uses `sao2_unit`;
+- nominal tuples and unions use `sao2_def_<DefinitionId>`; and
+- anonymous unions use `sao2_union_ty_<TypeId>`.
 
-Forward-declare generated functions before emitting definitions so direct and
-mutual recursion work. Emit tuple structs and named and anonymous union
-declarations in deterministic dependency order. Reject cyclic or incomplete C
-layout dependencies as backend invariants; the validated frontend and IR should
-already exclude them.
+Pass and return every Stage-1 value by value. Forward-declare all aggregate
+structs in stable identity order. Build one dependency graph covering nominal
+tuples, nominal unions, and anonymous unions, with an edge for every by-value
+tuple field or union payload. Traverse roots and dependencies by stable identity
+and append each node in deterministic DFS postorder, so dependencies are
+defined first. Encountering a visiting node is a backend invariant failure; the
+validated frontend should already exclude recursive inline layouts.
 
-Represent each union with a `uint32_t` discriminant and a C union payload. Map
-IR alternatives to one-based C tags so the all-zero representation remains the
-reserved inactive state. Do not expose those physical tag numbers outside the
-C backend.
+Preserve tuple field and union alternative order. Represent each union as a
+struct containing a `uint32_t tag` followed by a C union named `payload`, whose
+members are named `alternative_<AlternativeId>`. Map alternatives to one-based
+C tags so zero remains the reserved inactive state. Keep physical tag numbers
+private to the backend.
 
-Add a deterministic backend capability validator which runs before rendering.
-It accepts the milestone-7 core and rejects structs, containers, tuple
-operations, and other runtime-dependent operations with a dedicated backend
-error rather than producing partial C. Backend limitations are compiler
-diagnostics, not new language errors, and must preserve semantic warnings and
-the existing generated-output boundary.
+After all complete value-type definitions, emit function prototypes in
+`FunctionId` order. Use `sao2_fn_<FunctionId>` for functions and
+`sao2_arg_<parameter-position>` for parameters. Use `(void)` for an empty
+parameter list. Forward declarations permit direct and mutual recursion in
+Stage 2.
+
+Source spelling must never become a C identifier. Use only stable IR identities
+for types, fields, alternatives, functions, and later locals and blocks.
+
+### Deterministic rendering
+
+Render sections in this exact order:
+
+1. generated-file comment;
+2. standard headers;
+3. fixed helper types;
+4. aggregate forward declarations;
+5. aggregate definitions in dependency order; and
+6. function prototypes in `FunctionId` order.
+
+Use `\n` line endings, separate sections consistently, and emit exactly one
+final newline. The declaration-only output need not be connected to or compiled
+by production during this stage.
 
 ### Tests and completion
 
-Add emitter-only tests which construct IR directly and cover canonical headers,
-type names, forward declarations, dependency ordering, function prototypes,
-one-based union tags, exact rendering, and deterministic error context. Cover
-invalid IR and every deliberately unsupported category. No production pipeline
-behavior changes in this stage.
+Construct IR directly in backend tests without parsing source. Add coverage for:
+
+- canonical headers, fixed helper types, and exact section ordering;
+- every scalar C type and source-independent identity-derived names;
+- identity-ordered forward declarations and dependency-ordered definitions;
+- nested tuple declarations and named and anonymous unions;
+- tuple fields, union payload members, and one-based alternative tags;
+- empty and ordered parameter lists, tuple and union parameters and results,
+  and mutually recursive function prototypes;
+- malformed IR preserving its original validation context;
+- every unsupported definition, signature, local, operation, projection,
+  intrinsic, built-in, and terminator category;
+- handcrafted cyclic aggregate layouts producing backend invariants; and
+- byte-for-byte equality across repeated rendering.
+
+Include source names containing punctuation and C keywords to prove they never
+affect generated identifiers. Do not change compiler output, CLI behavior,
+filesystem boundaries, or existing temporary-emitter tests in this stage.
 
 Exit criterion: a validated IR program can be classified and its complete C
 type and declaration layer rendered deterministically without consulting the
-AST, analysis, or semantic tables.
+AST, analysis, or semantic tables; all deliberate limitations fail before
+rendering; and the production compiler remains on the working temporary
+backend.
 
 ## Stage 2: Scalar functions and explicit control flow
 
