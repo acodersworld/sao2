@@ -1,1004 +1,270 @@
-# Current Work: Typed Intermediate Representation
+# Current Work: Complete Core C Backend
 
-Status: complete.
+Status: in progress.
 
-This document expands milestone 6 of `ROADMAP.md`. The objective is to lower a
-validated frontend result into a small, owned, typed control-flow IR before the
-compiler depends on C evaluation rules. Milestone 4's resolved-AST C emitter
-remains the active backend until milestone 7 and must not shape the IR.
+This document expands milestone 7 of `ROADMAP.md`. The objective is to replace
+the temporary resolved-AST emitter with deterministic C11 generation from the
+validated, owned typed IR. The completed backend executes scalar primitives,
+direct calls, explicit control flow, checked arithmetic, and unions of supported
+core values while preserving the existing output walking skeleton.
 
-Lowering begins only after `semantic::validate_handoff` accepts the completed
-`Analysis` and `SemanticResult` described in `AST.md`. Missing or contradictory
-frontend facts are compiler invariant failures, not new source diagnostics.
-The IR owns everything required after lowering and does not retain AST
-references.
+Milestone 8 retains ownership of permanent strings, complete printing, and
+tuple value operations. Milestone 7 does not change the public CLI or
+`CompileOutput` interface.
 
-## IR direction
+## Stage 1: Backend contract and C type model
 
-Use a Rust-MIR-like representation made from typed functions, locals, basic
-blocks, statements, and terminators. Locals cover parameters, source bindings,
-and compiler-created temporaries. Basic blocks contain straight-line operations
-and end in one explicit control transfer. Places describe assignable storage;
-operands and computed values remain distinct from places.
+Replace the temporary emitter with an IR-only construction boundary:
 
-The initial vocabulary covers constants and copies, unary and binary
-operations, conversions, aggregate construction, union injection and payload
-access, calls and intrinsics, indexing and member access, assignment, runtime
-checks, branches, switches, returns, panic, and unreachable control flow. Source
-constructs such as blocks, `if`, loops, `switch`, short-circuit operators, and
-postfix `?` do not survive as nested IR operations.
+```text
+emit(&ir::Program) -> Result<String, CEmissionError>
+```
 
-Evaluation order is explicit. Any intermediate reference-bearing value that
-must survive a call or possible allocation is materialized in a typed local or
-temporary. Calls continue to use ordinary native C calling convention in the
-future backend; the IR is not a virtual-machine operand stack and does not
-prescribe physical stack offsets.
+Validate the IR at the boundary. Report deterministic failures with the
+function, block, operation, terminator, or identity context retained by the IR.
+Use stable identity-derived C names rather than source spelling, and render the
+complete translation unit in memory before the caller performs filesystem
+writes.
 
-## Shadow-stack compatibility
+Map core types to fixed C representations:
 
-Milestone 10 will derive GC roots from IR local types. A generated function that
-can hold roots will use a function-specific shadow-frame struct whose first
-member is a common header linking the caller frame and naming a generated
-traversal callback. The callback casts the header to the known frame type and
-traces its reference-bearing fields. Functions without roots need no shadow
-frame.
+- `int` uses `int64_t`;
+- `float` uses `double`;
+- `bool` uses `bool`;
+- `char` uses `uint8_t`; and
+- unit uses a concrete generated struct so it remains a complete C type.
 
-The core IR records typed storage but contains no root push or pop instructions,
-generic root-slot tables, C field offsets, or mandatory GC liveness maps. Root
-storage will be zero-initialized and traceable incoming parameters copied into
-their fields before the frame is linked. The all-zero packed reference and zero
-union discriminant are reserved non-value states that trace nothing. Initially,
-every root field may remain visible for the whole function invocation; clearing
-dead roots or using liveness-sensitive traversal is a later optimization.
+Forward-declare generated functions before emitting definitions so direct and
+mutual recursion work. Emit tuple structs and named and anonymous union
+declarations in deterministic dependency order. Reject cyclic or incomplete C
+layout dependencies as backend invariants; the validated frontend and IR should
+already exclude them.
 
-## Stage 1: IR model and invariants
+Represent each union with a `uint32_t` discriminant and a C union payload. Map
+IR alternatives to one-based C tags so the all-zero representation remains the
+reserved inactive state. Do not expose those physical tag numbers outside the
+C backend.
 
-Implement the complete milestone-6 IR vocabulary as one cohesive change. This
-stage defines the representation, construction boundary, deterministic
-renderer, structural validator, and focused tests. It does not lower frontend
-syntax or alter compiler-pipeline behavior.
-
-Add a private `ir` module and register it in the crate. The module remains
-unused by production compilation until later stages connect lowering to the
-pipeline.
-
-### Owned program and types
-
-- Define opaque, stable index identities for types, nominal definitions,
-  functions, locals, blocks, fields, union alternatives, and source locations.
-  Allocate identities in insertion order and render their numeric form
-  deterministically.
-- Make the IR program own its source filename metadata, canonical types,
-  nominal definitions, functions, validated entry-function identity, and
-  compact source-location table. Do not retain the source text or any AST
-  reference.
-- Represent unit, primitive, list, map, nominal, and anonymous-union types in an
-  owned canonical type table. IR type identities are independent of frontend
-  `TypeId` values; lowering will create an explicit deterministic mapping.
-- Give nominal definitions owned names and ordered owned layouts. Preserve
-  struct field names and inline-or-referenced storage, tuple positions, union
-  tags and payload types, and the constructor form required by universal
-  printing. Use stable field and alternative identities rather than source
-  spelling to select members after lowering.
-- Give each function an owned name, ordered parameter-local identities, result
-  type, complete local table, entry block, and block table. A local records its
-  type, optional owned source name, and whether it originated as a parameter,
-  source binding, or compiler-created temporary. Do not retain frontend
-  `BindingId` values in the finished IR.
-- Provide insertion methods for arena-like tables which return the newly
-  allocated stable identity. Blocks retain an ordered operation list and an
-  optional terminator so construction can be incremental; validation rejects
-  the incomplete form.
-- Intern source provenance behind compact location identities. Each entry
-  retains its UTF-8 byte span against the program's owned source filename.
-  Stage 5 will populate the runtime-failure-specific entries and the data needed
-  to emit line and column tables.
-
-### Places, operands, and operations
-
-Use mutable typed locals rather than SSA. A place starts at one local and has an
-ordered projection path. Projections distinguish struct fields, tuple fields,
-list indices, and map indices. A dynamic list index or map key must already be
-materialized in a local; this prevents a recursive place/operand representation
-and makes its evaluation order explicit.
-
-An operand is either a typed constant or a copy from a place. Constants cover
-unit, an integer magnitude, binary64 float bits, owned string bytes, a character
-byte, and a boolean. Keeping float bits rather than relying on host formatting
-or equality makes validation and rendering deterministic.
-
-Define the complete operation vocabulary now so later stages add lowering
-without redesigning the core representation:
-
-- copying an operand, unary and binary computation, numeric conversion,
-  aggregate construction, union injection, target-independent union testing,
-  and union payload extraction;
-- assignment to a place, direct function calls, intrinsic calls, and built-in
-  list, map, and string methods; and
-- explicit integer overflow and negation, division, remainder, shift-range,
-  finite-float, numeric-conversion, list or string bounds, and missing-map-key
-  checks.
-
-Every value-producing or unit-producing call has an explicit destination.
-Operations retain compact source provenance, but contain no C helper names,
-physical layout, shadow-stack commands, root-slot tables, or GC liveness
-instructions.
-
-### Terminators and control flow
-
-Every completed basic block ends in exactly one terminator. Define terminators
-for unconditional jumps, boolean branches, union-alternative switches, returns,
-panic, and unreachable continuation. Successor blocks are always named by
-stable block identity. Return carries an operand, including an explicit unit
-operand for unit-returning functions.
-
-Calls remain ordered operations rather than control-flow terminators. Panic and
-unreachable are terminal. Do not embed source blocks, `if`, loops, `switch`,
-short-circuit operators, or postfix `?` as nested IR nodes.
-
-### Structural and type validator
-
-Expose validation as a deterministic `Result` with a dedicated IR validation
-error. Stop at the first error in program, function, block, and operation order.
-An error identifies the containing function and, where applicable, the block
-and operation or terminator. Pipeline integration will later wrap such failures
-as compiler invariant diagnostics.
-
-Validate all of the following without repeating frontend semantics:
-
-- every referenced identity is in range and selects the expected kind of
-  program entity;
-- the entry function and each function's entry block exist;
-- parameter identities are unique, occur in signature order, and designate
-  parameter locals;
-- type entries, nominal layouts, fields, and union alternatives are
-  structurally complete and internally consistent;
-- every block is terminated and every jump, branch, and switch edge names an
-  existing block;
-- each place projection is legal for the projected type, including its field,
-  storage, tuple position, list-index, or map-key identity and type;
-- each constant agrees with its declared type;
-- operation arity and operand types are valid and every destination agrees with
-  the operation's result type;
-- aggregate members, union alternatives, calls, intrinsics, built-in methods,
-  and explicit checks agree with their referenced signatures and types; and
-- branch conditions are boolean, switches select alternatives of their operand
-  union, returns match the function result, and panic operands satisfy the
-  intrinsic contract.
-
-The validator does not perform reachability, dominance, definite-initialization
-analysis, source-level inference, mutability checking, switch coverage,
-return-path proof, or GC liveness. Structurally unreachable blocks are valid
-because unreachable source remains represented through lowering.
-
-### Deterministic rendering
-
-Implement a custom canonical renderer rather than exposing derived Rust
-`Debug`. Render source metadata, type and nominal declarations, function
-signatures, locals, blocks, operations, terminators, stable identities,
-constants, escaped names and byte strings, and byte spans in table order.
-Equivalent IR must render byte-for-byte identically across runs. Keep the text
-human-readable for unit-test expectations and milestone-7 backend debugging;
-it is a diagnostic form, not a serialized compatibility format.
+Add a deterministic backend capability validator which runs before rendering.
+It accepts the milestone-7 core and rejects structs, containers, tuple
+operations, and other runtime-dependent operations with a dedicated backend
+error rather than producing partial C. Backend limitations are compiler
+diagnostics, not new language errors, and must preserve semantic warnings and
+the existing generated-output boundary.
 
 ### Tests and completion
 
-Add IR-only unit tests which construct programs directly without parsing source
-and cover:
+Add emitter-only tests which construct IR directly and cover canonical headers,
+type names, forward declarations, dependency ordering, function prototypes,
+one-based union tags, exact rendering, and deterministic error context. Cover
+invalid IR and every deliberately unsupported category. No production pipeline
+behavior changes in this stage.
 
-- a representative straight-line function with parameters, locals, constants,
-  arithmetic, a call, and a return;
-- branches, union switches, projections, aggregates, explicit checks, panic,
-  unreachable termination, and a structurally unreachable block;
-- insertion-order identity allocation and byte-for-byte deterministic rendering,
-  including escaped strings and binary64 constants;
-- ownership of names, paths, bytes, layouts, and types after temporary
-  construction inputs have been dropped;
-- invalid type, definition, function, local, block, field, alternative, and
-  location identities;
-- malformed definitions, constants, projections, aggregates, unions, calls,
-  intrinsics, built-ins, checks, destinations, branches, switches, returns, and
-  unterminated blocks; and
-- validation errors containing the appropriate function, block, and operation
-  context.
+Exit criterion: a validated IR program can be classified and its complete C
+type and declaration layer rendered deterministically without consulting the
+AST, analysis, or semantic tables.
 
-Exit criterion: tests can directly construct, render, and validate the full IR
-vocabulary; malformed IR fails deterministically; no IR value borrows the
-frontend AST; and later stages can implement lowering without revisiting the
-core representation.
+## Stage 2: Scalar functions and explicit control flow
 
-## Stage 2: Straight-line lowering
+Emit executable functions for unit, integer, float, boolean, and character
+values. Declare locals at function entry and zero-initialize them. Function
+parameters retain IR signature order, and every IR destination names explicit
+C storage.
 
-Lower complete straight-line functions from the validated frontend handoff into
-owned IR, then run the Stage 1 validator before returning the result. Preserve
-left-to-right evaluation through conservative snapshots and support all value
-construction, including unions. Do not connect lowering to normal compilation
-until Stage 6.
+Emit constants from their exact IR values. Reconstruct binary64 constants from
+their recorded bits without violating C aliasing rules or depending on decimal
+formatting. Emit copies, local assignments, scalar unary and binary operations,
+numeric conversions, and direct calls.
 
-### Complete the frontend handoff
+Render every IR basic block as an identity-derived C label. Enter through an
+explicit jump to the function's IR entry block, and translate jumps, branches,
+returns, and unreachable terminators directly. Do not recover structured source
+control flow or depend on C expression evaluation order.
 
-The current frontend does not yet represent the explicit numeric conversions
-specified by `DESIGN.md`: the reserved `int` and `float` tokens cannot begin an
-expression, and the AST has no conversion node. Add `int(expression)` and
-`float(expression)` to `GRAMMAR.ebnf`, the AST, parser, name-and-type analysis,
-semantic traversal, and handoff validation. Accept only `int(float)` and
-`float(int)`. Record the selected source and destination types; Stage 5 remains
-responsible for finite and range checks.
+Implement signed bitwise operations and arithmetic right shift without relying
+on implementation-defined host behavior. Source operations which have explicit
+IR checks remain adjacent to their generated checked operation; Stage 3 supplies
+the permanent helper implementations before pipeline activation.
 
-Ordinary member and index reads also need identity-bearing handoff facts. Record
-one resolved projection for each value-level access while existing analysis is
-already selecting it:
-
-- a struct declaration, field ordinal, inline-or-referenced storage, and result
-  type;
-- a tuple declaration, position, and result type;
-- a list's element type;
-- a map's key and value types; or
-- string indexing and its `char` result.
-
-Exclude built-in method callees and qualified union constructors from these
-projection subjects; their existing call-target records are authoritative.
-Extend assignment path records with struct field ordinals as well as their
-existing member references. Update `AST.md` and the handoff validator to require
-exactly one valid projection record for every applicable expression. Missing,
-duplicated, or contradictory conversion and projection facts are compiler
-invariant failures, not new source diagnostics.
-
-### Program and identity mapping
-
-Add a lowering entry point which accepts the completed `Analysis` and
-`SemanticResult` and returns an owned `ir::Program` or a dedicated lowering
-error. The caller must already have passed `semantic::validate_handoff`.
-Lowering must not retain either input.
-
-Build the IR in deterministic passes:
-
-1. Reserve nominal definitions and functions in source declaration order.
-2. Copy canonical types and complete all owned nominal layouts.
-3. Copy every function signature before lowering bodies, allowing direct and
-   mutual recursion.
-4. Lower function bodies in source order.
-5. Validate the completed IR and convert any rejection into a lowering
-   invariant failure.
-
-Maintain explicit frontend-to-IR maps for types, nominal definitions,
-functions, bindings, fields, and union alternatives. Do not depend on frontend
-and IR numeric identities happening to match. Preallocation must support
-recursive nominal definitions and recursive function calls without placeholder
-AST references.
-
-Within a function, allocate parameter locals first in signature order, source
-locals when their declarations are encountered, and compiler temporaries in
-evaluation order. Copy all retained names, types, paths, bytes, union tags, and
-source metadata into IR-owned storage. Intern operation provenance in order of
-first occurrence of each byte span.
-
-### Expression lowering
-
-Use a lowering routine which produces a typed operand and applies any recorded
-implicit union injection before returning it. Parentheses are transparent, but
-an injection recorded on a parenthesized expression still applies at that exact
-expression boundary.
-
-- Lower unit and literals to typed constants and binding identifiers to copies
-  from their mapped locals.
-- Lower unary operations, non-short-circuit binary operations, membership, and
-  numeric conversions into typed temporaries. Leave `&&` and `||` to Stage 3
-  because their right operand is conditional.
-- Evaluate list elements, each map key followed by its value, and tuple
-  constructor arguments from left to right. Stabilize each value before
-  evaluating the next and retain that order in the aggregate operation.
-- Evaluate struct constructor arguments in source order and stabilize each
-  result. Only then use the recorded argument-to-member mapping to reorder
-  operands into declaration-field order for construction.
-- Lower untagged, tagged, and `Error` union constructors using the exact
-  recorded union alternative. Lower recorded implicit injections as explicit
-  union-injection operations without flattening nested unions.
-- Lower direct calls through mapped function identities. Lower `print` and
-  `println` through resolved intrinsic identities. For built-in methods,
-  evaluate and stabilize the receiver before arguments and retain the resolved
-  built-in method identity.
-- Lower member and index reads only through recorded projection identities.
-  Materialize computed receivers and every dynamic list index or map key before
-  constructing a projected place. Represent string indexing as its dedicated
-  read operation rather than an assignable place.
-
-Terminal `panic`, block and `if` expressions, explicit returns, statement
-conditionals, loops, switches, `break`, `continue`, and postfix `?` return a
-temporary `PendingStage` lowering error naming the owning later stage. This is
-not a compiler invariant and cannot reach users because Stage 2 lowering is not
-yet in the production pipeline. Remove each temporary case when its stage is
-implemented.
-
-### Conservative evaluation order
-
-Do not add effect analysis in this stage. Use a `stabilize` helper whenever an
-operand's value must be fixed before a later expression is evaluated. Constants
-and existing compiler-created temporaries are already stable. A copy from a
-parameter, source binding, or projected place is assigned to a fresh temporary.
-Lowering-created temporaries follow a single-assignment convention even though
-the IR itself permits mutable locals.
-
-Apply stabilization consistently:
-
-- stabilize the left operand before lowering the right operand of a binary
-  operation;
-- stabilize receivers before indices, keys, or call arguments;
-- stabilize each call, constructor, list, and map argument immediately after
-  evaluating it; and
-- retain every typed temporary, including reference-bearing values which must
-  survive a later call or possible allocation.
-
-This deliberately permits extra copies. Removing unnecessary temporaries is a
-later optimization and must not weaken explicit evaluation order.
-
-### Assignment lowering
-
-Use the exact semantic mutation authorization associated with each assignment.
-Confirm that its subject, root binding, access classification, operation, and
-typed path agree with the name-and-type assignment record, but do not repeat
-the permission decision.
-
-- For direct `=`, lower the right-hand value, including any injection, and
-  assign it to the mapped binding place.
-- For a projected target, snapshot the root object and evaluate each dynamic
-  index or key once from left to right before lowering the right-hand value.
-  Build the destination from the recorded field and projection identities.
-- For compound assignment, additionally copy the old target value before
-  lowering the right operand, lower the corresponding binary operation into a
-  temporary, and assign the result back to the previously captured place.
-- Preserve inline struct-slot replacement versus referenced-member rebinding in
-  the projection data without selecting a C representation.
-
-Emit ordinary arithmetic and indexing operations in this stage. Stage 5 adds
-the corresponding overflow, division, remainder, shift, float, conversion,
-bounds, and missing-key checks without changing operand order.
-
-Lower expression statements for their effects and discard their result. A
-straight-line function without a terminal construct ends its entry block by
-returning its final block expression, or an explicit unit constant when the
-body has no value.
+Preserve the existing output walking skeleton through a visibly temporary
+string-slice representation. It supports string literals and copies plus the
+currently exercised `print` and `println` forms for strings, integers, and
+booleans. Preserve Windows binary stdout handling. Check output calls for
+failure through their recorded IR failure sites rather than silently ignoring
+host I/O errors. Milestone 8 replaces this compatibility representation with
+interned strings and complete universal printing.
 
 ### Tests and completion
 
-Add parser, analysis, semantic, and handoff tests for both conversion forms,
-invalid conversion operands, every projection category, excluded method and
-qualified-constructor callees, field ordinals, and corrupted or duplicated
-handoff records.
+Add direct emitter tests for every scalar constant, local origin, copy,
+assignment, unary and binary operation, conversion, direct and mutual call,
+block order, branch, return, and unreachable path. Compile and execute generated
+C only during the required external verification, not during implementation.
 
-Add lowering tests covering:
+Exit criterion: direct IR tests can render complete scalar functions and CFGs,
+including recursion and the existing output subset, while the production
+compiler still uses the old emitter.
 
-- owned and deterministic type, definition, function, field, alternative, and
-  binding mappings, including recursive definitions and mutual calls;
-- parameters, source locals, literals, conversions, unary and ordinary binary
-  operations, membership, expression statements, and fallthrough returns;
-- operation order and snapshots for nested calls, binary operands, receivers,
-  arguments, and later mutations;
-- list and map evaluation order, typed empty containers, tuple construction,
-  and source-ordered struct evaluation followed by layout reordering;
-- explicit untagged, tagged, and `Error` construction, implicit injection, and
-  explicitly nested union identity;
-- struct and tuple member reads, list and map indexing, and string indexing;
-- direct, projected, and compound assignments with every index or key evaluated
-  exactly once;
-- direct function calls, printable intrinsics, and all built-in methods;
-- byte-for-byte deterministic IR rendering followed by successful Stage 1
-  validation;
-- missing or contradictory frontend facts producing lowering invariant errors;
-  and
-- each deferred control-flow or postfix-`?` construct producing its explicit
-  temporary `PendingStage` result.
+## Stage 3: Checked arithmetic and runtime failures
 
-Keep existing frontend, warning, temporary C backend, compiler, and executable
-tests unchanged. Contributor guidance prohibits compiling, running tests, or
-formatting during implementation.
+Generate portable, undefined-behavior-free helpers for all scalar checks already
+made explicit in IR:
 
-Exit criterion: every function in the defined straight-line subset lowers in
-source order to deterministic, owned, validated IR; all earlier observable
-values are stabilized before later effects; reference-bearing intermediates
-survive calls in typed locals; and the remaining unsupported constructs are
-explicitly assigned to Stages 3 and 4 rather than mistaken for broken frontend
-invariants.
+- integer addition, subtraction, multiplication, and negation overflow;
+- integer division and remainder by zero and signed-minimum divided by `-1`;
+- shift counts outside `0..=63` and overflowing left shift;
+- floating-point division by positive or negative zero;
+- non-finite floating-point arithmetic results; and
+- float-to-int values outside the half-open representable integer range.
 
-## Stage 3: Control-flow lowering
+Run every check against the already-materialized operands. Perform the ordinary
+C operation only after its preconditions make that operation defined. Implement
+arithmetic right shift portably, and implement checked left shift according to
+SAO2's mathematical multiplication semantics. Int-to-float remains unchecked.
 
-Extend lowering from one active straight-line block into a complete
-control-flow graph for blocks, conditionals, short-circuit operators, loops,
-returns, panic, and divergent expressions. The frontend continues to parse and
-semantically validate unreachable source and emit its existing warnings, but
-lowering omits unreachable tails after an unconditional terminator. Union
-tests, switches, narrowing, and postfix `?` remain together in Stage 4.
+Emit a compact generated table from the IR failure-site table. Each entry names
+the target-independent failure operation, function, line, and column; the
+program metadata supplies the filename. All runtime-check diagnostics use this
+stable form:
 
-### Lowering state and semantic handoff
+```text
+sao2: panic: <reason> at <filename>:<line>:<column> in <function>
+```
 
-- Replace the single current `BlockId` with an optional live block. Terminating
-  a path consumes it; subsequent expressions or statements on that path cannot
-  emit operations.
-- Make expression lowering return either a typed operand or divergence.
-  Callers must stop evaluation after divergence and must not evaluate later
-  operands, arguments, statements, or block values.
-- Add lookup helpers for the validated semantic flow tables: flow summaries,
-  explicit returns, function completions, and loop-control targets. Missing,
-  duplicated, or contradictory records remain lowering invariants.
-- Maintain a loop-context stack containing the source loop, continue target,
-  break target, and any active iteration cleanup. Resolve `break` and
-  `continue` through the recorded semantic target rather than assuming the top
-  context is correct.
-- Remove every `PendingStage::Stage3` result after its construct is implemented.
-  Keep `PendingStage::Stage4` for union tests, switches, and postfix `?`.
-- Continue validating the completed program through the Stage 1 validator.
-  Lowering remains disconnected from normal compilation until Stage 6.
+Explicit panic prints its message in the same location-bearing form when the
+temporary string representation is sufficient. An unhandled Error prints
+`Error(payload)` for payload kinds supported by this milestone. Every panic
+terminates with a nonzero status without unwinding. Reaching an IR
+`Unreachable` terminator traps through a separate compiler-invariant path.
 
-### Blocks, returns, and divergence
-
-Lower statement blocks directly into the current path; braces do not require a
-basic block by themselves. Stop lowering the remainder of a sequential region
-once its current path terminates. The frontend has already validated and warned
-about that unreachable syntax, so it is intentionally absent from IR rather
-than copied into detached blocks.
-
-Lower explicit returns using their unique `ExplicitReturn` record. Evaluate the
-return value first, apply its recorded injection, and then emit `Return`. A bare
-return constructs unit and applies the record's unit-union injection. Before a
-return from inside active `for` loops, emit their cleanup operations from
-innermost to outermost.
-
-Lower function fallthrough using the unique `FunctionCompletion` record. Return
-the final block value when present; otherwise return unit with any recorded
-injection. If the body diverges, do not manufacture a return or continuation.
-
-Lower `panic` wherever it occurs as an expression. Evaluate its message, emit
-the `Panic` terminator, and propagate divergence through the enclosing
-expression. Panic requires no iteration cleanup because it terminates the
-process. Preserve structural reachability and do not fold literal conditions.
-
-### Conditional control flow
-
-Lower an `if` statement into condition, body, false-chain, and merge blocks.
-Evaluate `else if` conditions sequentially so a later condition runs only when
-all preceding conditions are false. Only fallthrough bodies jump to the merge;
-terminal bodies retain their existing terminators. An `if` without `else` keeps
-its final false path as a fallthrough path.
-
-Lower an `if` expression into one preallocated result temporary. Every
-fallthrough branch assigns its value to that destination and jumps to the
-merge. A terminal branch neither assigns nor jumps. If all branches diverge,
-create no merge result and propagate divergence.
-
-Allocate condition and branch blocks in source order, allocate the merge after
-them, and then patch the collected fallthrough edges. This keeps stable block
-identities and rendered IR deterministic without placing merge blocks before
-their contributing branches.
-
-Lower short-circuit expressions without evaluating the right operand eagerly:
-
-- Evaluate and stabilize the left boolean once, then copy it into a result
-  temporary.
-- For `&&`, branch directly to the merge when the left value is false and
-  evaluate the right operand only on the true edge.
-- For `||`, branch directly to the merge when the left value is true and
-  evaluate the right operand only on the false edge.
-- A fallthrough right path overwrites the result and jumps to the merge. A
-  divergent right path retains its terminal control flow.
-
-### While loops and loop control
-
-Lower `while` into a preheader jump followed by condition, body, and exit
-blocks. Re-evaluate the condition on every iteration, branch to the body or
-exit, route ordinary body fallthrough and `continue` back to the condition, and
-route `break` to the exit.
-
-Nested loop control must use the semantic `LoopControl` target. A terminal
-`break` or `continue` ends the current path, so the rest of that sequential
-source region is checked and warned about by the frontend but not lowered.
-
-### Indexed `for` loops and iteration locks
-
-Lower list and map iteration using indexed compiler primitives rather than an
-opaque iterator type:
-
-1. Evaluate and stabilize the iterable exactly once.
-2. Emit `BeginIteration` to increment the container's internal iteration-lock
-   count.
-3. Snapshot its length, initialize an integer index to zero, and jump to the
-   loop header.
-4. Test `index < length`; branch to the body or cleanup block.
-5. Use `IterationValue` to fetch the list element or insertion-order map key at
-   the current index and assign it to the mapped loop-binding local.
-6. Route body fallthrough and `continue` through an advance block which
-   increments the index and returns to the header.
-7. Route exhaustion and `break` through one cleanup block which emits
-   `EndIteration` before reaching the exit.
-
-Use a counter rather than a boolean so nested iteration over the same container
-is valid. A return emits `EndIteration` for every active `for` loop before its
-`Return` terminator; `continue` keeps the current iteration locked. The
-stabilized iterable remains a typed local and therefore remains available to
-future shadow-frame root derivation.
-
-Extend the target-independent IR with `BeginIteration`, `EndIteration`, and
-`IterationValue` operations. Validate that begin and end operands are lists or
-maps, iteration indices are integers, and the fetched destination agrees with
-the list element or map key type. Do not encode container layout, C helper
-names, or an opaque runtime iterator in the core IR.
-
-The eventual list or map runtime stores the internal lock count. Structural
-operations check that count and panic immediately while it is nonzero, including
-when reached through an alias or called function. Element replacement is not a
-structural change and remains permitted.
+Defer float Error-payload formatting, string Error payloads, and other cases
+which require milestone 8's complete primitive formatting or interned-string
+runtime. Reject them during capability validation rather than emitting
+non-conforming output.
 
 ### Tests and completion
 
-Add lowering and IR-validation tests covering:
+Add exact C and native execution cases for every boundary and failure class,
+including signed minimum, both float zero representations, allowed float
+underflow, shift counts `0`, `63`, negative, and `64`, and float-to-int boundary
+values. Snapshot runtime diagnostics to prove that reason, SAO2 filename,
+function, line, and column are stable.
 
-- statement blocks, nested value-producing blocks, final function values, and
-  unit or unit-union completion;
-- `if`, `else if`, missing `else`, expression merge destinations, terminal
-  branches, and expressions whose every branch diverges;
-- `&&` and `||` evaluation order, bypass paths, result values, and divergent
-  right operands;
-- `while` condition reevaluation, ordinary fallthrough, nested loops, `break`,
-  and `continue`;
-- list and map iteration order, typed loop bindings, length snapshots, indexed
-  iteration values, and nested iteration locks;
-- iteration cleanup on exhaustion, `break`, and return through one or several
-  active `for` loops, with no cleanup emitted after panic;
-- explicit value returns, bare returns, injected unit returns, fallthrough
-  returns, and divergent return expressions;
-- panic nested inside operands, arguments, conditions, and branch values;
-- omission of operations after return, panic, break, continue, or another
-  divergent expression while frontend warnings remain unchanged;
-- deterministic block allocation and rendering followed by successful
-  whole-program IR validation;
-- corrupted flow summaries, explicit returns, function completions, or loop
-  targets producing lowering invariant errors; and
-- union tests, switches, and postfix `?` remaining explicit Stage 4 pending
-  cases.
+Exit criterion: every accepted scalar arithmetic operation either produces the
+specified result or terminates through its exact IR failure site without
+invoking undefined or implementation-defined C arithmetic.
 
-Keep existing frontend, warning, temporary C backend, compiler, and executable
-tests unchanged. Contributor guidance prohibits compiling, running tests, or
-formatting during implementation.
+## Stage 4: Core unions and entry adapters
 
-Exit criterion: every accepted non-union control-flow form lowers to a closed,
-deterministic, validated graph; no syntax-level block, conditional,
-short-circuit operator, loop, return, or panic remains in IR; iteration locks
-are balanced on every non-panicking lowered exit; and unreachable source is
-fully checked by the frontend but absent from the lowered program.
+Emit union injection by zero-initializing the destination, assigning its payload,
+and then publishing its one-based tag. Emit union copies, parameters, results,
+tests, payload extraction, exhaustive switches, and Error propagation for
+recursively supported scalar unions. Distinct alternatives may share a target
+block, and anonymous and nominal unions retain separate generated identities.
 
-## Stage 4: Unions and error flow
+Tuple declarations remain available for ABI and dependency groundwork, but
+tuple construction, projection, equality, hashing, and printing remain
+milestone-8 operations. A tuple operation reaching this backend is a
+deterministic capability error.
 
-Complete union lowering as one change: union tests, branch-local narrowing,
-exhaustive switches, and postfix `?`. Remove the final `PendingStage` cases so
-every validated language construct can be represented in IR before Stage 5
-adds runtime checks.
+Generate all four validated entry adapter shapes:
 
-This stage also records and implements the design decision that every `Error`
-payload must be exactly one primitive type: `int`, `float`, `str`, `bool`, or
-`char`.
+1. no arguments and unit result;
+2. no arguments and integer result;
+3. `[str]` arguments and unit result; and
+4. `[str]` arguments and integer result.
 
-### Error payload and panic design
+The no-argument adapters call the IR entry function, translate unit to exit
+status zero, and translate an integer result to the host process exit status.
 
-Update `DESIGN.md` before changing behavior:
-
-- Restrict every `Error(T)` alternative, whether in a named or anonymous union,
-  to the five primitive payload types.
-- Keep standalone `Error(T)` invalid. An operation with no non-error result uses
-  `() | Error(T)`, and postfix `?` produces unit on its successful path.
-- Specify that an unhandled Error reached through `?` in `main` prints
-  `Error(payload)` using the primitive payload's ordinary formatting, reports
-  the `?` source location, and terminates with a nonzero status.
-- Keep the explicit `panic(message)` intrinsic restricted to `str`; an
-  unhandled Error is a distinct typed panic operation rather than an implicit
-  conversion to string.
-
-Diagnose a non-primitive Error payload during type resolution at the payload
-type span. Apply the restriction equally to all union syntax and retain the
-existing rule that Error is the final alternative. Extend the semantic handoff
-validator to reject any contradictory Error alternative which reaches
-lowering. Update `AST.md` with the restricted payload contract and the
-propagate-or-panic lowering information.
-
-### Target-independent union operations
-
-Replace the raw integer-producing `Discriminant` IR operation with
-`UnionTest`, which names a union operand and one `AlternativeId` and produces a
-`bool`. Runtime discriminant numbering remains a backend layout choice and must
-not appear as an integer constant in core IR.
-
-Retain `UnionPayload` for extraction after a branch or switch has established
-the active alternative. Strengthen validation of `Switch` terminators so their
-targets contain every direct alternative exactly once. Distinct alternatives
-may intentionally target the same `else` block.
-
-Add an `ErrorPanic` terminator whose operand is the extracted Error payload.
-Keep it distinct from the existing string `Panic` terminator. Validate that its
-operand has one of the five permitted primitive types. Render union tests,
-payload extraction, exhaustive switches, and Error panic canonically without
-exposing physical tags or runtime helper names.
-
-### Scoped narrowing
-
-Maintain a lowering-time narrowing environment. Each active entry records the
-frontend binding, stabilized union operand, selected alternative, payload type,
-and extracted payload local. Save and restore this environment around branches,
-loop bodies, switch arms, and nested tests.
-
-Lower `value is Alternative` by evaluating and stabilizing the union once and
-emitting `UnionTest` with the exact mapped alternative. A general boolean use
-of `is` produces only its boolean result. When an exact binding test directly
-controls an `if`, `if` expression, or `while`, emit `UnionPayload` at the true
-body's entry and activate that payload local for the body. Do not infer negative
-narrowing on false or `else` paths.
-
-When lowering a binding read, select its narrowed local only when the
-expression's final semantic annotation agrees with that payload. Otherwise use
-the original union local. This lets the final frontend facts remain the source
-of truth and prevents a stale narrowing environment from changing a read.
-
-Use the narrowed payload local as the root for resolved member access, indexing,
-built-in calls, and projected mutation. A direct reassignment writes the
-original union binding and invalidates narrowing for subsequent reads. Nested
-narrowing of the same binding temporarily shadows the outer entry. Do not
-repeat member selection, mutability checking, or narrowed type inference.
-
-### Complete switch lowering
-
-Consume the unique `SwitchResolution` for each switch:
-
-1. Evaluate and stabilize the union operand exactly once.
-2. Create explicit arm blocks in source order, followed by a reachable `else`
-   block when required, and then a merge block if any path falls through.
-3. Build the switch target table in the union's direct alternative order.
-4. Route each covered alternative to its resolved arm and each uncovered
-   alternative to the shared `else` block.
-5. For an exact binding operand, extract the selected payload at each explicit
-   arm's entry and activate it for that arm. An `else` body receives no
-   narrowing.
-6. Preserve existing terminators in terminal arms and jump only fallthrough
-   arms to the merge. Propagate divergence when no arm falls through.
-
-If explicit arms already cover every alternative, preserve the frontend's
-unreachable warning but do not allocate or lower its unreachable `else` body.
-Do not recompute labels, coverage, exhaustiveness, payload types, or whether an
-else arm is reachable.
-
-### Postfix `?`
-
-Consume the unique `TryResolution` for each reachable postfix operation.
-Evaluate and stabilize its operand exactly once, then emit one exhaustive union
-switch. Route the Error alternative to an error block and every successful
-alternative to its own success block.
-
-In each success block, extract the payload with `UnionPayload`:
-
-- With one success alternative, assign its payload directly to the shared
-  result temporary.
-- With multiple success alternatives, inject each payload into the recorded
-  anonymous success union using the corresponding preserved alternative, then
-  assign that value to the shared result.
-- Preserve a unit payload normally, so `() | Error(P)` produces the ordinary
-  unit value.
-
-Map source and success alternatives by their semantic identity rather than
-assuming their numeric positions match. Preserve tags, explicit nesting, and
-constructor form. Route every successful fallthrough to one merge and return
-its typed operand to the enclosing expression.
-
-On the Error path:
-
-- For `TryAction::Propagate`, extract the primitive payload, inject it into the
-  exact destination Error alternative, emit `EndIteration` for every active
-  `for` loop from innermost to outermost, and terminate with `Return`.
-- For `TryAction::Panic`, extract the primitive payload and terminate with
-  `ErrorPanic` at the recorded `?` operator span. Do not emit iteration cleanup
-  because the process terminates.
-- If evaluating the operand already diverges, emit no switch. A `Never` operand
-  has no try record and simply preserves that divergence.
-
-Lower chained tries inside-out so each successful result becomes the next
-postfix operand. Do not reuse ordinary widening for Error propagation; the
-recorded source and destination payload types and alternatives must agree
-exactly.
-
-After union tests, switches, and tries are implemented, remove `PendingStage`
-and the pending lowering-error variant entirely. Any remaining accepted syntax
-which cannot lower is a compiler invariant failure.
+For `main(args [str])`, validate every byte of `argv[1..]` as ASCII before
+entering SAO2 code. Pass a clearly marked temporary borrowed-argv value to the
+entry function. Permit this adapter only when the IR does not inspect, copy,
+return, pass onward, index, or iterate the `args` parameter. Actual `[str]`
+behavior waits for the permanent string and container runtimes; using the
+parameter before then is a backend capability error. A non-ASCII argument
+panics before entering SAO2 code with a stable adapter-specific diagnostic that
+does not invent a source location.
 
 ### Tests and completion
 
-Add analysis and handoff tests for all five permitted Error payload primitives,
-and reject unit, lists, maps, tuples, structs, unions, and other nominal Error
-payloads at their payload spans.
+Add deterministic rendering and native execution tests for scalar union
+construction, testing, switches, propagation, nested supported unions, shared
+switch targets, and union-valued calls. Add all four adapter shapes, integer
+exit results, ASCII argument ordering, non-ASCII rejection, and deterministic
+rejection of actual `args` use.
 
-Add IR and lowering tests covering:
+Exit criterion: supported scalar unions execute through physical C tags and
+payloads without exposing layout to IR, and every validated entry signature has
+a generated adapter without prematurely implementing lists or interned strings.
 
-- `UnionTest` typing, rendering, invalid alternatives, and the absence of raw
-  discriminant-number comparisons;
-- narrowed identifiers, members, indices, built-ins, projected mutations,
-  nested tests, loop-condition narrowing, and invalidation after direct
-  reassignment;
-- tests on computed unions which produce booleans without binding narrowing;
-- exhaustive named and anonymous, tagged and untagged switches;
-- source-ordered arm blocks, alternative-ordered targets, shared else targets,
-  payload extraction, terminal arms, all-diverging switches, and omission of
-  an unreachable exhaustive else body;
-- single-success, multiple-success, unit-success, nominal, anonymous, tagged,
-  explicitly nested, and chained postfix tries;
-- exact Error propagation, destination reinjection, and active iteration
-  cleanup before propagated returns;
-- `main` Error panic for `int`, `float`, `str`, `bool`, and `char`, including
-  its `Error(payload)` rendering intent and `?` source location;
-- try operands which already diverge and therefore produce no dispatch;
-- corrupted union-test, switch, try, alternative, payload, narrowing, or action
-  facts producing lowering invariant errors; and
-- deterministic rendering and successful whole-program IR validation with no
-  remaining pending-stage result.
+## Stage 5: Pipeline replacement and handoff
 
-Keep existing warning behavior, diagnostic ordering, temporary C backend,
-compiler tests, and executable tests unchanged. Contributor guidance prohibits
-compiling, running tests, or formatting during implementation.
+Replace the production temporary backend call with the IR emitter. Pass only
+the owned validated `ir::Program`; do not pass the AST, analysis, semantic
+tables, or frontend entry signature. The IR entry-function identity becomes
+authoritative for adapter selection.
 
-Exit criterion: every valid union inspection, narrowed path, switch, and
-postfix-`?` lowers to explicit typed operations and closed control-flow edges;
-Error payloads are uniformly primitive and precisely propagated or rendered by
-panic; runtime discriminant numbering remains outside core IR; and no valid
-source construct remains pending lowering.
+Remove the temporary resolved-AST capability checker and renderer. Remove or
+rewrite compiler tests whose assertions intentionally describe its generated C
+or unsupported-subset messages. Do not retain duplicate lowering or semantic
+logic in the new backend.
 
-## Stage 5: Runtime checks and source locations
+Preserve semantic warnings on backend and filesystem failures. An emitter
+failure must occur before build-directory creation or output writes, leaving an
+existing `program.c` unchanged. Keep `build`, `run`, `--show-c`, host compiler
+invocation, generated filenames, and `CompileOutput` unchanged.
 
-Make every required numeric, indexing, missing-key, and structural-mutation
-failure explicit in evaluation order. Keep these operations target-independent:
-the IR records SAO2 semantics and failure attribution rather than C helpers,
-physical container layouts, or host arithmetic behavior.
-
-### Compact failure sites
-
-Add `FailureSiteId` as an identity separate from the existing `LocationId` used
-for general operation provenance. Intern an owned failure-site table in first
-lowering order. Each entry contains an existing source location, the enclosing
-`FunctionId`, and a target-independent source operation. The program's source
-metadata supplies the filename. Deduplicate only an identical location,
-function, and operation tuple, so multiple checks belonging to one source
-operation share an ID without conflating equal spans in different functions or
-different operations at one span.
-
-Attach a failure site to every explicit runtime check and to each presently
-panic-capable IR operation: checked list, map, and string access, structural
-built-ins, output intrinsics, explicit `Panic`, and `ErrorPanic`. Use operation
-kinds such as integer addition, float division, list indexing, map removal,
-output, explicit panic, and unhandled Error; do not record backend helper names.
-
-Use the source operator span for unary, binary, shift, and compound-assignment
-failures; the complete conversion expression for float-to-int; the index
-expression or assignment suffix for indexing; the complete call for built-ins,
-output, and explicit panic; and the recorded `?` operator for unhandled Error.
-Render the failure-site table deterministically alongside ordinary locations.
-
-### Checked numeric operations
-
-Emit checks against already-lowered operands so no source expression is
-reevaluated:
-
-- Before integer `+`, `-`, and `*`, check that the mathematical result is in the
-  signed 64-bit range.
-- Before integer unary `-`, reject negation of the signed minimum.
-- Before integer `/`, reject zero and `MIN / -1`; before integer `%`, reject
-  zero and `MIN % -1`.
-- Before either shift, require a count in `0..=63`. For left shift, perform its
-  overflow check after the range check and before the binary operation. Right
-  shift needs no result-overflow check.
-- Before float division, reject either positive or negative zero. After float
-  `+`, `-`, `*`, or `/`, check the destination temporary and panic if it is
-  infinity or NaN. IEEE underflow, subnormal results, and zero remain valid.
-- Before float-to-int conversion, require a value whose truncation toward zero
-  is representable as an `int`. Int-to-float is always finite and needs no
-  check.
-
-Route ordinary binary expressions and compound assignments through the same
-typed check-emission helpers. Compound operations use their assignment-operator
-span. Keep bitwise operations, comparisons, unary plus, integer-to-float, and
-finite float negation free of unnecessary checks.
-
-Represent semantic integer constants as signed `i64` rather than unsigned
-source magnitudes. Lower the syntactic special case
-`-9223372036854775808` directly to `i64::MIN`, without first constructing an
-unrepresentable positive value or emitting a spurious negation failure. A
-subsequent negation of that value is checked normally.
-
-### Atomic container access
-
-Keep list and string indices as their original signed `int` values. The runtime
-operation which performs an access owns negative-index interpretation, bounds
-checking, and failure atomically against the container's current length:
-negative indices add the current length, and the access panics unless the
-resolved position lies in `0..length`. Do not expose a normalized physical
-index or container layout in core IR.
-
-Make checked access explicit by adding a `FailureSiteId` to list and map place
-projections and to `StringIndex`. A list projection checks bounds whenever the
-containing place is actually read or written. A map projection checks that its
-key exists at that same point. This naturally checks a compound assignment once
-for its pre-right-hand-side read and again for its post-right-hand-side write,
-which remains correct if an intervening call mutates an aliased container.
-Simple assignment checks at the final write after the right-hand value has been
-evaluated. Preserve the existing rule that receiver, index or key expressions,
-and right-hand operands themselves are each evaluated once from left to right.
-
-Give `ListRemoveIndex` the raw signed index and make bounds checking and negative
-index interpretation part of that runtime operation. Make missing-key checking
-part of `MapRemoveKey`. A removal operation uses one source failure site for
-both its access failure and its iteration-lock failure while retaining distinct
-failure/check kinds and eventual panic messages.
-
-### Structural mutation during iteration
-
-After evaluating and stabilizing a built-in receiver and its arguments, emit an
-`IterationUnlocked` check immediately before each structural mutation:
-`ListAppend`, `ListRemoveIndex`, and `MapRemoveKey`. The check inspects the
-actual receiver object's internal iteration-lock count and panics when it is
-nonzero, so aliases and calls cannot evade it. Perform the lock check before a
-removal's bounds or missing-key work. List and map element replacement is not
-structural and receives only its normal bounds or key check.
-
-### Validation, tests, and completion
-
-Extend whole-program validation to reject invalid or duplicate failure-site
-entries, invalid location or function identities, and a failure-site operation
-which disagrees with its referencing check or operation. Validate the complete
-required check sequence around each failure-capable numeric operation,
-including pre-check order and the post-result finite-float check. Reject list,
-map, or string accesses without compatible failure sites; structural mutations
-without an immediately preceding lock check over the same receiver; removal
-operations without access-failure attribution; and panic-capable terminators or
-output intrinsics without failure sites.
-
-Add IR and lowering tests covering:
-
-- every integer failure class, shift boundaries, signed-minimum literals and
-  negation, ordinary arithmetic, and compound arithmetic;
-- float division by both zero representations, non-finite results, allowed
-  underflow, and float-to-int limits;
-- positive, negative, empty, and out-of-range list and string indices;
-- missing map keys on reads, replacements, compound assignments, and removal;
-- compound indexed assignments checking both their read and write, including
-  an intervening call which may mutate an alias;
-- direct, nested, and aliased structural mutations during one or more active
-  iterations;
-- deterministic failure-site interning and rendering with exact source span,
-  operation, and enclosing function; and
-- deliberately corrupted operand types, check order, failure-site references,
-  operation attribution, and mutation receiver relationships.
-
-Keep existing frontend diagnostics, warnings, semantic handoff, temporary C
-backend, compiler tests, and executable tests unchanged. Contributor guidance
-prohibits compiling, running tests, or formatting during implementation.
-
-Exit criterion: every currently specified numeric, container-access,
-missing-key, output, explicit-panic, unhandled-Error, and iteration-lock failure
-is target-independently represented at its exact evaluation point; every such
-operation has a valid compact failure site; and no unchecked host-language
-arithmetic or container access is required to recover SAO2 semantics.
-
-## Stage 6: Pipeline integration and handoff
-
-Connect the completed typed lowering path to normal compilation. Every
-diagnostic-free frontend result must become a closed, validated, owned IR
-program before the temporary resolved-AST emitter is allowed to inspect the
-source program. This stage changes orchestration and invariant handling only;
-milestone 7 remains responsible for consuming the IR and replacing the
-temporary backend.
-
-### Pipeline order and ownership
-
-Make the production compiler run these phases in order:
-
-1. parse the source;
-2. perform name-and-type analysis and stop on source diagnostics;
-3. perform semantic analysis and stop on source diagnostics;
-4. validate the completed frontend handoff;
-5. lower the handoff into owned typed IR and validate that IR;
-6. run the temporary resolved-AST backend capability check and C renderer; and
-7. create the build directory and write generated C only after every in-memory
-   phase has succeeded.
-
-Call `lowering::lower` immediately after `semantic::validate_handoff`. Retain
-the returned IR program until compilation has completed even though the
-temporary backend does not consume it. Do not add the IR to `CompileOutput`,
-expose it through the CLI, or make it borrow the source, AST, analysis, or
-semantic side tables. `lowering::lower` remains the single construction
-boundary and must return only a fully validated program; production code must
-not accept or forward partial IR.
-
-Keep entry-point selection for the temporary emitter sourced from the already
-validated semantic result. The IR's independently owned entry-function identity
-is authoritative for future IR consumers but does not need to be translated
-back into a frontend identity during this transitional stage.
-
-### Invariant failures and diagnostics
-
-Treat every `LoweringError` or IR `ValidationError` as a compiler invariant
-diagnostic, never as a new source diagnostic or temporary-backend limitation.
-The diagnostic must identify the lowering or IR validation boundary and retain
-the deterministic function, block, operation, terminator, or identity context
-already carried by the underlying error. Do not attach a speculative source
-span when the invariant does not provide one.
-
-Preserve semantic warnings on lowering, validation, temporary-backend, and
-filesystem failures. Parser and name-and-type failures still have no semantic
-warnings, and semantic source errors retain the warnings accumulated before
-the error boundary. An invariant failure must stop before backend inspection,
-directory creation, or output writes. Existing `program.c` output must remain
-unchanged, and a missing build directory must remain absent.
-
-Keep the existing defensive entry-point failure after handoff validation. It is
-unreachable for a valid handoff but continues to produce a compiler diagnostic
-if orchestration state is corrupted.
-
-### Temporary backend isolation
-
-Continue to call the milestone-4 C emitter with the source AST, analysis, and
-validated frontend `main` signature. Do not pass typed IR to it, expand its
-accepted syntax, duplicate lowering logic inside it, or change its existing
-unsupported-program diagnostics. A valid program may therefore lower
-successfully and then be rejected by the temporary backend; that is the
-intended walking-skeleton boundary until milestone 7.
-
-Update stale module documentation which says lowering is disconnected or that
-milestone 6 replaces the temporary emitter. The comments should state that
-milestone 6 validates and retains IR alongside the temporary backend, while
-milestone 7 replaces that backend with IR-based C generation. Do not otherwise
-change public commands, `CompileOutput`, generated filenames, `--show-c`, host
-compiler invocation, or run behavior.
+Update module documentation to state that milestone 7 consumes typed IR and
+that milestone 8 supplies the next runtime-value layer.
 
 ### Integration tests and completion
 
-Add compiler-level tests which prove:
+Add compiler and end-to-end coverage for:
 
-- supported primitive programs still produce byte-for-byte identical C after
-  typed lowering runs;
-- representative valid programs covering control flow, unions, postfix `?`,
-  containers, and checked arithmetic pass lowering before receiving the
-  unchanged temporary-backend diagnostic;
-- a lowering invariant and a post-lowering validation invariant become compiler
-  diagnostics, preserve existing warnings, and neither create nor overwrite
-  generated output;
-- parser, name-and-type, semantic, and handoff failures stop before lowering,
-  retain their established diagnostic category and ordering, and preserve the
-  existing output boundary;
-- unreachable-source warnings survive successful lowering and remain ordered
-  before later compiler or temporary-backend failures; and
-- repeated compilation remains deterministic and the native walking-skeleton
-  tests continue to exercise the same generated C and executable behavior.
+- deterministic generated C from repeated compilation;
+- scalar functions, recursion, branches, loops, and short-circuit CFG;
+- checked integer and floating-point success and failure paths;
+- supported unions and Error propagation;
+- all four `main` adapters;
+- runtime panic source attribution;
+- backend limitations preserving warnings and generated output;
+- `--show-c`, toolchain failures, and program exit statuses; and
+- the existing exact-byte output and reproducible primitive fuzz programs.
 
-Use test-only injection seams where invariant corruption cannot arise from
-accepted source. Keep those seams private to the compiler module, run the real
-frontend and lowering before the injected corruption point, and do not weaken
-production validation to make failures injectable. Retain the focused IR and
-lowering tests from Stages 1 through 5 rather than duplicating their exhaustive
-cases at the orchestration layer.
+Replace obsolete byte-for-byte expectations tied to the temporary emitter with
+new canonical IR-backend expectations. Preserve observable behavior rather than
+the old implementation's C spelling.
 
 Contributor guidance prohibits compiling, running tests, or formatting during
-implementation. External verification must run `rustc --version` followed by
-`SAO2_CC=cc cargo test`, replacing `cc` only when another supported compiler is
-required. Native end-to-end assertions must run rather than skip. After that
-evidence succeeds, mark milestone 6 complete in `ROADMAP.md`; milestone 7 then
-becomes current.
+implementation. External verification must run:
 
-Exit criterion: every diagnostic-free frontend result is lowered into closed,
-deterministic, validated, owned IR before the temporary backend runs; invariant
-failures preserve warnings and generated output; existing supported programs
-retain identical behavior; and milestone 7 can replace the backend without
-revisiting syntax, frontend semantics, or lowering.
+```text
+rustc --version
+SAO2_CC=cc cargo test
+```
+
+Replace `cc` only when another supported compiler is required. Native
+end-to-end assertions must run rather than skip. After that evidence succeeds,
+mark milestone 7 complete in `ROADMAP.md`; milestone 8 then becomes current.
+
+Exit criterion: production C generation consumes only closed validated IR;
+supported scalar and union programs compile and execute with portable checked
+semantics; the source-to-executable walking skeleton remains operational; and
+later runtime milestones can add value representations without revisiting the
+frontend or lowering.
 
 ## Boundaries
 
-- Do not implement C emission from IR during this milestone.
-- Do not implement runtime layouts, the arena allocator, escape analysis,
-  shadow-frame generation, garbage collection, containers, or runtime printing.
-- Do not repeat name resolution, type inference, mutability checking, switch
-  coverage, reachability, or return-path proof in lowering.
-- Do not borrow AST nodes from the IR or make source spelling necessary after
-  lowering; retain only owned names and compact source-location data required
-  for diagnostics and later runtime failures.
-- Preserve filenames, UTF-8 byte spans, warning behavior, diagnostic limits,
-  and compiler-versus-source failure categories.
+- Do not implement struct layout, escape analysis, arena references,
+  shadow-stack generation, garbage collection, or container storage.
+- Do not implement permanent string interning, general `[str]` argument values,
+  universal printing, or tuple value operations.
+- Do not recover source-level structure or repeat frontend name resolution,
+  typing, mutability, coverage, or flow analysis.
+- Do not expose C layout, tag values, helper names, or calling details in IR.
+- Keep generated code dependency-free beyond the C standard library and avoid
+  compiler-specific arithmetic built-ins unless a portable fallback has
+  identical tested behavior.
+- Keep child-process invocation argument-based and preserve source, compiler,
+  toolchain, and program failure categories.
