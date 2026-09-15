@@ -881,22 +881,114 @@ arithmetic or container access is required to recover SAO2 semantics.
 
 ## Stage 6: Pipeline integration and handoff
 
-Run typed lowering and IR validation immediately after the semantic handoff.
-Keep the temporary resolved-AST emitter as the downstream code generator until
-milestone 7, without expanding its supported subset or teaching it to consume
-partial IR. Treat lowering or validation contradictions as compiler diagnostics
-while preserving semantic warnings and the existing no-output-on-failure
-boundary.
+Connect the completed typed lowering path to normal compilation. Every
+diagnostic-free frontend result must become a closed, validated, owned IR
+program before the temporary resolved-AST emitter is allowed to inspect the
+source program. This stage changes orchestration and invariant handling only;
+milestone 7 remains responsible for consuming the IR and replacing the
+temporary backend.
 
-Add focused lowering and validation tests for evaluation order, temporaries,
-branch merges, loops, switches, union narrowing, postfix `?`, checked failures,
-locations, invalid IR, and frontend-handoff corruption. Retain the existing
-compiler and executable tests unchanged as the walking-skeleton regression
-boundary.
+### Pipeline order and ownership
 
-Exit criterion: every diagnostic-free frontend result lowers to validated,
-owned typed IR before the existing backend runs, and milestone 7 can replace
-that backend without revisiting syntax or semantic analysis.
+Make the production compiler run these phases in order:
+
+1. parse the source;
+2. perform name-and-type analysis and stop on source diagnostics;
+3. perform semantic analysis and stop on source diagnostics;
+4. validate the completed frontend handoff;
+5. lower the handoff into owned typed IR and validate that IR;
+6. run the temporary resolved-AST backend capability check and C renderer; and
+7. create the build directory and write generated C only after every in-memory
+   phase has succeeded.
+
+Call `lowering::lower` immediately after `semantic::validate_handoff`. Retain
+the returned IR program until compilation has completed even though the
+temporary backend does not consume it. Do not add the IR to `CompileOutput`,
+expose it through the CLI, or make it borrow the source, AST, analysis, or
+semantic side tables. `lowering::lower` remains the single construction
+boundary and must return only a fully validated program; production code must
+not accept or forward partial IR.
+
+Keep entry-point selection for the temporary emitter sourced from the already
+validated semantic result. The IR's independently owned entry-function identity
+is authoritative for future IR consumers but does not need to be translated
+back into a frontend identity during this transitional stage.
+
+### Invariant failures and diagnostics
+
+Treat every `LoweringError` or IR `ValidationError` as a compiler invariant
+diagnostic, never as a new source diagnostic or temporary-backend limitation.
+The diagnostic must identify the lowering or IR validation boundary and retain
+the deterministic function, block, operation, terminator, or identity context
+already carried by the underlying error. Do not attach a speculative source
+span when the invariant does not provide one.
+
+Preserve semantic warnings on lowering, validation, temporary-backend, and
+filesystem failures. Parser and name-and-type failures still have no semantic
+warnings, and semantic source errors retain the warnings accumulated before
+the error boundary. An invariant failure must stop before backend inspection,
+directory creation, or output writes. Existing `program.c` output must remain
+unchanged, and a missing build directory must remain absent.
+
+Keep the existing defensive entry-point failure after handoff validation. It is
+unreachable for a valid handoff but continues to produce a compiler diagnostic
+if orchestration state is corrupted.
+
+### Temporary backend isolation
+
+Continue to call the milestone-4 C emitter with the source AST, analysis, and
+validated frontend `main` signature. Do not pass typed IR to it, expand its
+accepted syntax, duplicate lowering logic inside it, or change its existing
+unsupported-program diagnostics. A valid program may therefore lower
+successfully and then be rejected by the temporary backend; that is the
+intended walking-skeleton boundary until milestone 7.
+
+Update stale module documentation which says lowering is disconnected or that
+milestone 6 replaces the temporary emitter. The comments should state that
+milestone 6 validates and retains IR alongside the temporary backend, while
+milestone 7 replaces that backend with IR-based C generation. Do not otherwise
+change public commands, `CompileOutput`, generated filenames, `--show-c`, host
+compiler invocation, or run behavior.
+
+### Integration tests and completion
+
+Add compiler-level tests which prove:
+
+- supported primitive programs still produce byte-for-byte identical C after
+  typed lowering runs;
+- representative valid programs covering control flow, unions, postfix `?`,
+  containers, and checked arithmetic pass lowering before receiving the
+  unchanged temporary-backend diagnostic;
+- a lowering invariant and a post-lowering validation invariant become compiler
+  diagnostics, preserve existing warnings, and neither create nor overwrite
+  generated output;
+- parser, name-and-type, semantic, and handoff failures stop before lowering,
+  retain their established diagnostic category and ordering, and preserve the
+  existing output boundary;
+- unreachable-source warnings survive successful lowering and remain ordered
+  before later compiler or temporary-backend failures; and
+- repeated compilation remains deterministic and the native walking-skeleton
+  tests continue to exercise the same generated C and executable behavior.
+
+Use test-only injection seams where invariant corruption cannot arise from
+accepted source. Keep those seams private to the compiler module, run the real
+frontend and lowering before the injected corruption point, and do not weaken
+production validation to make failures injectable. Retain the focused IR and
+lowering tests from Stages 1 through 5 rather than duplicating their exhaustive
+cases at the orchestration layer.
+
+Contributor guidance prohibits compiling, running tests, or formatting during
+implementation. External verification must run `rustc --version` followed by
+`SAO2_CC=cc cargo test`, replacing `cc` only when another supported compiler is
+required. Native end-to-end assertions must run rather than skip. After that
+evidence succeeds, mark milestone 6 complete in `ROADMAP.md`; milestone 7 then
+becomes current.
+
+Exit criterion: every diagnostic-free frontend result is lowered into closed,
+deterministic, validated, owned IR before the temporary backend runs; invariant
+failures preserve warnings and generated output; existing supported programs
+retain identical behavior; and milestone 7 can replace the backend without
+revisiting syntax, frontend semantics, or lowering.
 
 ## Boundaries
 
