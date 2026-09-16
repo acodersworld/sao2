@@ -585,7 +585,7 @@ boundaries; and Stage 1 reference and arena behavior is unchanged.
 
 ## Stage 3: Conservative struct construction and value flow
 
-Status: current.
+Status: complete.
 
 Connect struct aggregate operations to the Stage 1 heap interface and the
 Stage 2 layout plan. Every construction in this stage receives heap lifetime;
@@ -866,25 +866,345 @@ lifetime or is reclaimed.
 
 ## Stage 4: Member access and identity-preserving copy
 
-Status: planned.
+Status: current.
 
-Implement struct projections and mutation using the storage classification
-already present in typed IR:
+Enable the `Projection::StructField` paths already produced by lowering and
+validated by typed IR. Stage 4 resolves packed references only while executing
+the operation which needs the body, creates stable interior references for
+inline struct fields, and implements mutation without replacing an embedded
+slot's identity.
 
-- projecting an inline struct creates an interior packed reference with the
-  same owner_ptr and the field slot's member_ptr;
-- projecting a referenced struct loads the packed reference stored in that
-  field;
-- primitive and other inline value fields address the exact body selected by
-  member_ptr; and
-- nested projections retain the original root owner across every inline hop.
+The IR representation is sufficient. Every struct projection already records
+the receiver `DefinitionId`, `FieldId`, and `MemberStorage`; the surrounding
+typed place determines the result type. The Stage 2 layout plan supplies the
+private body type, descriptor, field offset, size, alignment, and nested layout
+identity. Do not add physical offsets, native pointers, copy operations, or
+arena placement to IR.
 
-Assignment to a referenced-struct field rebinds that field. Assignment to an
-inline-struct field must instead copy language-visible fields into the
-existing destination slot so previously created references retain their
-identity. Generate deterministic per-layout field-copy helpers, recurse
-through nested inline structs, and handle self-assignment and aliased source
-and destination safely.
+Stage 4 adds no source-level failure operation. A field access on a valid SAO2
+value cannot fail. A zero reference, reserved arena tag, inconsistent layout,
+overflowing offset, out-of-range body, or misaligned typed address is therefore
+a compiler/runtime invariant rather than a program panic.
+
+### Typed body resolution
+
+Replace the construction-only raw member resolution with one arena-neutral
+typed resolver used by construction, projection, and copy helpers. It accepts
+a `sao2_ref` and the expected immutable struct layout descriptor and returns a
+temporary byte pointer only after checking:
+
+- the reference is nonzero and has a supported owner tag;
+- the tag in `owner_ptr` selects the one arena base used for both the decoded
+  owner offset and the unmodified member offset, and both are within that
+  reservation;
+- the untagged owner offset is no greater than the member offset;
+- adding the expected body size to the member offset cannot overflow and does
+  not exceed the arena's logical capacity;
+- the selected address satisfies the expected body alignment; and
+- for a heap reference, the owner header exists and the complete expected body
+  range lies within the header's root-body range.
+
+For a heap owner, compute its end with checked arithmetic from the decoded
+owner offset and header body size. Require the selected range
+`[member_ptr, member_ptr + expected.size)` to lie inside that owner range. Also
+retain the Stage 1 lifetime and arena invariants. Do not search allocations by
+`member_ptr` and do not treat an interior pointer as the owner.
+
+For the scoped tag, which source programs still cannot produce in Stage 4,
+validate the typed range against the live scoped cursor as well as the logical
+capacity. The compiler-generated interior-reference chain provides the
+inductive proof that each child range lies within its typed parent and hence
+within the original allocation. Do not add heap-style headers or an allocation
+side table to the scoped arena.
+
+Do not infer that a reference is an allocation root merely because decoded
+`owner_ptr == member_ptr`. An inline struct in its parent's first field may
+have offset zero and therefore the same two packed words as the enclosing root,
+while having a different nominal layout. Root-versus-interior interpretation
+comes from the compiler's expected layout and projection path. Consequently,
+the typed resolver must not require the heap header's root layout identity to
+equal the expected layout identity. The Stage 3 allocation transaction remains
+the place which validates a newly allocated root's header identity.
+
+Return typed private-body pointers only inside generated helper calls or the
+single generated statement which consumes them. Never store a native pointer
+in a language local, tuple, union, allocation body, or across a generated call
+or allocation. Packed references remain the only persistent struct values.
+
+### Interior-reference construction
+
+Add a narrow helper for projecting an inline struct field. It accepts the
+parent reference, parent descriptor, selected field descriptor, and child
+descriptor. Before calling the Stage 1 `sao2_ref_interior` primitive, require:
+
+- the parent passes typed body resolution for the parent descriptor;
+- the field descriptor denotes inline storage and its nested layout identity,
+  size, and alignment agree with the child descriptor;
+- the field offset and child size fit wholly within the parent body using
+  checked arithmetic;
+- adding the field offset to the parent's untagged `member_ptr` is
+  representable by `uint32_t`; and
+- the resulting child range remains within the selected arena's live range and
+  the complete heap owner range when the owner is heap allocated.
+
+The result copies `owner_ptr` exactly and replaces only `member_ptr` with the
+absolute arena offset of the embedded field. Do not add the field offset to the
+decoded owner offset: nested projection is relative to the current exact
+member. Do not mask `member_ptr`, because an embedded body may be unaligned to
+eight bytes when its own planned alignment permits that placement.
+
+An offset-zero inline field is valid even though its packed bits can equal the
+parent's bits. Values of distinct nominal struct types cannot be compared, and
+future tracing distinguishes them with the expected layout identity. Do not
+introduce padding merely to force every embedded reference to have distinct
+bits.
+
+Referenced struct projection is different: resolve the parent's typed body and
+load the `sao2_ref` stored in that field unchanged. Its owner and member both
+come from the referenced allocation; the containing object's owner must not be
+substituted. A later dereference of that value performs ordinary typed
+resolution for the referenced layout.
+
+### General place rendering
+
+Refactor the renderer's current string-only `place` path into a typed projection
+walk which can distinguish a read value from an assignment destination. The
+exact Rust data structures may vary, but the walk must carry the current
+`TypeId`, C expression, and whether the expression represents a packed struct
+reference or an ordinary C lvalue.
+
+Process projections in their IR order:
+
+- a tuple projection appends the selected `field_N` to the current inline
+  tuple lvalue;
+- a struct projection first resolves the current packed reference as the
+  projection's declared `DefinitionId`;
+- a primitive, string, tuple, union, or unit struct field yields the exact body
+  `field_N` lvalue;
+- a referenced struct field yields the stored packed reference; and
+- an inline struct field yields a packed interior reference constructed from
+  the current reference and the planned descriptors.
+
+This must support arbitrary legal mixtures such as a tuple containing a struct
+reference, a struct containing a tuple whose member is a struct reference, and
+several inline or referenced struct hops. Every inline hop retains the original
+owner word; every referenced hop replaces both words with the loaded reference.
+
+Use the same read-place path for operands in copies, calls, binary operations,
+aggregates, union operations, intrinsics, checks, and terminators. Resolution
+helpers have no language-visible side effects, but lowering's existing
+stabilization remains responsible for source evaluation order. Do not evaluate
+a source operand or index expression again merely because its place contains
+several projections.
+
+Continue rejecting list and map projections at their existing container-stage
+capability boundary. Remove the blanket `place projection` rejection only for
+validated tuple and struct paths. Capability validation must still complete
+before rendering, and malformed projection definitions, field identities,
+storage modes, or receiver types remain IR validation errors.
+
+### Ordinary field mutation and rebinding
+
+For an assignment whose final destination is a primitive, string, tuple, union,
+unit, or referenced struct field, render the projected body field as an
+ordinary C lvalue and perform the existing assignment:
+
+- value fields copy their inline C representation; and
+- referenced struct fields copy both words of the source `sao2_ref`, rebinding
+  that field without modifying either referenced object.
+
+An unprojected struct-local assignment continues to rebind the local. It must
+not invoke a body-copy helper. Likewise, a tuple field which contains a struct
+stores a packed reference and follows tuple value semantics; only a struct
+field explicitly marked `MemberStorage::Inline` selects identity-preserving
+body replacement.
+
+Compound assignment lowering already reads the projected value into a
+temporary, performs the checked operation, and emits a final simple `Assign`.
+Once read and write place rendering works, compound assignment to eligible
+primitive fields needs no separate backend operation. Preserve the existing
+failure site and the receiver reference stabilized before evaluation of the
+right-hand side.
+
+Semantic analysis remains the sole owner of `var` and transitive mutability
+rules. The backend must not add a weaker runtime mutability test or reinterpret
+the authorization already reflected in accepted IR.
+
+### Identity-preserving inline replacement
+
+An assignment whose final projection is an inline struct field is not an
+ordinary C assignment of `sao2_ref`. Resolve the destination field's interior
+reference and the source packed reference as the same expected child layout,
+then invoke a deterministic copy helper for that layout. The destination
+reference and all references previously obtained for that embedded slot retain
+their original packed identity.
+
+Emit one private field-copy helper per struct layout with an identity-only name.
+Define helpers in the Stage 2 deterministic dependency order so every inline
+dependency precedes its owner; use `DefinitionId` as the deterministic root and
+tie-break order, not as a reason to place an owner before its dependency. Each
+interface accepts typed destination and source body pointers and copies fields
+in ascending `FieldId` order:
+
+- primitive, string, unit, tuple, union, and referenced struct fields use
+  ordinary value assignment; and
+- inline struct fields recurse into the selected child's copy helper using the
+  addresses of the embedded destination and source bodies.
+
+The helper copies language-visible fields only. It never copies a heap header,
+owner offset, layout descriptor, mark state, or other allocator metadata. It
+does not allocate, panic, construct a new packed reference, or change the
+destination slot address. Referenced objects remain shared because their packed
+references are copied unchanged.
+
+Handle exact self-assignment with an early typed-pointer equality return. Two
+distinct well-typed bodies of the same nominal layout cannot partially overlap:
+an inline occurrence of its own layout, directly or indirectly, would be the
+recursive layout cycle already rejected by analysis and `LayoutPlanner`.
+Therefore distinct source and destination pointers identify disjoint bodies,
+and deterministic field-by-field recursion is safe without a potentially
+multi-gigabyte native-stack snapshot. Do not add `restrict`, use `memcpy` or
+`memmove`, or allocate a temporary body proportional to the layout size.
+
+Use these copy helpers for Stage 3 initialization of inline fields as well, so
+fresh construction and later replacement share one recursive definition of
+language-visible copying. Construction may still write ordinary fresh fields
+directly and continues to publish its root reference only after initialization.
+
+### Aliasing and observable identity
+
+The implementation must preserve these distinctions:
+
+- reading an inline field produces a reference to the existing embedded slot,
+  not a new allocation and not the source reference from which it was
+  initialized;
+- reading a referenced field produces the exact stored reference;
+- assigning an inline field changes the values observable through every alias
+  to that destination slot but does not change any alias's packed words;
+- assigning a referenced field changes which object is reached through the
+  containing field, while aliases to the previously referenced object continue
+  to reach that object; and
+- replacing one inline sibling neither changes another sibling's identity nor
+  retargets references stored inside either sibling.
+
+An interior reference may be passed, returned, stored in a tuple or union, and
+compared just like a root reference. Stage 3 equality already compares both
+packed words, so two reads of the same inline slot compare equal and distinct
+nonzero-offset sibling slots compare unequal. Owner equality alone remains
+insufficient. Returning an interior reference is safe in Stage 4 because every
+allocation still has monotonic heap lifetime.
+
+### Backend and runtime integration
+
+Retain the Stage 1 packed-reference ABI, arena tags, reservations, and heap
+header, the Stage 2 descriptors, and the Stage 3 allocation/failure behavior.
+Extend the struct runtime section with typed range validation and interior
+construction rather than open-coding owner masks or arena selection in each
+projected expression.
+
+Generated copy helpers and typed resolver wrappers use identity-only names.
+They should be emitted in deterministic layout dependency order before
+generated functions. Use `offsetof`-validated Stage 2 field offsets and the
+existing descriptors; do not recalculate a second physical layout in place
+rendering.
+
+No write barrier is needed because milestone 9 has no collector and its heap is
+monotonic. Keep mutation behind generated helpers and field stores so milestone
+10 can add any collector integration without changing language IR. Do not add
+marking, tracing, sweeping, shadow frames, free lists, or collection triggers.
+
+All source allocations remain heap allocations. Stage 4 must not call the
+scoped allocator, save or restore scoped marks, or classify escapes. Arena
+initialization and normal host-adapter cleanup remain unchanged.
+
+### Implementation sequence
+
+Implement Stage 4 in the following order:
+
+1. Add the arena-neutral typed body-range resolver and lock heap, future scoped,
+   offset-zero interior, overflow, alignment, and owner-range behavior with
+   direct runtime tests.
+2. Add descriptor-checked inline-reference construction using the current
+   `member_ptr` plus the planned field offset. Test nested inline hops before
+   enabling general place rendering.
+3. Generate deterministic recursive copy helpers and replace Stage 3's direct
+   inline construction copy with the appropriate helper call.
+4. Refactor read-place rendering to support arbitrary tuple and struct
+   projection chains in every operand and terminator position.
+5. Refactor assignment destinations into ordinary lvalue stores, referenced
+   struct rebinding, and inline struct replacement through copy helpers.
+6. Narrow `CapabilityValidator` for tuple/struct projections while retaining
+   container, printing, ordering, hashing, escape, and scoped boundaries.
+7. Add direct generated-C and native end-to-end coverage, then remove duplicate
+   reference decoding, raw offset arithmetic, and construction-only body
+   resolution.
+
+### Tests and completion
+
+Direct IR, layout, and backend tests should verify:
+
+- typed resolution rejects zero references, reserved tags, reversed
+  owner/member ranges, checked-add overflow, arena overflow, owner-body
+  overflow, misalignment, and heap ranges outside the recorded root body;
+- offset-zero inline fields resolve successfully without being mistaken for a
+  root of the child layout;
+- inline projection preserves `owner_ptr`, changes only `member_ptr` by the
+  field offset, uses the current member rather than the root as its base, and
+  supports unaligned but correctly typed child bodies;
+- referenced projection loads both stored words and never substitutes the
+  containing owner;
+- nested tuple, inline-struct, and referenced-struct paths produce the expected
+  type and generated C in reads, calls, aggregates, checks, returns, branches,
+  and switch operations;
+- ordinary field stores and referenced-field rebinding use exact typed lvalues,
+  while an unprojected local assignment remains reference rebinding;
+- every inline assignment invokes the copy helper for the selected nominal
+  layout, recurses in `FieldId` order, copies referenced fields unchanged, and
+  leaves destination addresses and packed references stable;
+- self-assignment returns safely and sibling or cross-allocation copies do not
+  overwrite the source during recursion;
+- compound primitive field assignments retain their existing runtime checks
+  and evaluate the receiver and right-hand side in source order;
+- Stage 3 construction uses the same recursive helper for inline body values
+  without publishing a partially initialized root;
+- invalid projection metadata is rejected by IR validation before rendering,
+  and list/map projections retain their precise capability errors; and
+- no new failure operation, allocation, dependency, scoped-lifetime action,
+  escape fact, collector action, or source-visible pointer behavior appears.
+
+Native end-to-end programs should cover:
+
+- reading and writing every primitive and existing inline value representation
+  through a struct field;
+- inline and referenced fields of the same struct type, demonstrating copy
+  versus rebinding behavior;
+- references captured for nested inline slots before replacement and observed
+  afterward to prove stable destination identity;
+- self-assignment, copying between two sibling inline slots, copying between
+  allocations, and nested inline copies containing referenced fields;
+- a referenced recursive graph, including mutation through several referenced
+  hops without recursive physical layout;
+- interior references passed to and returned from functions and carried through
+  tuples, named and anonymous unions, branches, loops, and equality;
+- offset-zero and nonzero nested inline fields, including a minimally aligned
+  body at an unaligned absolute member offset; and
+- repeated reads and mutations after enough allocations to cross committed-page
+  boundaries, proving native addresses are reconstructed rather than retained.
+
+Retain the established native-test skip policy when no supported C compiler is
+available. Contributor guidance prohibits compiling, running tests, or
+formatting during implementation. External verification should use Rust 1.90
+or newer, exercise both platform branches, report native skips explicitly, and
+leave generated artifacts under `build/` only.
+
+Stage 4 is complete when every valid struct projection executes; inline
+projections produce stable interior references with the original owner;
+referenced projections preserve the stored reference; all ordinary field
+values can be read and mutated according to existing semantics; inline
+replacement recursively copies language-visible fields without changing any
+destination slot identity; aliases observe the required copy-versus-rebinding
+behavior; Stage 3 construction uses the same copy semantics; and allocation,
+escape, scoped-lifetime, and collector behavior remain unchanged.
 
 ## Stage 5: Context-insensitive escape summaries
 
