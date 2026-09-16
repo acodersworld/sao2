@@ -306,52 +306,185 @@ resolved-AST emitter.
 
 ## Stage 3: Checked arithmetic and runtime failures
 
-Generate portable, undefined-behavior-free helpers for all scalar checks already
-made explicit in IR:
+Replace every Stage-2 declaration-only scalar check with a `static` C helper
+definition. Each helper accepts the already-materialized operands followed by a
+`size_t` failure-site index and returns normally only when the subsequent C
+operation is defined and conforms to SAO2. Keep the IR operation order intact:
+precondition helpers remain immediately before their operation and finite-result
+helpers remain immediately after the float destination has been written.
 
-- integer addition, subtraction, multiplication, and negation overflow;
-- integer division and remainder by zero and signed-minimum divided by `-1`;
-- shift counts outside `0..=63` and overflowing left shift;
-- floating-point division by positive or negative zero;
-- non-finite floating-point arithmetic results; and
-- float-to-int values outside the half-open representable integer range.
+Add `<float.h>` and `<math.h>` in the fixed generated-header order. Emit C11
+`_Static_assert` declarations proving that `double` has the binary64 radix,
+precision, exponent range, and eight-byte width required by SAO2. Continue to
+reconstruct float constants from recorded bits with `memcpy`; do not replace
+that representation with decimal constants or aliasing-dependent access.
 
-Run every check against the already-materialized operands. Perform the ordinary
-C operation only after its preconditions make that operation defined. Implement
-arithmetic right shift portably, and implement checked left shift according to
-SAO2's mathematical multiplication semantics. Int-to-float remains unchecked.
+### Checked integer operations
 
-Emit a compact generated table from the IR failure-site table. Each entry names
-the target-independent failure operation, function, line, and column; the
-program metadata supplies the filename. All runtime-check diagnostics use this
-stable form:
+Implement integer checks without first evaluating the possibly undefined signed
+operation:
+
+- Addition checks positive and negative right operands against the corresponding
+  `INT64_MAX - right` or `INT64_MIN - right` bound before evaluating `left +
+  right`.
+- Subtraction checks negative and positive right operands against the
+  corresponding `INT64_MAX + right` or `INT64_MIN + right` bound before
+  evaluating `left - right`.
+- Multiplication converts each operand to an unsigned mathematical magnitude
+  without negating `INT64_MIN`. Select a magnitude limit of `INT64_MAX` for a
+  nonnegative result and `2^63` for a negative result, then compare by division
+  before evaluating the signed multiplication. Zero operands always pass.
+- Negation rejects `INT64_MIN` before applying unary minus.
+- Division and remainder reject a zero divisor. They also reject the
+  `INT64_MIN`, `-1` pair before the C `/` or `%` expression is evaluated.
+- A shift-range helper rejects counts outside `0..=63` before the count is
+  converted for an unsigned C shift. It is shared by left and right shifts but
+  reports through the operation recorded at its failure site.
+- Checked left shift treats the operation as mathematical multiplication by
+  `2^count`. Compare the left operand's unsigned magnitude against the
+  sign-dependent result limit shifted right by `count`; do not compute the
+  signed product during the check. After success, retain Stage 2's unsigned
+  bit-pattern shift and portable conversion back to `int64_t`.
+
+The Stage-2 unsigned implementation remains authoritative for bitwise
+operations and arithmetic right shift. In particular, handle a zero right-shift
+count separately and fill high bits explicitly for a negative value. No signed
+negative value is passed to C's shift operators, and no expression shifts by
+64.
+
+### Checked floating-point operations and conversions
+
+For floating-point division, reject the divisor when `right == 0.0`; this
+comparison covers both positive and negative zero before the division occurs.
+After each float addition, subtraction, multiplication, or division, apply
+`isfinite` to the materialized destination. Infinity and NaN fail, while finite
+subnormal results and underflow to either signed zero succeed.
+
+Float-to-int accepts exactly the half-open mathematical interval
+`[-0x1p63, 0x1p63)`. Test the source against those exactly representable binary
+bounds before applying the `int64_t` cast; NaN fails because it satisfies
+neither ordered bound. Conversion truncates toward zero after the check.
+Int-to-float remains an unchecked explicit `double` conversion and may lose
+precision as specified by the language.
+
+### Failure metadata and panic output
+
+Emit runtime metadata before the helper definitions. Use the program's source
+filename display spelling once, a function-name table in `FunctionId` order,
+and a compact failure table in `FailureSiteId` order. Each failure entry stores
+the target-independent `FailureOperation`, function identity, one-based line,
+and one-based column. Render filename and function spellings as deterministic
+byte arrays rather than C string escapes. When a generated C array would
+otherwise have zero elements, emit one inert sentinel element plus an explicit
+logical count of zero; never rely on a compiler extension for zero-length
+arrays.
+
+Before indexing metadata, check the supplied failure-site index against its
+logical count. An out-of-range index enters the compiler-invariant path rather
+than reading outside the table. Map the stored function identity through the
+function-name table with the same defensive check.
+
+All language panics write exact bytes to `stderr` in this form and terminate
+with `exit(EXIT_FAILURE)` without unwinding:
 
 ```text
 sao2: panic: <reason> at <filename>:<line>:<column> in <function>
 ```
 
-Explicit panic prints its message in the same location-bearing form when the
-temporary string representation is sufficient. An unhandled Error prints
-`Error(payload)` for payload kinds supported by this milestone. Every panic
-terminates with a nonzero status without unwinding. Reaching an IR
-`Unreachable` terminator traps through a separate compiler-invariant path.
+Use checked `fwrite`, `fputc`, and formatted decimal output as appropriate while
+constructing the diagnostic, but do not recursively panic if writing `stderr`
+fails. Attempt the remaining diagnostic writes where meaningful, then terminate
+with the same failure status. The trailing newline is part of the stable byte
+format.
 
-Defer float Error-payload formatting, string Error payloads, and other cases
-which require milestone 8's complete primitive formatting or interned-string
-runtime. Reject them during capability validation rather than emitting
-non-conforming output.
+Lock these reasons exactly:
+
+| Runtime condition | Reason text |
+| --- | --- |
+| integer addition overflow | `integer addition overflow` |
+| integer subtraction overflow | `integer subtraction overflow` |
+| integer multiplication overflow | `integer multiplication overflow` |
+| integer negation overflow | `integer negation overflow` |
+| integer division by zero | `integer division by zero` |
+| `INT64_MIN / -1` | `integer division overflow` |
+| integer remainder by zero | `integer remainder by zero` |
+| `INT64_MIN % -1` | `integer remainder overflow` |
+| shift count outside `0..=63` | `shift count out of range` |
+| overflowing left shift | `integer left shift overflow` |
+| float division by either zero | `floating-point division by zero` |
+| non-finite float addition | `floating-point addition produced a non-finite result` |
+| non-finite float subtraction | `floating-point subtraction produced a non-finite result` |
+| non-finite float multiplication | `floating-point multiplication produced a non-finite result` |
+| non-finite float division | `floating-point division produced a non-finite result` |
+| invalid float-to-int conversion | `float-to-int conversion out of range` |
+| failed stdout setup or write | `standard output failure` |
+
+Replace Stage 2's temporary output-failure helper with this common panic path,
+using the `FailureOperation::Output` site recorded on the intrinsic. A partial
+stdout write may already be observable; do not retry it or report a false
+ordinary return value.
+
+An explicit panic uses its temporary `sao2_string` message bytes directly as
+the reason, including embedded zero or newline bytes, then appends the same
+location suffix. An unhandled Error prints `Error(`, the supported payload, and
+`)` as its reason. This milestone supports integer decimal payloads, `true` or
+`false` boolean payloads, and raw ASCII character payload bytes. Continue to
+reject float and string Error payloads during capability validation; their
+required permanent formatting belongs to milestone 8.
+
+An IR `Unreachable` terminator does not use a language failure site. Best-effort
+write this exact compiler-invariant diagnostic to `stderr`:
+
+```text
+sao2: internal compiler error: reached unreachable IR
+```
+
+Then call `abort()`. Do not attach a source filename, function, line, or column,
+and do not route the event through the language-panic reason table.
 
 ### Tests and completion
 
-Add exact C and native execution cases for every boundary and failure class,
-including signed minimum, both float zero representations, allowed float
-underflow, shift counts `0`, `63`, negative, and `64`, and float-to-int boundary
-values. Snapshot runtime diagnostics to prove that reason, SAO2 filename,
-function, line, and column are stable.
+Construct IR directly and add exact-C tests for helper definitions, binary64
+assertions, helper-call adjacency, metadata field order, filename and function
+byte arrays, empty-table sentinels, stable operation codes, defensive identity
+checks, and byte-for-byte repeated rendering.
+
+During the required external verification, use the Stage-2 test-only C harness
+to compile and execute:
+
+- successful addition, subtraction, multiplication, negation, division, and
+  remainder at zero, one, `INT64_MIN`, `INT64_MAX`, and the nearest valid
+  operation-specific boundaries;
+- bitwise and shift results for positive and negative values, with shift counts
+  `0` and `63`;
+- failure cases for every locked integer reason, including negative and `64`
+  shift counts and both signed-minimum division cases;
+- float arithmetic with ordinary finite values, both zero encodings, finite
+  subnormal results, and underflow to positive and negative zero;
+- non-finite float results from every arithmetic operator and division by both
+  positive and negative zero;
+- float-to-int at `-0x1p63`, the greatest binary64 value below `0x1p63`, both
+  signed zero values, values immediately outside each bound, infinities, and
+  NaN; and
+- output failure, explicit panic messages, all supported Error payloads, an
+  invalid metadata identity, and the compiler-unreachable path.
+
+Snapshot exact `stderr` bytes for every reason and terminal path. Use fixtures
+whose filename and function name prove that the selected failure site supplies
+the reported function, line, and column. Include embedded zero and newline
+bytes in explicit panic and character Error payload cases, and assert process
+termination is nonzero without depending on one particular numeric status.
+
+Contributor guidance continues to prohibit compilation, execution, and
+formatting during implementation. Native cases run only in the required
+external verification, and the production compiler remains on the temporary
+resolved-AST emitter.
 
 Exit criterion: every accepted scalar arithmetic operation either produces the
-specified result or terminates through its exact IR failure site without
-invoking undefined or implementation-defined C arithmetic.
+specified result or terminates through its exact IR failure site; all generated
+checked operations avoid undefined and implementation-defined signed
+arithmetic; runtime diagnostics are byte-stable; and Stage 3 closes every
+declaration-only scalar and failure hook introduced by Stage 2.
 
 ## Stage 4: Core unions and entry adapters
 
