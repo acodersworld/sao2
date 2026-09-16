@@ -197,7 +197,7 @@ impl<'a> CapabilityValidator<'a> {
         if self.operation_uses_entry_args(operation) {
             return self.unsupported("use of the entry args parameter");
         }
-        if matches!(operation, OperationKind::Assign { destination, .. } if !destination.projections.is_empty())
+        if matches!(operation, OperationKind::Assign { destination, .. } if place_has_unsupported_read_projection(destination))
             || operation_operands_have_unsupported_projection(operation)
         {
             return self.unsupported("place projection");
@@ -739,6 +739,7 @@ impl<'a> Renderer<'a> {
         self.render_scalar_helpers();
         self.render_arena_runtime();
         self.render_struct_allocation_helpers();
+        self.render_struct_copy_helpers();
         self.render_primitive_formatters();
         self.render_string_data();
         self.render_tuple_helpers();
@@ -844,6 +845,27 @@ impl<'a> Renderer<'a> {
     fn render_struct_allocation_helpers(&mut self) {
         if !self.struct_layouts.is_empty() {
             self.output.push_str(STRUCT_ALLOCATION_RUNTIME);
+        }
+    }
+
+    fn render_struct_copy_helpers(&mut self) {
+        if self.struct_layouts.is_empty() { return; }
+        self.output.push('\n');
+        let layouts = self.struct_layouts.clone();
+        for layout in &layouts {
+            let definition = layout.definition.index();
+            let _ = writeln!(self.output, "static void sao2_copy_body_def_{definition}(sao2_body_def_{definition} *destination, const sao2_body_def_{definition} *source) {{");
+            self.output.push_str("    if (destination == source) return;\n");
+            for field in &layout.fields {
+                if field.storage == MemberStorage::Inline && field.nested_layout.is_some()
+                    && matches!(&self.program.types[field.ty.index()], Type::Nominal(inner) if matches!(self.program.definitions[inner.index()].layout, DefinitionLayout::Struct(_))) {
+                    let Type::Nominal(inner) = &self.program.types[field.ty.index()] else { unreachable!() };
+                    let _ = writeln!(self.output, "    sao2_copy_body_def_{}(&destination->field_{}, &source->field_{});", inner.index(), field.id.index(), field.id.index());
+                } else {
+                    let _ = writeln!(self.output, "    destination->field_{} = source->field_{};", field.id.index(), field.id.index());
+                }
+            }
+            self.output.push_str("}\n\n");
         }
     }
 
@@ -1385,8 +1407,13 @@ impl<'a> Renderer<'a> {
             }
             OperationKind::Assign { destination, value } => {
                 let value = self.operand(value);
-                let destination = self.place(destination);
-                let _ = writeln!(self.output, "    {destination} = {value};");
+                if let Some((definition, field)) = self.inline_assignment(destination) {
+                    let destination_ref = self.inline_destination_reference(destination, definition, field);
+                    let _ = writeln!(self.output, "    sao2_copy_body_def_{}((sao2_body_def_{0} *)sao2_resolve_body({destination_ref}, &sao2_layout_def_{0}), (const sao2_body_def_{0} *)sao2_resolve_body({value}, &sao2_layout_def_{0}));", definition.index());
+                } else {
+                    let destination = self.place(destination);
+                    let _ = writeln!(self.output, "    {destination} = {value};");
+                }
             }
             OperationKind::Call { destination, function: callee, arguments } => {
                 let arguments = arguments.iter().map(|argument| self.operand(argument)).collect::<Vec<_>>().join(", ");
@@ -1462,7 +1489,7 @@ impl<'a> Renderer<'a> {
             if field.storage == MemberStorage::Inline && field.nested_layout.is_some()
                 && matches!(&self.program.types[field.ty.index()], Type::Nominal(inner) if matches!(self.program.definitions[inner.index()].layout, DefinitionLayout::Struct(_))) {
                 let Type::Nominal(inner) = &self.program.types[field.ty.index()] else { unreachable!() };
-                let _ = writeln!(self.output, "    {{ unsigned char *sao2_inline_source_{id}; if (!sao2_ref_member({value}, &sao2_inline_source_{id}) || ((uintptr_t)sao2_inline_source_{id} % _Alignof(sao2_body_def_{}) != 0)) sao2_compiler_invariant(); sao2_struct_body_{id}->field_{} = *(sao2_body_def_{} *)sao2_inline_source_{id}; }}", inner.index(), field.id.index(), inner.index());
+                let _ = writeln!(self.output, "    sao2_copy_body_def_{}(&sao2_struct_body_{id}->field_{}, (const sao2_body_def_{0} *)sao2_resolve_body({value}, &sao2_layout_def_{0}));", inner.index(), field.id.index());
             } else {
                 let _ = writeln!(self.output, "    sao2_struct_body_{id}->field_{} = {value};", field.id.index());
             }
@@ -1712,18 +1739,57 @@ impl<'a> Renderer<'a> {
     }
 
     fn place(&self, place: &Place) -> String {
+        self.place_through(place, place.projections.len())
+    }
+
+    fn place_through(&self, place: &Place, count: usize) -> String {
         let mut rendered = format!("sao2_local_{}", place.local.index());
-        for projection in &place.projections {
+        for projection in place.projections.iter().take(count) {
             match projection {
                 Projection::TupleField { field, .. } => {
                     let _ = write!(rendered, ".field_{}", field.index());
                 }
-                Projection::StructField { .. } | Projection::ListIndex { .. } | Projection::MapIndex { .. } => {
+                Projection::StructField { definition, field, storage } => {
+                    let layout = self.struct_layout(*definition);
+                    let field_layout = layout.fields.iter().find(|item| item.id == *field).expect("validated struct field");
+                    let parent = rendered;
+                    let body = format!("((sao2_body_def_{0} *)sao2_resolve_body({parent}, &sao2_layout_def_{0}))", definition.index());
+                    if *storage == MemberStorage::Inline && field_layout.nested_layout.is_some() && self.is_struct_type(field_layout.ty) {
+                        let Type::Nominal(child) = &self.program.types[field_layout.ty.index()] else { unreachable!() };
+                        rendered = format!("sao2_project_inline({parent}, &sao2_layout_def_{}, &sao2_layout_fields_def_{}[{}], &sao2_layout_def_{})", definition.index(), definition.index(), field.index(), child.index());
+                    } else {
+                        rendered = format!("{body}->field_{}", field.index());
+                    }
+                }
+                Projection::ListIndex { .. } | Projection::MapIndex { .. } => {
                     unreachable!("capability validation rejected projection")
                 }
             }
         }
         rendered
+    }
+
+    fn struct_layout(&self, definition: DefinitionId) -> &StructLayout {
+        self.struct_layouts.iter().find(|layout| layout.definition == definition).expect("validated struct layout")
+    }
+
+    fn inline_assignment(&self, place: &Place) -> Option<(DefinitionId, ir::FieldId)> {
+        match place.projections.last()? {
+            Projection::StructField { definition, field, storage: MemberStorage::Inline }
+                if self.struct_layout(*definition).fields.iter().any(|item| item.id == *field && item.nested_layout.is_some()) => {
+                    let layout = self.struct_layout(*definition);
+                    let item = layout.fields.iter().find(|item| item.id == *field).expect("validated inline field");
+                    let Type::Nominal(child) = &self.program.types[item.ty.index()] else { unreachable!() };
+                    Some((*child, *field))
+                }
+            _ => None,
+        }
+    }
+
+    fn inline_destination_reference(&self, place: &Place, child: DefinitionId, field: ir::FieldId) -> String {
+        let parent = self.place_through(place, place.projections.len() - 1);
+        let Projection::StructField { definition: parent_definition, .. } = place.projections.last().expect("inline projection") else { unreachable!() };
+        format!("sao2_project_inline({parent}, &sao2_layout_def_{}, &sao2_layout_fields_def_{}[{}], &sao2_layout_def_{})", parent_definition.index(), parent_definition.index(), field.index(), child.index())
     }
 
     fn place_type(&self, function: &Function, place: &Place) -> TypeId {
@@ -1735,7 +1801,12 @@ impl<'a> Renderer<'a> {
                         else { unreachable!("validated tuple projection") };
                     fields[field.index()]
                 }
-                Projection::StructField { .. } | Projection::ListIndex { .. } | Projection::MapIndex { .. } => {
+                Projection::StructField { definition, field, .. } => {
+                    let DefinitionLayout::Struct(fields) = &self.program.definitions[definition.index()].layout
+                        else { unreachable!("validated struct projection") };
+                    fields[field.index()].ty
+                }
+                Projection::ListIndex { .. } | Projection::MapIndex { .. } => {
                     unreachable!("capability validation rejected projection")
                 }
             };
@@ -1848,7 +1919,7 @@ fn failure_operation_macro(operation: FailureOperation) -> &'static str {
 
 const ARENA_RUNTIME: &str = r#"
 
-/* Stage 3 arena runtime. Struct construction uses the monotonic heap only. */
+/* Stage 4 arena runtime. Struct construction and projections use the monotonic heap only. */
 #define SAO2_ARENA_CAPACITY UINT64_C(4294967296)
 #define SAO2_ARENA_INITIAL_CURSOR UINT64_C(8)
 #define SAO2_REF_OWNER_TAG_MASK UINT32_C(7)
@@ -2134,6 +2205,50 @@ static inline bool sao2_ref_equal(sao2_ref left, sao2_ref right) {
     return left.owner_ptr == right.owner_ptr && left.member_ptr == right.member_ptr;
 }
 
+static unsigned char *sao2_resolve_body(sao2_ref reference, const sao2_layout_descriptor *layout) {
+    sao2_arena_kind kind;
+    sao2_arena *arena;
+    sao2_heap_header *header;
+    uint64_t owner, member, end, owner_end;
+    if (!sao2_ref_kind(reference, &kind)) sao2_compiler_invariant();
+    arena = sao2_arena_for_kind(kind);
+    owner = (uint64_t)(reference.owner_ptr & ~SAO2_REF_OWNER_TAG_MASK);
+    member = (uint64_t)reference.member_ptr;
+    if (arena->base == NULL || owner == 0 || member == 0 || owner > member
+        || owner >= arena->capacity || member >= arena->capacity
+        || layout->alignment == 0 || member > UINT64_MAX - layout->size) sao2_compiler_invariant();
+    end = member + layout->size;
+    if (end > arena->capacity || (uintptr_t)(arena->base + (size_t)member) % layout->alignment != 0)
+        sao2_compiler_invariant();
+    if (kind == SAO2_ARENA_HEAP) {
+        if (!sao2_heap_header_for(reference, &header) || header->lifetime != SAO2_HEAP_LIFETIME
+            || header->body_size > UINT64_MAX - owner)
+            sao2_compiler_invariant();
+        owner_end = owner + header->body_size;
+        if (end > owner_end) sao2_compiler_invariant();
+    } else if (end > arena->cursor) {
+        sao2_compiler_invariant();
+    }
+    return arena->base + (size_t)member;
+}
+
+static sao2_ref sao2_project_inline(sao2_ref parent, const sao2_layout_descriptor *parent_layout,
+    const sao2_layout_field_descriptor *field, const sao2_layout_descriptor *child_layout) {
+    sao2_ref child;
+    uint64_t member, field_end;
+    (void)sao2_resolve_body(parent, parent_layout);
+    if (field->storage != SAO2_LAYOUT_FIELD_INLINE || field->inline_layout != child_layout->identity
+        || field->size != child_layout->size || field->alignment != child_layout->alignment
+        || field->offset > parent_layout->size || child_layout->size > parent_layout->size - field->offset
+        || field->offset > UINT64_MAX - (uint64_t)parent.member_ptr) sao2_compiler_invariant();
+    member = (uint64_t)parent.member_ptr + field->offset;
+    field_end = member + child_layout->size;
+    if (member == 0 || member > UINT32_MAX || field_end < member) sao2_compiler_invariant();
+    if (!sao2_ref_interior(parent, member, &child)) sao2_compiler_invariant();
+    (void)sao2_resolve_body(child, child_layout);
+    return child;
+}
+
 static void sao2_allocate_struct(const sao2_layout_descriptor *layout, size_t site,
     sao2_ref *reference, unsigned char **body) {
     sao2_arena_result status = sao2_heap_allocate(layout->size, SAO2_REF_ALIGNMENT,
@@ -2154,8 +2269,8 @@ static void sao2_allocate_struct(const sao2_layout_descriptor *layout, size_t si
         || owner_offset == 0 || reference->member_ptr != owner_offset
         || !sao2_heap_header_for(*reference, &header)
         || header->body_size != layout->size || header->layout_identity != layout->identity
-        || !sao2_ref_member(*reference, body)
-        || ((uintptr_t)*body % layout->alignment) != 0) sao2_compiler_invariant();
+        ) sao2_compiler_invariant();
+    *body = sao2_resolve_body(*reference, layout);
 }
 "#;
 
@@ -2704,7 +2819,8 @@ fn visit_terminator_places(terminator: &TerminatorKind, visitor: &mut impl FnMut
 }
 
 fn place_has_unsupported_read_projection(place: &Place) -> bool {
-    place.projections.iter().any(|projection| !matches!(projection, Projection::TupleField { .. }))
+    place.projections.iter().any(|projection| matches!(projection,
+        Projection::ListIndex { .. } | Projection::MapIndex { .. }))
 }
 
 fn operation_operands_have_unsupported_projection(operation: &OperationKind) -> bool {
@@ -2782,7 +2898,7 @@ mod tests {
         let emitted = emit(&program).unwrap();
         let reference = emitted.find("typedef struct {\n    uint32_t owner_ptr;\n    uint32_t member_ptr;\n} sao2_ref;").unwrap();
         let aggregate = emitted.find("typedef struct sao2_interned_string {").unwrap();
-        let runtime = emitted.find("/* Stage 3 arena runtime.").unwrap();
+        let runtime = emitted.find("/* Stage 4 arena runtime.").unwrap();
         let prototype = emitted.find("sao2_unit sao2_fn_0(void);").unwrap();
         assert!(reference < aggregate && aggregate < runtime && runtime < prototype);
         assert!(emitted.contains("_Static_assert(sizeof(sao2_ref) == 8"));
@@ -2835,6 +2951,7 @@ mod tests {
         let mut main = Function::new("main", types.int);
         let value = main.add_local(point, None, LocalOrigin::Temporary);
         let equal = main.add_local(types.boolean, None, LocalOrigin::Temporary);
+        let projected = main.add_local(types.int, None, LocalOrigin::Temporary);
         let block = main.add_block();
         main.entry = Some(block);
         main.blocks[block.index()].push(OperationKind::Aggregate {
@@ -2844,6 +2961,12 @@ mod tests {
         main.blocks[block.index()].push(OperationKind::Binary {
             destination: equal, operator: BinaryOperator::Equal,
             left: Operand::Copy(Place::local(value)), right: Operand::Copy(Place::local(value)),
+        }, location);
+        main.blocks[block.index()].push(OperationKind::Copy {
+            destination: projected,
+            operand: Operand::Copy(Place::projected(value, vec![Projection::StructField {
+                definition, field: ir::FieldId::from_index(0), storage: MemberStorage::Inline,
+            }])),
         }, location);
         main.blocks[block.index()].terminate(TerminatorKind::Return(constant(types.int, ConstantValue::Integer(0))), location);
         let main = program.add_function(main);
@@ -2855,6 +2978,8 @@ mod tests {
         assert!(emitted.contains("sao2_struct_body_0->field_0 = INT64_C(7);"));
         assert!(emitted.contains("sao2_local_0 = sao2_struct_ref_0;"));
         assert!(emitted.contains("sao2_local_1 = sao2_ref_equal(sao2_local_0, sao2_local_0);"));
+        assert!(emitted.contains("sao2_local_2 = ((sao2_body_def_0 *)sao2_resolve_body(sao2_local_0, &sao2_layout_def_0))->field_0;"));
+        assert!(emitted.contains("static unsigned char *sao2_resolve_body"));
         assert!(emitted.contains("sao2_fail(site, SAO2_FAILURE_STRUCT_ALLOCATION"));
     }
 
@@ -3224,7 +3349,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_tuple_projection_and_rejects_later_projection_printing_builtins_and_terminators() {
+    fn renders_tuple_projection_and_keeps_container_projection_boundaries() {
         let (mut projection_program, types, location) = program();
         let mut tuple = NominalDefinition::tuple("Tuple");
         let field = tuple.add_tuple_field(types.int);
@@ -3267,11 +3392,8 @@ mod tests {
         );
         let main = assignment_program.add_function(main);
         assignment_program.entry = Some(main);
-        assert_unsupported(
-            emit(&assignment_program),
-            "place projection",
-            Some(OperationSite::Operation(0)),
-        );
+        let emitted = emit(&assignment_program).unwrap();
+        assert!(emitted.contains("sao2_local_0.field_0 = INT64_C(1);"));
 
         let (mut index_program, types, location) = program();
         let failure = index_program.intern_failure_site(FailureSite {
