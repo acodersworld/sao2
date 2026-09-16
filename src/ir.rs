@@ -1429,6 +1429,9 @@ impl<'a> Validator<'a> {
             }
             Aggregate { destination, aggregate } => {
                 let result = self.validate_aggregate(function, aggregate)?;
+                if let crate::ir::Aggregate::Struct { failure, .. } = aggregate
+                    && self.program.failure_sites[failure.index()].location != operation.location
+                { return Err(self.error("struct allocation failure site has the wrong source location")); }
                 self.destination(function, *destination, result, "aggregate")
             }
             UnionInject { destination, union_type, alternative, payload } => {

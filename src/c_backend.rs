@@ -225,7 +225,7 @@ impl<'a> CapabilityValidator<'a> {
                 let ty = self.operand_type(function, left);
                 if self.is_scalar(ty)
                     || matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual)
-                        && self.is_equatable_tuple(ty, &mut Vec::new())
+                        && (self.is_struct(ty) || self.is_equatable_tuple(ty, &mut Vec::new()))
                 {
                     Ok(())
                 } else {
@@ -238,7 +238,7 @@ impl<'a> CapabilityValidator<'a> {
                 self.executable_union_use(self.operand_type(function, value))
             }
             OperationKind::Aggregate { aggregate: ir::Aggregate::Tuple { .. }, .. } => Ok(()),
-            OperationKind::Aggregate { aggregate: ir::Aggregate::Struct { .. }, .. } => self.unsupported("struct aggregate construction"),
+            OperationKind::Aggregate { aggregate: ir::Aggregate::Struct { .. }, .. } => Ok(()),
             OperationKind::Aggregate { .. } => self.unsupported("aggregate construction"),
             OperationKind::StringIndex { .. } => Ok(()),
             OperationKind::Intrinsic { intrinsic, arguments, .. } => match intrinsic {
@@ -285,7 +285,7 @@ impl<'a> CapabilityValidator<'a> {
             Type::Unit | Type::Primitive(_) => Ok(()),
             Type::Nominal(definition) => match &self.program.definitions[definition.index()].layout {
                 DefinitionLayout::Tuple(_) | DefinitionLayout::Union(_) => Ok(()),
-                DefinitionLayout::Struct(_) => self.unsupported(format!("{description} uses a struct")),
+                DefinitionLayout::Struct(_) => Ok(()),
             },
             Type::Union(_) => Ok(()),
             Type::List(_) | Type::Map { .. } => self.unsupported(format!("{description} uses container storage")),
@@ -312,6 +312,11 @@ impl<'a> CapabilityValidator<'a> {
 
     fn is_scalar(&self, ty: TypeId) -> bool {
         matches!(&self.program.types[ty.index()], Type::Unit | Type::Primitive(_))
+    }
+
+    fn is_struct(&self, ty: TypeId) -> bool {
+        matches!(&self.program.types[ty.index()], Type::Nominal(definition)
+            if matches!(self.program.definitions[definition.index()].layout, DefinitionLayout::Struct(_)))
     }
 
     fn executable_union_use(&self, ty: TypeId) -> Result<(), CEmissionError> {
@@ -352,7 +357,7 @@ impl<'a> CapabilityValidator<'a> {
                     visiting.pop();
                     supported
                 }
-                DefinitionLayout::Struct(_) => false,
+                DefinitionLayout::Struct(_) => true,
             },
             Type::List(_) | Type::Map { .. } => false,
         }
@@ -366,7 +371,8 @@ impl<'a> CapabilityValidator<'a> {
         visiting.push(ty);
         let equatable = fields.iter().all(|field| match &self.program.types[field.index()] {
             Type::Unit | Type::Primitive(_) => true,
-            Type::Nominal(_) => self.is_equatable_tuple(*field, visiting),
+            Type::Nominal(definition) => matches!(self.program.definitions[definition.index()].layout, DefinitionLayout::Struct(_))
+                || self.is_equatable_tuple(*field, visiting),
             Type::Union(_) | Type::List(_) | Type::Map { .. } => false,
         });
         visiting.pop();
@@ -732,6 +738,7 @@ impl<'a> Renderer<'a> {
         self.render_writer_declarations();
         self.render_scalar_helpers();
         self.render_arena_runtime();
+        self.render_struct_allocation_helpers();
         self.render_primitive_formatters();
         self.render_string_data();
         self.render_tuple_helpers();
@@ -832,6 +839,12 @@ impl<'a> Renderer<'a> {
 
     fn render_arena_runtime(&mut self) {
         self.output.push_str(ARENA_RUNTIME);
+    }
+
+    fn render_struct_allocation_helpers(&mut self) {
+        if !self.struct_layouts.is_empty() {
+            self.output.push_str(STRUCT_ALLOCATION_RUNTIME);
+        }
     }
 
     fn render_writer_declarations(&mut self) {
@@ -1123,10 +1136,11 @@ impl<'a> Renderer<'a> {
             Type::Unit => "true".to_owned(),
             Type::Primitive(PrimitiveType::Str) => format!("{left} == {right}"),
             Type::Primitive(_) => format!("{left} == {right}"),
-            Type::Nominal(definition) => format!(
-                "sao2_tuple_equal_def_{}({left}, {right})",
-                definition.index(),
-            ),
+            Type::Nominal(definition) => match &self.program.definitions[definition.index()].layout {
+                DefinitionLayout::Struct(_) => format!("sao2_ref_equal({left}, {right})"),
+                DefinitionLayout::Tuple(_) => format!("sao2_tuple_equal_def_{}({left}, {right})", definition.index()),
+                DefinitionLayout::Union(_) => unreachable!(),
+            },
             Type::Union(_) | Type::List(_) | Type::Map { .. } => unreachable!(),
         }
     }
@@ -1163,7 +1177,8 @@ impl<'a> Renderer<'a> {
         visiting.push(definition);
         let equatable = fields.iter().all(|field| match &self.program.types[field.index()] {
             Type::Unit | Type::Primitive(_) => true,
-            Type::Nominal(inner) => self.is_equatable_tuple_definition(*inner, visiting),
+            Type::Nominal(inner) => matches!(self.program.definitions[inner.index()].layout, DefinitionLayout::Struct(_))
+                || self.is_equatable_tuple_definition(*inner, visiting),
             Type::Union(_) | Type::List(_) | Type::Map { .. } => false,
         });
         visiting.pop();
@@ -1419,11 +1434,41 @@ impl<'a> Renderer<'a> {
                     let _ = writeln!(self.output, "    sao2_local_{}.field_{index} = {value};", destination.index());
                 }
             }
+            OperationKind::Aggregate { destination, aggregate: ir::Aggregate::Struct { definition, fields, failure } } => {
+                self.render_struct_aggregate(*destination, *definition, fields, *failure);
+            }
             OperationKind::Check(check) => self.render_check(function, check),
             OperationKind::Aggregate { .. } | OperationKind::Builtin { .. }
             | OperationKind::BeginIteration { .. } | OperationKind::EndIteration { .. }
             | OperationKind::IterationValue { .. } => unreachable!("capability validation rejected operation"),
         }
+    }
+
+    fn render_struct_aggregate(&mut self, destination: LocalId, definition: DefinitionId,
+        operands: &[(ir::FieldId, Operand)], failure: FailureSiteId) {
+        let layout = self.struct_layouts.iter().find(|item| item.definition == definition)
+            .expect("validated struct layout").clone();
+        let id = destination.index();
+        self.output.push_str("    {\n");
+        let _ = writeln!(self.output, "    sao2_ref sao2_struct_ref_{id};");
+        let _ = writeln!(self.output, "    unsigned char *sao2_struct_bytes_{id};");
+        let _ = writeln!(self.output, "    sao2_body_def_{} *sao2_struct_body_{id};", definition.index());
+        let _ = writeln!(self.output, "    sao2_allocate_struct(&sao2_layout_def_{}, {}, &sao2_struct_ref_{id}, &sao2_struct_bytes_{id});", definition.index(), failure.index());
+        let _ = writeln!(self.output, "    sao2_struct_body_{id} = (sao2_body_def_{0} *)sao2_struct_bytes_{id};", definition.index());
+        for field in &layout.fields {
+            let (_, operand) = operands.iter().find(|(field_id, _)| *field_id == field.id)
+                .expect("validated struct field operand");
+            let value = self.operand(operand);
+            if field.storage == MemberStorage::Inline && field.nested_layout.is_some()
+                && matches!(&self.program.types[field.ty.index()], Type::Nominal(inner) if matches!(self.program.definitions[inner.index()].layout, DefinitionLayout::Struct(_))) {
+                let Type::Nominal(inner) = &self.program.types[field.ty.index()] else { unreachable!() };
+                let _ = writeln!(self.output, "    {{ unsigned char *sao2_inline_source_{id}; if (!sao2_ref_member({value}, &sao2_inline_source_{id}) || ((uintptr_t)sao2_inline_source_{id} % _Alignof(sao2_body_def_{}) != 0)) sao2_compiler_invariant(); sao2_struct_body_{id}->field_{} = *(sao2_body_def_{} *)sao2_inline_source_{id}; }}", inner.index(), field.id.index(), inner.index());
+            } else {
+                let _ = writeln!(self.output, "    sao2_struct_body_{id}->field_{} = {value};", field.id.index());
+            }
+        }
+        let _ = writeln!(self.output, "    sao2_local_{id} = sao2_struct_ref_{id};");
+        self.output.push_str("    }\n");
     }
 
     fn render_terminator(&mut self, function: &Function, terminator: &TerminatorKind) {
@@ -1608,6 +1653,13 @@ impl<'a> Renderer<'a> {
                 _ => unreachable!("capability validation rejected tuple binary operation"),
             };
         }
+        if self.is_struct_type(ty) {
+            return match operator {
+                BinaryOperator::Equal => format!("sao2_ref_equal({left}, {right})"),
+                BinaryOperator::NotEqual => format!("!sao2_ref_equal({left}, {right})"),
+                _ => unreachable!("capability validation rejected struct binary operation"),
+            };
+        }
         match operator {
             BinaryOperator::BitwiseOr => format!("sao2_int_from_bits(sao2_int_to_bits({left}) | sao2_int_to_bits({right}))"),
             BinaryOperator::BitwiseXor => format!("sao2_int_from_bits(sao2_int_to_bits({left}) ^ sao2_int_to_bits({right}))"),
@@ -1716,6 +1768,11 @@ impl<'a> Renderer<'a> {
             Type::List(_) | Type::Map { .. } => unreachable!("capability validation rejected container C type"),
         }
     }
+
+    fn is_struct_type(&self, ty: TypeId) -> bool {
+        matches!(&self.program.types[ty.index()], Type::Nominal(definition)
+            if matches!(self.program.definitions[definition.index()].layout, DefinitionLayout::Struct(_)))
+    }
 }
 
 const ALL_FAILURE_OPERATIONS: &[FailureOperation] = &[
@@ -1791,7 +1848,7 @@ fn failure_operation_macro(operation: FailureOperation) -> &'static str {
 
 const ARENA_RUNTIME: &str = r#"
 
-/* Stage 1 arena prototype.  Source-level allocation remains unsupported. */
+/* Stage 3 arena runtime. Struct construction uses the monotonic heap only. */
 #define SAO2_ARENA_CAPACITY UINT64_C(4294967296)
 #define SAO2_ARENA_INITIAL_CURSOR UINT64_C(8)
 #define SAO2_REF_OWNER_TAG_MASK UINT32_C(7)
@@ -2068,6 +2125,37 @@ static bool sao2_scoped_restore(sao2_scoped_mark mark) {
         return false;
     sao2_scoped_arena.cursor = mark;
     return true;
+}
+"#;
+
+const STRUCT_ALLOCATION_RUNTIME: &str = r#"
+
+static inline bool sao2_ref_equal(sao2_ref left, sao2_ref right) {
+    return left.owner_ptr == right.owner_ptr && left.member_ptr == right.member_ptr;
+}
+
+static void sao2_allocate_struct(const sao2_layout_descriptor *layout, size_t site,
+    sao2_ref *reference, unsigned char **body) {
+    sao2_arena_result status = sao2_heap_allocate(layout->size, SAO2_REF_ALIGNMENT,
+        layout->identity, reference);
+    sao2_heap_header *header;
+    uint32_t owner_offset;
+    if (status == SAO2_ARENA_EXHAUSTED) {
+        static const unsigned char reason[] = "heap arena exhausted";
+        sao2_fail(site, SAO2_FAILURE_STRUCT_ALLOCATION, reason, sizeof reason - 1);
+    }
+    if (status == SAO2_ARENA_COMMIT_FAILED) {
+        static const unsigned char reason[] = "unable to commit heap storage";
+        sao2_fail(site, SAO2_FAILURE_STRUCT_ALLOCATION, reason, sizeof reason - 1);
+    }
+    if (status != SAO2_ARENA_OK) sao2_compiler_invariant();
+    owner_offset = reference->owner_ptr & ~SAO2_REF_OWNER_TAG_MASK;
+    if ((reference->owner_ptr & SAO2_REF_OWNER_TAG_MASK) != SAO2_REF_HEAP_TAG
+        || owner_offset == 0 || reference->member_ptr != owner_offset
+        || !sao2_heap_header_for(*reference, &header)
+        || header->body_size != layout->size || header->layout_identity != layout->identity
+        || !sao2_ref_member(*reference, body)
+        || ((uintptr_t)*body % layout->alignment) != 0) sao2_compiler_invariant();
 }
 "#;
 
@@ -2694,7 +2782,7 @@ mod tests {
         let emitted = emit(&program).unwrap();
         let reference = emitted.find("typedef struct {\n    uint32_t owner_ptr;\n    uint32_t member_ptr;\n} sao2_ref;").unwrap();
         let aggregate = emitted.find("typedef struct sao2_interned_string {").unwrap();
-        let runtime = emitted.find("/* Stage 1 arena prototype.").unwrap();
+        let runtime = emitted.find("/* Stage 3 arena runtime.").unwrap();
         let prototype = emitted.find("sao2_unit sao2_fn_0(void);").unwrap();
         assert!(reference < aggregate && aggregate < runtime && runtime < prototype);
         assert!(emitted.contains("_Static_assert(sizeof(sao2_ref) == 8"));
@@ -2732,6 +2820,42 @@ mod tests {
         assert!(emitted.contains("sao2_layout_def_0 = { UINT64_C(0), UINT64_C(8), UINT64_C(8), 1"));
         assert!(emitted.contains("sao2_layout_def_1 = { UINT64_C(1), UINT64_C(24), UINT64_C(8), 3"));
         assert!(!emitted.contains("names must not leak"));
+    }
+
+    #[test]
+    fn renders_heap_struct_construction_and_reference_equality() {
+        let (mut program, types, location) = program();
+        let definition = program.add_definition(NominalDefinition::structure("Point"));
+        let point = program.intern_type(Type::Nominal(definition));
+        program.definitions[definition.index()].add_struct_field("x", types.int, MemberStorage::Inline);
+        let failure = program.intern_failure_site(ir::FailureSite {
+            location, function: FunctionId::from_index(0), operation: FailureOperation::StructAllocation,
+            line: 1, column: 1,
+        });
+        let mut main = Function::new("main", types.int);
+        let value = main.add_local(point, None, LocalOrigin::Temporary);
+        let equal = main.add_local(types.boolean, None, LocalOrigin::Temporary);
+        let block = main.add_block();
+        main.entry = Some(block);
+        main.blocks[block.index()].push(OperationKind::Aggregate {
+            destination: value,
+            aggregate: Aggregate::Struct { definition, fields: vec![(ir::FieldId::from_index(0), constant(types.int, ConstantValue::Integer(7)))], failure },
+        }, location);
+        main.blocks[block.index()].push(OperationKind::Binary {
+            destination: equal, operator: BinaryOperator::Equal,
+            left: Operand::Copy(Place::local(value)), right: Operand::Copy(Place::local(value)),
+        }, location);
+        main.blocks[block.index()].terminate(TerminatorKind::Return(constant(types.int, ConstantValue::Integer(0))), location);
+        let main = program.add_function(main);
+        program.entry = Some(main);
+
+        let emitted = emit(&program).unwrap();
+        assert!(emitted.contains("static inline bool sao2_ref_equal(sao2_ref left, sao2_ref right)"));
+        assert!(emitted.contains("sao2_allocate_struct(&sao2_layout_def_0, 0, &sao2_struct_ref_0, &sao2_struct_bytes_0);"));
+        assert!(emitted.contains("sao2_struct_body_0->field_0 = INT64_C(7);"));
+        assert!(emitted.contains("sao2_local_0 = sao2_struct_ref_0;"));
+        assert!(emitted.contains("sao2_local_1 = sao2_ref_equal(sao2_local_0, sao2_local_0);"));
+        assert!(emitted.contains("sao2_fail(site, SAO2_FAILURE_STRUCT_ALLOCATION"));
     }
 
     #[test]
