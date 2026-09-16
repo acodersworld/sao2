@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::analysis;
 use crate::c_backend;
 use crate::diagnostic::{Diagnostic, Diagnostics, Warnings};
+use crate::escape;
 use crate::ir;
 use crate::lowering::{self, LoweringError};
 use crate::parser;
@@ -147,7 +148,18 @@ fn compile_into_with_pipeline(
             warnings: semantic.warnings,
         });
     }
-    let generated_c = match c_backend::emit(&ir_program) {
+    let allocation_plan = match escape::analyze(&ir_program) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Err(CompileFailure {
+                error: CompileError::Diagnostic(Diagnostic::compiler(format!(
+                    "escape-analysis boundary failed: {error}"
+                ))),
+                warnings: semantic.warnings,
+            });
+        }
+    };
+    let generated_c = match c_backend::emit_with_plan(&ir_program, &allocation_plan) {
         Ok(generated_c) => generated_c,
         Err(error) => {
             return Err(CompileFailure {

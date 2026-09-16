@@ -4,6 +4,7 @@ mod c_backend;
 mod cli;
 mod compiler;
 mod diagnostic;
+mod escape;
 mod host_compiler;
 mod ir;
 mod lexer;

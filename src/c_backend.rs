@@ -11,9 +11,26 @@ use crate::ir::{
     NumericConversion, OperationKind, OperationSite, Operand, Place, PrimitiveType, Projection,
     RuntimeCheck, TerminatorKind, Type, TypeId, UnaryOperator, ValidationError,
 };
+use crate::escape::{self, AllocationPlan};
 
+#[allow(dead_code)] // Retained as the validated-program convenience boundary for direct backend tests.
 pub(crate) fn emit(program: &ir::Program) -> Result<String, CEmissionError> {
+    // Keep the longstanding direct-backend contract: malformed IR is reported
+    // as InvalidIr before any optional analysis boundary is entered.
     program.validate().map_err(CEmissionError::InvalidIr)?;
+    let plan = escape::analyze(program).map_err(|error| CEmissionError::Invariant(BackendInvariant {
+        definition: None, ty: None, message: error.to_string(),
+    }))?;
+    emit_with_plan(program, &plan)
+}
+
+/// Stage 5's explicit backend boundary.  The plan is deliberately validated
+/// here even though Stage 5 still renders both classes through the heap.
+pub(crate) fn emit_with_plan(program: &ir::Program, plan: &AllocationPlan) -> Result<String, CEmissionError> {
+    program.validate().map_err(CEmissionError::InvalidIr)?;
+    plan.validate(program).map_err(|error| CEmissionError::Invariant(BackendInvariant {
+        definition: None, ty: None, message: error.to_string(),
+    }))?;
     CapabilityValidator::new(program).validate()?;
     let layouts = LayoutPlanner::new(program).plan()?;
     Ok(Renderer::new(program, layouts).render())
