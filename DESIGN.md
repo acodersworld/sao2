@@ -347,8 +347,16 @@ a primitive value, an immutable tuple recursively containing printable values,
 or a union whose every alternative has a recursively printable payload. The
 zero-argument `println` writes an empty line. Unit prints as `()`. Strings and
 characters print their contents without quotes, integers use decimal, floats
-use the shortest decimal representation that round-trips exactly, and booleans
-print as `true` or `false`.
+use the following canonical shortest-round-trip representation, and booleans
+print as `true` or `false`: the implementation chooses the first significant
+digit precision from 1 through 17 for which C-locale `%g` parses back to the
+same binary64 value. Exponents use lowercase `e`, omit a positive sign and
+redundant leading zeroes; positive and negative zero print as `0` and `-0`.
+Thus `1000000.0` prints as `1e6` and `-0.0` prints as `-0`.
+
+Tuples print in constructor form, retaining their nominal name and declaration
+order: `Pair(1, true)`. Fields are separated by `, ` and printable nested
+values use these same rules without quotes.
 
 Union values retain their constructor form when printed. A named untagged union
 prints `Union(payload)`, a named tagged union prints `Union.Tag(payload)`, a

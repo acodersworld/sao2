@@ -6,7 +6,7 @@
 use std::fmt::{self, Write as _};
 
 use crate::ir::{
-    self, BinaryOperator, ConstantValue, DefinitionId, DefinitionLayout, FailureOperation,
+    self, AlternativeConstructor, BinaryOperator, ConstantValue, DefinitionId, DefinitionLayout, FailureOperation,
     FailureSiteId, Function, FunctionId, IntegerOperation, Intrinsic, LocalId,
     NumericConversion, OperationKind, OperationSite, Operand, Place, PrimitiveType, Projection,
     RuntimeCheck, TerminatorKind, Type, TypeId, UnaryOperator, ValidationError,
@@ -270,12 +270,10 @@ impl<'a> CapabilityValidator<'a> {
             TerminatorKind::Switch { union, .. } => {
                 self.require_executable_union(self.operand_type(function, union))
             }
-            TerminatorKind::ErrorPanic { payload, .. } => {
-                match &self.program.types[self.operand_type(function, payload).index()] {
-                    Type::Primitive(PrimitiveType::Int | PrimitiveType::Bool | PrimitiveType::Char) => Ok(()),
-                    _ => self.unsupported("Error panic payload formatting"),
-                }
-            }
+            TerminatorKind::ErrorPanic { payload, .. } => match &self.program.types[self.operand_type(function, payload).index()] {
+                Type::Primitive(_) => Ok(()),
+                _ => self.unsupported("Error panic payload formatting"),
+            },
         }
     }
 
@@ -376,8 +374,36 @@ impl<'a> CapabilityValidator<'a> {
     }
 
     fn output_operand(&self, function: &Function, operand: &Operand) -> bool {
-        matches!(&self.program.types[self.operand_type(function, operand).index()],
-            Type::Primitive(PrimitiveType::Str | PrimitiveType::Int | PrimitiveType::Bool))
+        self.is_printable(self.operand_type(function, operand), &mut Vec::new())
+    }
+
+    fn is_printable(&self, ty: TypeId, visiting: &mut Vec<TypeId>) -> bool {
+        if visiting.contains(&ty) { return true; }
+        match &self.program.types[ty.index()] {
+            Type::Unit | Type::Primitive(_) => true,
+            Type::Nominal(definition) => match &self.program.definitions[definition.index()].layout {
+                DefinitionLayout::Tuple(fields) => {
+                    visiting.push(ty);
+                    let printable = fields.iter().all(|field| self.is_printable(*field, visiting));
+                    visiting.pop();
+                    printable
+                }
+                DefinitionLayout::Union(alternatives) => {
+                    visiting.push(ty);
+                    let printable = alternatives.iter().all(|item| self.is_printable(item.payload, visiting));
+                    visiting.pop();
+                    printable
+                }
+                DefinitionLayout::Struct(_) => false,
+            },
+            Type::Union(alternatives) => {
+                visiting.push(ty);
+                let printable = alternatives.iter().all(|item| self.is_printable(item.payload, visiting));
+                visiting.pop();
+                printable
+            }
+            Type::List(_) | Type::Map { .. } => false,
+        }
     }
 
     fn require_scalar_operand(&self, function: &Function, operand: &Operand, message: &str) -> Result<(), CEmissionError> {
@@ -521,6 +547,7 @@ struct Renderer<'a> {
     program: &'a ir::Program,
     definitions: Vec<AggregateId>,
     strings: Vec<StringLiteral>,
+    labels: Vec<Vec<u8>>,
     output: String,
 }
 
@@ -532,7 +559,9 @@ struct StringLiteral {
 
 impl<'a> Renderer<'a> {
     fn new(program: &'a ir::Program, definitions: Vec<AggregateId>) -> Self {
-        Self { program, definitions, strings: collect_strings(program), output: String::new() }
+        let mut renderer = Self { program, definitions, strings: collect_strings(program), labels: Vec::new(), output: String::new() };
+        renderer.plan_format_labels();
+        renderer
     }
 
     fn render(mut self) -> String {
@@ -570,9 +599,13 @@ impl<'a> Renderer<'a> {
             }
         }
         self.render_runtime_metadata();
+        self.render_writer_declarations();
         self.render_scalar_helpers();
+        self.render_primitive_formatters();
         self.render_string_data();
         self.render_tuple_helpers();
+        self.render_format_labels();
+        self.render_aggregate_formatters();
         if !self.program.functions.is_empty() {
             self.output.push('\n');
             for index in 0..self.program.functions.len() {
@@ -666,6 +699,88 @@ impl<'a> Renderer<'a> {
         self.output.push_str(SCALAR_RUNTIME);
     }
 
+    fn render_writer_declarations(&mut self) {
+        self.output.push_str(concat!(
+            "\ntypedef struct { FILE *stream; size_t site; bool checked; bool failed; } sao2_writer;\n",
+            "static _Noreturn void sao2_output_failure(size_t site);\n",
+            "static void sao2_writer_bytes(sao2_writer *writer, const unsigned char *bytes, size_t length);\n",
+            "static void sao2_writer_char(sao2_writer *writer, unsigned char value);\n",
+            "static void sao2_format_unit(sao2_writer *writer, sao2_unit value);\n",
+            "static void sao2_format_int(sao2_writer *writer, int64_t value);\n",
+            "static void sao2_format_float(sao2_writer *writer, double value);\n",
+            "static void sao2_format_string(sao2_writer *writer, sao2_string value);\n",
+            "static void sao2_format_bool(sao2_writer *writer, bool value);\n",
+            "static void sao2_format_char(sao2_writer *writer, uint8_t value);\n",
+        ));
+    }
+
+    fn render_primitive_formatters(&mut self) {
+        self.output.push_str(FORMAT_RUNTIME);
+    }
+
+    fn plan_label(&mut self, bytes: &[u8]) {
+        if !self.labels.iter().any(|item| item.as_slice() == bytes) { self.labels.push(bytes.to_vec()); }
+    }
+
+    fn plan_format_labels(&mut self) {
+        let definitions = self.definitions.clone();
+        for aggregate in definitions {
+            match aggregate {
+                AggregateId::Definition(definition) => match self.program.definitions[definition.index()].layout.clone() {
+                    DefinitionLayout::Tuple(_) => {
+                        let name = self.program.definitions[definition.index()].name.clone();
+                        self.plan_label(name.as_bytes());
+                        self.plan_label(b"("); self.plan_label(b", "); self.plan_label(b")");
+                    }
+                    DefinitionLayout::Union(alternatives) => self.plan_union_labels(Some(definition), &alternatives),
+                    DefinitionLayout::Struct(_) => {}
+                },
+                AggregateId::AnonymousUnion(ty) => {
+                    let Type::Union(alternatives) = self.program.types[ty.index()].clone() else { unreachable!() };
+                    self.plan_union_labels(None, &alternatives);
+                }
+            }
+        }
+    }
+
+    fn plan_union_labels(&mut self, definition: Option<DefinitionId>, alternatives: &[ir::UnionAlternative]) {
+        for alternative in alternatives {
+            match &alternative.constructor {
+                AlternativeConstructor::Error => self.plan_label(b"Error("),
+                AlternativeConstructor::Tagged(tag) => {
+                    if let Some(definition) = definition {
+                        let name = self.program.definitions[definition.index()].name.clone();
+                        self.plan_label(name.as_bytes());
+                        self.plan_label(b".");
+                    }
+                    self.plan_label(tag.as_bytes()); self.plan_label(b"(");
+                }
+                AlternativeConstructor::Untagged => if let Some(definition) = definition {
+                    let name = self.program.definitions[definition.index()].name.clone();
+                    self.plan_label(name.as_bytes());
+                    self.plan_label(b"(");
+                },
+            }
+            if !matches!(alternative.constructor, AlternativeConstructor::Untagged) || definition.is_some() {
+                self.plan_label(b")");
+            }
+        }
+    }
+
+    fn render_format_labels(&mut self) {
+        if self.labels.is_empty() { return; }
+        self.output.push('\n');
+        let labels = self.labels.clone();
+        for (index, label) in labels.iter().enumerate() {
+            self.render_byte_array(&format!("sao2_format_label_{index}"), label);
+        }
+    }
+
+    fn label(&self, bytes: &[u8]) -> String {
+        let index = self.labels.iter().position(|label| label.as_slice() == bytes).expect("planned formatting label");
+        format!("sao2_format_label_{index}")
+    }
+
     fn render_string_data(&mut self) {
         if self.strings.is_empty() { return; }
         self.output.push('\n');
@@ -725,6 +840,131 @@ impl<'a> Renderer<'a> {
             for definition in hashed {
                 self.render_tuple_hash_helper(definition);
             }
+        }
+    }
+
+    fn render_aggregate_formatters(&mut self) {
+        let aggregates = self.definitions.clone();
+        for aggregate in aggregates {
+            if !self.is_printable_aggregate(aggregate, &mut Vec::new()) { continue; }
+            self.output.push('\n');
+            match aggregate {
+                AggregateId::Definition(definition) => match self.program.definitions[definition.index()].layout.clone() {
+                    DefinitionLayout::Tuple(fields) => self.render_tuple_formatter(definition, &fields),
+                    DefinitionLayout::Union(alternatives) => self.render_union_formatter(aggregate, &alternatives),
+                    DefinitionLayout::Struct(_) => {}
+                },
+                AggregateId::AnonymousUnion(ty) => {
+                    let Type::Union(alternatives) = self.program.types[ty.index()].clone() else { unreachable!() };
+                    self.render_union_formatter(aggregate, &alternatives);
+                }
+            }
+        }
+    }
+
+    fn is_printable_aggregate(&self, aggregate: AggregateId, visiting: &mut Vec<AggregateId>) -> bool {
+        if visiting.contains(&aggregate) { return true; }
+        visiting.push(aggregate);
+        let values = match aggregate {
+            AggregateId::Definition(definition) => match &self.program.definitions[definition.index()].layout {
+                DefinitionLayout::Tuple(fields) => fields.clone(),
+                DefinitionLayout::Union(alternatives) => alternatives.iter().map(|item| item.payload).collect(),
+                DefinitionLayout::Struct(_) => Vec::new(),
+            },
+            AggregateId::AnonymousUnion(ty) => match &self.program.types[ty.index()] {
+                Type::Union(alternatives) => alternatives.iter().map(|item| item.payload).collect(),
+                _ => unreachable!(),
+            },
+        };
+        let printable = !values.is_empty() && values.into_iter().all(|ty| self.is_printable_type(ty, visiting));
+        visiting.pop();
+        printable
+    }
+
+    fn is_printable_type(&self, ty: TypeId, visiting: &mut Vec<AggregateId>) -> bool {
+        match &self.program.types[ty.index()] {
+            Type::Unit | Type::Primitive(_) => true,
+            Type::Nominal(definition) => self.is_printable_aggregate(AggregateId::Definition(*definition), visiting),
+            Type::Union(_) => self.is_printable_aggregate(AggregateId::AnonymousUnion(ty), visiting),
+            Type::List(_) | Type::Map { .. } => false,
+        }
+    }
+
+    fn render_tuple_formatter(&mut self, definition: DefinitionId, fields: &[TypeId]) {
+        let name = format!("sao2_def_{}", definition.index());
+        let _ = writeln!(self.output, "static inline void sao2_format_tuple_def_{}(sao2_writer *writer, {name} value) {{", definition.index());
+        let prefix = self.label(self.program.definitions[definition.index()].name.as_bytes());
+        let _ = writeln!(self.output, "    sao2_writer_bytes(writer, {prefix}, {});", self.program.definitions[definition.index()].name.len());
+        self.write_label_call(b"(");
+        for (index, ty) in fields.iter().enumerate() {
+            if index != 0 { self.write_label_call(b", "); }
+            let call = self.format_call(*ty, &format!("value.field_{index}"));
+            let _ = writeln!(self.output, "    {call};");
+        }
+        self.write_label_call(b")");
+        self.output.push_str("}\n");
+    }
+
+    fn render_union_formatter(&mut self, aggregate: AggregateId, alternatives: &[ir::UnionAlternative]) {
+        let name = aggregate_name(aggregate);
+        let _ = writeln!(self.output, "static inline void sao2_format_union_{}(sao2_writer *writer, {name} value) {{", match aggregate { AggregateId::Definition(id) => format!("def_{}", id.index()), AggregateId::AnonymousUnion(id) => format!("ty_{}", id.index()) });
+        self.output.push_str("    switch (value.tag) {\n");
+        for (index, alternative) in alternatives.iter().enumerate() {
+            let _ = writeln!(self.output, "        case UINT32_C({}):", index + 1);
+            self.render_union_wrapper(aggregate, alternative, index);
+            let call = self.format_call(alternative.payload, &format!("value.payload.alternative_{index}"));
+            let _ = writeln!(self.output, "            {call};");
+            if self.union_has_wrapper(aggregate, alternative) { self.output.push_str("            "); self.write_label_call(b")"); }
+            self.output.push_str("            return;\n");
+        }
+        self.output.push_str("        default: sao2_compiler_invariant();\n    }\n}\n");
+    }
+
+    fn render_union_wrapper(&mut self, aggregate: AggregateId, alternative: &ir::UnionAlternative, _index: usize) {
+        match &alternative.constructor {
+            AlternativeConstructor::Error => { self.output.push_str("            "); self.write_label_call(b"Error("); }
+            AlternativeConstructor::Tagged(tag) => {
+                if let AggregateId::Definition(definition) = aggregate {
+                    let name = self.label(self.program.definitions[definition.index()].name.as_bytes());
+                    let _ = writeln!(self.output, "            sao2_writer_bytes(writer, {name}, {});", self.program.definitions[definition.index()].name.len());
+                    self.output.push_str("            "); self.write_label_call(b".");
+                }
+                let tag_label = self.label(tag.as_bytes());
+                let _ = writeln!(self.output, "            sao2_writer_bytes(writer, {tag_label}, {});", tag.len());
+                self.output.push_str("            "); self.write_label_call(b"(");
+            }
+            AlternativeConstructor::Untagged => if let AggregateId::Definition(definition) = aggregate {
+                let name = self.label(self.program.definitions[definition.index()].name.as_bytes());
+                let _ = writeln!(self.output, "            sao2_writer_bytes(writer, {name}, {});", self.program.definitions[definition.index()].name.len());
+                self.output.push_str("            "); self.write_label_call(b"(");
+            },
+        }
+    }
+
+    fn union_has_wrapper(&self, aggregate: AggregateId, alternative: &ir::UnionAlternative) -> bool {
+        !matches!(alternative.constructor, AlternativeConstructor::Untagged) || matches!(aggregate, AggregateId::Definition(_))
+    }
+
+    fn write_label_call(&mut self, bytes: &[u8]) {
+        let label = self.label(bytes);
+        let _ = writeln!(self.output, "sao2_writer_bytes(writer, {label}, {});", bytes.len());
+    }
+
+    fn format_call(&self, ty: TypeId, value: &str) -> String {
+        match &self.program.types[ty.index()] {
+            Type::Unit => format!("sao2_format_unit(writer, {value})"),
+            Type::Primitive(PrimitiveType::Int) => format!("sao2_format_int(writer, {value})"),
+            Type::Primitive(PrimitiveType::Float) => format!("sao2_format_float(writer, {value})"),
+            Type::Primitive(PrimitiveType::Str) => format!("sao2_format_string(writer, {value})"),
+            Type::Primitive(PrimitiveType::Bool) => format!("sao2_format_bool(writer, {value})"),
+            Type::Primitive(PrimitiveType::Char) => format!("sao2_format_char(writer, {value})"),
+            Type::Nominal(definition) => match &self.program.definitions[definition.index()].layout {
+                DefinitionLayout::Tuple(_) => format!("sao2_format_tuple_def_{}(writer, {value})", definition.index()),
+                DefinitionLayout::Union(_) => format!("sao2_format_union_def_{}(writer, {value})", definition.index()),
+                DefinitionLayout::Struct(_) => unreachable!(),
+            },
+            Type::Union(_) => format!("sao2_format_union_ty_{}(writer, {value})", ty.index()),
+            Type::List(_) | Type::Map { .. } => unreachable!(),
         }
     }
 
@@ -1005,6 +1245,8 @@ impl<'a> Renderer<'a> {
                 let payload_value = self.operand(payload);
                 let helper = match &self.program.types[self.operand_type(function, payload).index()] {
                     Type::Primitive(PrimitiveType::Int) => "sao2_error_panic_int",
+                    Type::Primitive(PrimitiveType::Float) => "sao2_error_panic_float",
+                    Type::Primitive(PrimitiveType::Str) => "sao2_error_panic_string",
                     Type::Primitive(PrimitiveType::Bool) => "sao2_error_panic_bool",
                     Type::Primitive(PrimitiveType::Char) => "sao2_error_panic_char",
                     _ => unreachable!("capability validation rejected Error payload"),
@@ -1117,23 +1359,14 @@ impl<'a> Renderer<'a> {
     ) {
         let site = failure.index();
         let _ = writeln!(self.output, "    sao2_prepare_output({site});");
+        let _ = writeln!(self.output, "    sao2_writer sao2_output_writer = {{ stdout, {site}, true, false }};");
         if let Some(argument) = arguments.first() {
             let value = self.operand(argument);
-            match &self.program.types[self.operand_type(function, argument).index()] {
-                Type::Primitive(PrimitiveType::Str) => {
-                    let _ = writeln!(self.output, "    if (fwrite(({value})->bytes, 1, ({value})->length, stdout) != ({value})->length) sao2_output_failure({site});");
-                }
-                Type::Primitive(PrimitiveType::Int) => {
-                    let _ = writeln!(self.output, "    if (fprintf(stdout, \"%\" PRId64, {value}) < 0) sao2_output_failure({site});");
-                }
-                Type::Primitive(PrimitiveType::Bool) => {
-                    let _ = writeln!(self.output, "    if (({value}) ? fwrite(sao2_true_bytes, 1, 4, stdout) != 4 : fwrite(sao2_false_bytes, 1, 5, stdout) != 5) sao2_output_failure({site});");
-                }
-                _ => unreachable!("capability validation rejected output type"),
-            }
+            let call = self.format_call(self.operand_type(function, argument), &value).replace("writer", "&sao2_output_writer");
+            let _ = writeln!(self.output, "    {call};");
         }
         if intrinsic == Intrinsic::Println {
-            let _ = writeln!(self.output, "    if (fputc('\\n', stdout) == EOF) sao2_output_failure({site});");
+            self.output.push_str("    sao2_writer_char(&sao2_output_writer, UINT8_C(10));\n");
         }
         let _ = writeln!(self.output, "    sao2_local_{} = (sao2_unit){{0}};", destination.index());
     }
@@ -1388,10 +1621,6 @@ static void sao2_write_stderr_size(size_t value) {
     if (fprintf(stderr, "%zu", value) < 0) return;
 }
 
-static void sao2_write_stderr_int(int64_t value) {
-    if (fprintf(stderr, "%" PRId64, value) < 0) return;
-}
-
 static _Noreturn void sao2_pre_entry_panic(
     const unsigned char *message,
     size_t message_length,
@@ -1590,7 +1819,9 @@ static void sao2_check_float_to_int(double operand, size_t site) {
 static _Noreturn void sao2_panic(sao2_string message, size_t site) {
     sao2_require_operation(site, SAO2_FAILURE_EXPLICIT_PANIC);
     sao2_write_panic_prefix();
-    sao2_write_stderr(message->bytes, message->length);
+    sao2_writer writer = { stderr, 0, false, false };
+    sao2_format_string(&writer, message);
+    if (writer.failed) exit(EXIT_FAILURE);
     sao2_finish_panic(site);
 }
 
@@ -1603,30 +1834,48 @@ static void sao2_error_panic_begin(size_t site) {
 
 static _Noreturn void sao2_error_panic_int(int64_t value, size_t site) {
     sao2_error_panic_begin(site);
-    sao2_write_stderr_int(value);
+    sao2_writer writer = { stderr, 0, false, false };
+    sao2_format_int(&writer, value);
+    if (writer.failed) exit(EXIT_FAILURE);
     sao2_write_stderr_char(')');
     sao2_finish_panic(site);
 }
 
 static _Noreturn void sao2_error_panic_bool(bool value, size_t site) {
-    static const unsigned char true_bytes[] = "true";
-    static const unsigned char false_bytes[] = "false";
     sao2_error_panic_begin(site);
-    if (value) sao2_write_stderr(true_bytes, sizeof true_bytes - 1);
-    else sao2_write_stderr(false_bytes, sizeof false_bytes - 1);
+    sao2_writer writer = { stderr, 0, false, false };
+    sao2_format_bool(&writer, value);
+    if (writer.failed) exit(EXIT_FAILURE);
     sao2_write_stderr_char(')');
     sao2_finish_panic(site);
 }
 
 static _Noreturn void sao2_error_panic_char(uint8_t value, size_t site) {
     sao2_error_panic_begin(site);
-    sao2_write_stderr(&value, 1);
+    sao2_writer writer = { stderr, 0, false, false };
+    sao2_format_char(&writer, value);
+    if (writer.failed) exit(EXIT_FAILURE);
     sao2_write_stderr_char(')');
     sao2_finish_panic(site);
 }
 
-static const unsigned char sao2_true_bytes[] = { UINT8_C(116), UINT8_C(114), UINT8_C(117), UINT8_C(101) };
-static const unsigned char sao2_false_bytes[] = { UINT8_C(102), UINT8_C(97), UINT8_C(108), UINT8_C(115), UINT8_C(101) };
+static _Noreturn void sao2_error_panic_float(double value, size_t site) {
+    sao2_error_panic_begin(site);
+    sao2_writer writer = { stderr, 0, false, false };
+    sao2_format_float(&writer, value);
+    if (writer.failed) exit(EXIT_FAILURE);
+    sao2_write_stderr_char(')');
+    sao2_finish_panic(site);
+}
+
+static _Noreturn void sao2_error_panic_string(sao2_string value, size_t site) {
+    sao2_error_panic_begin(site);
+    sao2_writer writer = { stderr, 0, false, false };
+    sao2_format_string(&writer, value);
+    if (writer.failed) exit(EXIT_FAILURE);
+    sao2_write_stderr_char(')');
+    sao2_finish_panic(site);
+}
 
 static _Noreturn void sao2_output_failure(size_t site) {
     static const unsigned char reason[] = "standard output failure";
@@ -1639,6 +1888,92 @@ static void sao2_prepare_output(size_t site) {
 #else
     (void)site;
 #endif
+}
+"#;
+
+const FORMAT_RUNTIME: &str = r#"
+static void sao2_writer_bytes(sao2_writer *writer, const unsigned char *bytes, size_t length) {
+    if (writer->failed) return;
+    if (fwrite(bytes, 1, length, writer->stream) != length) {
+        if (writer->checked) sao2_output_failure(writer->site);
+        writer->failed = true;
+    }
+}
+
+static void sao2_writer_char(sao2_writer *writer, unsigned char value) {
+    sao2_writer_bytes(writer, &value, 1);
+}
+
+static void sao2_format_unit(sao2_writer *writer, sao2_unit value) {
+    static const unsigned char text[] = { UINT8_C(40), UINT8_C(41) };
+    (void)value;
+    sao2_writer_bytes(writer, text, sizeof text);
+}
+
+static void sao2_format_int(sao2_writer *writer, int64_t value) {
+    char buffer[32];
+    int length = snprintf(buffer, sizeof buffer, "%" PRId64, value);
+    if (length < 0 || (size_t)length >= sizeof buffer) {
+        if (writer->checked) sao2_output_failure(writer->site);
+        writer->failed = true;
+        return;
+    }
+    sao2_writer_bytes(writer, (const unsigned char *)buffer, (size_t)length);
+}
+
+static uint64_t sao2_float_to_bits(double value) {
+    uint64_t bits;
+    memcpy(&bits, &value, sizeof bits);
+    return bits;
+}
+
+static void sao2_normalize_float(char *buffer) {
+    char *exponent = strchr(buffer, 'e');
+    if (exponent == NULL) exponent = strchr(buffer, 'E');
+    if (exponent == NULL) return;
+    *exponent++ = 'e';
+    if (*exponent == '+') memmove(exponent, exponent + 1, strlen(exponent));
+    else if (*exponent == '-') ++exponent;
+    while (exponent[0] == '0' && exponent[1] != '\0') memmove(exponent, exponent + 1, strlen(exponent));
+}
+
+static void sao2_format_float(sao2_writer *writer, double value) {
+    char buffer[64];
+    if (value == 0.0) {
+        if (signbit(value)) sao2_writer_bytes(writer, (const unsigned char *)"-0", 2);
+        else sao2_writer_bytes(writer, (const unsigned char *)"0", 1);
+        return;
+    }
+    for (int precision = 1; precision <= 17; ++precision) {
+        int length = snprintf(buffer, sizeof buffer, "%.*g", precision, value);
+        if (length < 0 || (size_t)length >= sizeof buffer) {
+            if (writer->checked) sao2_output_failure(writer->site);
+            writer->failed = true;
+            return;
+        }
+        sao2_normalize_float(buffer);
+        char *end;
+        double parsed = strtod(buffer, &end);
+        if (*end == '\0' && sao2_float_to_bits(parsed) == sao2_float_to_bits(value)) {
+            sao2_writer_bytes(writer, (const unsigned char *)buffer, strlen(buffer));
+            return;
+        }
+    }
+    sao2_compiler_invariant();
+}
+
+static void sao2_format_string(sao2_writer *writer, sao2_string value) {
+    sao2_writer_bytes(writer, value->bytes, value->length);
+}
+
+static void sao2_format_bool(sao2_writer *writer, bool value) {
+    static const unsigned char yes[] = { UINT8_C(116), UINT8_C(114), UINT8_C(117), UINT8_C(101) };
+    static const unsigned char no[] = { UINT8_C(102), UINT8_C(97), UINT8_C(108), UINT8_C(115), UINT8_C(101) };
+    sao2_writer_bytes(writer, value ? yes : no, value ? sizeof yes : sizeof no);
+}
+
+static void sao2_format_char(sao2_writer *writer, uint8_t value) {
+    sao2_writer_char(writer, value);
 }
 "#;
 
@@ -2295,7 +2630,8 @@ mod tests {
         );
         let main_id = print_program.add_function(main);
         print_program.entry = Some(main_id);
-        assert_unsupported(emit(&print_program), "printing this value type", Some(OperationSite::Operation(0)));
+        let printed = emit(&print_program).unwrap();
+        assert!(printed.contains("sao2_format_char(&sao2_output_writer, UINT8_C(120));"));
 
         let (mut builtin_program, types, location) = program();
         let mut main = Function::new("main", types.int);
@@ -2337,11 +2673,7 @@ mod tests {
         }, location);
         let main_id = panic_program.add_function(main);
         panic_program.entry = Some(main_id);
-        assert_unsupported(
-            emit(&panic_program),
-            "Error panic payload formatting",
-            Some(OperationSite::Terminator),
-        );
+        assert!(emit(&panic_program).unwrap().contains("sao2_error_panic_float(sao2_float_from_bits(UINT64_C(0)), 0);"));
     }
 
     #[test]
@@ -2401,7 +2733,9 @@ mod tests {
         assert!(emitted.contains("UINT8_C(127)"));
         assert!(emitted.contains("sao2_local_0 = sao2_fn_0((-INT64_C(7)));"));
         assert!(!emitted.contains("source names never appear"));
-        assert!(!emitted.contains("while"));
+        // Formatter runtime code legitimately uses C control-flow keywords; source
+        // names must still never be used as generated identifiers.
+        assert!(!emitted.contains("sao2_fn_0_while"));
     }
 
     #[test]
@@ -2493,10 +2827,10 @@ mod tests {
 
         let emitted = emit(&program).unwrap();
         assert!(emitted.contains("#ifdef _WIN32\n#include <fcntl.h>\n#include <io.h>\n#endif"));
-        assert!(emitted.contains("fwrite((&sao2_string_descriptor_0)->bytes, 1, (&sao2_string_descriptor_0)->length, stdout) != (&sao2_string_descriptor_0)->length"));
-        assert!(emitted.contains("fprintf(stdout, \"%\" PRId64, INT64_C(12)) < 0"));
-        assert!(emitted.contains("fwrite(sao2_true_bytes, 1, 4, stdout) != 4"));
-        assert_eq!(emitted.matches("if (fputc('\\n', stdout) == EOF) sao2_output_failure(0);").count(), 3);
+        assert!(emitted.contains("sao2_format_string(&sao2_output_writer, &sao2_string_descriptor_0);"));
+        assert!(emitted.contains("sao2_format_int(&sao2_output_writer, INT64_C(12));"));
+        assert!(emitted.contains("sao2_format_bool(&sao2_output_writer, true);"));
+        assert_eq!(emitted.matches("sao2_writer_char(&sao2_output_writer, UINT8_C(10));").count(), 3);
         assert_eq!(emitted.matches("sao2_local_0 = (sao2_unit){0};").count(), 4);
     }
 

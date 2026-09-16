@@ -256,7 +256,7 @@ mod tests {
             "type Pair(int, int); type Nested(Pair, bool); ",
             "fn identity(value Pair) Pair { value } ",
             "fn main() { pair := Pair(20, 22); nested := Nested(pair, true); ",
-            "println(nested.0.0); println(pair == identity(pair)); }",
+            "println(pair); println(nested.0.0); println(pair == identity(pair)); }",
         ));
         let build_directory = temporary_directory("tuple-c-output");
         let output_path = compile_into(&source, &build_directory).unwrap().generated_c;
@@ -264,6 +264,7 @@ mod tests {
         assert!(output.contains("= (sao2_def_0){0};"));
         assert!(output.matches(".field_0;").count() >= 2);
         assert!(output.contains("sao2_tuple_equal_def_0"));
+        assert!(output.contains("sao2_format_tuple_def_0(&sao2_output_writer"));
         fs::remove_dir_all(build_directory).unwrap();
     }
 
@@ -288,21 +289,21 @@ mod tests {
         let output_path = compile_into(&source, &build_directory).unwrap().generated_c;
         let output = fs::read_to_string(&output_path).unwrap();
         assert!(output.contains("fwrite("));
-        assert!(output.contains("fprintf(stdout, \"%\" PRId64"));
-        assert!(output.contains("sao2_true_bytes"));
+        assert!(output.contains("sao2_writer sao2_output_writer"));
+        assert!(output.contains("sao2_format_int(&sao2_output_writer"));
+        assert!(output.contains("sao2_format_bool(&sao2_output_writer"));
         assert!(output.contains("int64_t sao2_result = sao2_fn_0();"));
         fs::remove_dir_all(build_directory).unwrap();
     }
 
     #[test]
-    fn unsupported_printable_type_returns_backend_capability_diagnostic() {
+    fn float_printing_uses_the_backend_formatter() {
         let source = source("fn main() { print(1.0); }");
-        let build_directory = temporary_directory("unsupported-output");
-        let diagnostic = compile_into(&source, &build_directory)
-            .unwrap_err()
-            .to_string();
-        assert!(diagnostic.contains("current C backend"));
-        assert!(!build_directory.exists());
+        let build_directory = temporary_directory("float-output");
+        let output_path = compile_into(&source, &build_directory).unwrap().generated_c;
+        let output = fs::read_to_string(output_path).unwrap();
+        assert!(output.contains("sao2_format_float(&sao2_output_writer"));
+        fs::remove_dir_all(build_directory).unwrap();
     }
 
     #[test]
@@ -354,7 +355,7 @@ mod tests {
         let output_path = build_directory.join("program.c");
         fs::write(&output_path, "existing generated C").unwrap();
 
-        let source = source("fn main() { print(1.0); }");
+        let source = source("fn main() { value := [1]; print(value); }");
         let diagnostic = compile_into(&source, &build_directory)
             .unwrap_err()
             .to_string();
