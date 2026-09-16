@@ -1,8 +1,7 @@
 //! C11 core value operations and host entry code generated solely from the validated owned IR.
 //!
-//! This is the production backend for milestone 7. It accepts only validated,
-//! owned IR and retains milestone-8 value operations as explicit capability
-//! boundaries.
+//! This is the production backend. It accepts only validated, owned IR and
+//! retains unsupported value operations as explicit capability boundaries.
 
 use std::fmt::{self, Write as _};
 
@@ -55,7 +54,7 @@ pub(crate) struct UnsupportedFeature {
 
 impl fmt::Display for UnsupportedFeature {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "unsupported by the milestone-7 C backend")?;
+        write!(formatter, "unsupported by the current C backend")?;
         if let Some(definition) = self.definition { write!(formatter, " in {definition}")?; }
         if let Some(ty) = self.ty { write!(formatter, " in {ty}")?; }
         write_function_context(formatter, self.function, self.block, self.site)?;
@@ -220,9 +219,7 @@ impl<'a> CapabilityValidator<'a> {
             }
             OperationKind::Binary { left, .. } => {
                 let ty = self.operand_type(function, left);
-                if matches!(&self.program.types[ty.index()], Type::Primitive(PrimitiveType::Str)) {
-                    self.unsupported("string comparison")
-                } else if self.is_scalar(ty) {
+                if self.is_scalar(ty) {
                     Ok(())
                 } else {
                     self.unsupported("non-scalar binary operation")
@@ -234,7 +231,7 @@ impl<'a> CapabilityValidator<'a> {
                 self.executable_union_use(self.operand_type(function, value))
             }
             OperationKind::Aggregate { .. } => self.unsupported("aggregate construction"),
-            OperationKind::StringIndex { .. } => self.unsupported("string indexing"),
+            OperationKind::StringIndex { .. } => Ok(()),
             OperationKind::Intrinsic { intrinsic, arguments, .. } => match intrinsic {
                 Intrinsic::Print if arguments.len() == 1 && self.output_operand(function, &arguments[0]) => Ok(()),
                 Intrinsic::Println if arguments.is_empty()
@@ -492,8 +489,14 @@ impl<'a> LayoutPlanner<'a> {
 struct Renderer<'a> {
     program: &'a ir::Program,
     definitions: Vec<AggregateId>,
-    strings: Vec<Vec<u8>>,
+    strings: Vec<StringLiteral>,
     output: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StringLiteral {
+    bytes: Vec<u8>,
+    hash: u64,
 }
 
 impl<'a> Renderer<'a> {
@@ -510,7 +513,14 @@ impl<'a> Renderer<'a> {
             "#ifdef _WIN32\n#include <fcntl.h>\n#include <io.h>\n#endif\n\n",
         ));
         self.output.push_str("typedef struct { uint8_t value; } sao2_unit;\n");
-        self.output.push_str("typedef struct { const unsigned char *bytes; size_t length; } sao2_string;\n");
+        self.output.push_str(concat!(
+            "typedef struct sao2_interned_string {\n",
+            "    const unsigned char *bytes;\n",
+            "    size_t length;\n",
+            "    uint64_t hash;\n",
+            "} sao2_interned_string;\n",
+            "typedef const sao2_interned_string *sao2_string;\n",
+        ));
         self.output.push_str("typedef struct { int count; char **values; } sao2_args;\n");
 
         let aggregates = self.aggregate_roots();
@@ -628,7 +638,8 @@ impl<'a> Renderer<'a> {
         if self.strings.is_empty() { return; }
         self.output.push('\n');
         for index in 0..self.strings.len() {
-            let bytes = &self.strings[index];
+            let literal = &self.strings[index];
+            let bytes = &literal.bytes;
             let _ = write!(self.output, "static const unsigned char sao2_string_data_{index}[] = {{");
             if bytes.is_empty() {
                 self.output.push_str(" UINT8_C(0) ");
@@ -641,6 +652,12 @@ impl<'a> Renderer<'a> {
                 self.output.push(' ');
             }
             self.output.push_str("};\n");
+            let _ = writeln!(
+                self.output,
+                "static const sao2_interned_string sao2_string_descriptor_{index} = {{ sao2_string_data_{index}, {}, UINT64_C({}) }};",
+                bytes.len(),
+                literal.hash,
+            );
         }
     }
 
@@ -789,8 +806,18 @@ impl<'a> Renderer<'a> {
             OperationKind::Intrinsic { destination, intrinsic, arguments, failure } => {
                 self.render_intrinsic(function, *destination, *intrinsic, arguments, *failure);
             }
+            OperationKind::StringIndex { destination, string, index, failure } => {
+                let string = self.operand(string);
+                let index = self.operand(index);
+                let _ = writeln!(
+                    self.output,
+                    "    sao2_local_{} = sao2_string_index({string}, {index}, {});",
+                    destination.index(),
+                    failure.index(),
+                );
+            }
             OperationKind::Check(check) => self.render_check(function, check),
-            OperationKind::Aggregate { .. } | OperationKind::StringIndex { .. } | OperationKind::Builtin { .. }
+            OperationKind::Aggregate { .. } | OperationKind::Builtin { .. }
             | OperationKind::BeginIteration { .. } | OperationKind::EndIteration { .. }
             | OperationKind::IterationValue { .. } => unreachable!("capability validation rejected operation"),
         }
@@ -937,7 +964,7 @@ impl<'a> Renderer<'a> {
             let value = self.operand(argument);
             match &self.program.types[self.operand_type(function, argument).index()] {
                 Type::Primitive(PrimitiveType::Str) => {
-                    let _ = writeln!(self.output, "    if (fwrite(({value}).bytes, 1, ({value}).length, stdout) != ({value}).length) sao2_output_failure({site});");
+                    let _ = writeln!(self.output, "    if (fwrite(({value})->bytes, 1, ({value})->length, stdout) != ({value})->length) sao2_output_failure({site});");
                 }
                 Type::Primitive(PrimitiveType::Int) => {
                     let _ = writeln!(self.output, "    if (fprintf(stdout, \"%\" PRId64, {value}) < 0) sao2_output_failure({site});");
@@ -955,6 +982,17 @@ impl<'a> Renderer<'a> {
     }
 
     fn binary_expression(&self, operator: BinaryOperator, ty: TypeId, left: &str, right: &str) -> String {
+        if matches!(&self.program.types[ty.index()], Type::Primitive(PrimitiveType::Str)) {
+            return match operator {
+                BinaryOperator::Equal => format!("{left} == {right}"),
+                BinaryOperator::NotEqual => format!("{left} != {right}"),
+                BinaryOperator::Less => format!("sao2_string_compare({left}, {right}) < 0"),
+                BinaryOperator::LessEqual => format!("sao2_string_compare({left}, {right}) <= 0"),
+                BinaryOperator::Greater => format!("sao2_string_compare({left}, {right}) > 0"),
+                BinaryOperator::GreaterEqual => format!("sao2_string_compare({left}, {right}) >= 0"),
+                _ => unreachable!("validated string binary operation"),
+            };
+        }
         match operator {
             BinaryOperator::BitwiseOr => format!("sao2_int_from_bits(sao2_int_to_bits({left}) | sao2_int_to_bits({right}))"),
             BinaryOperator::BitwiseXor => format!("sao2_int_from_bits(sao2_int_to_bits({left}) ^ sao2_int_to_bits({right}))"),
@@ -989,8 +1027,9 @@ impl<'a> Renderer<'a> {
                 ConstantValue::Integer(value) => format!("INT64_C({value})"),
                 ConstantValue::Float(bits) => format!("sao2_float_from_bits(UINT64_C({bits}))"),
                 ConstantValue::String(bytes) => {
-                    let index = self.strings.iter().position(|candidate| candidate == bytes).expect("collected string");
-                    format!("(sao2_string){{sao2_string_data_{index}, {}}}", bytes.len())
+                    let index = self.strings.iter().position(|candidate| candidate.bytes.as_slice() == bytes)
+                        .expect("collected string");
+                    format!("&sao2_string_descriptor_{index}")
                 }
                 ConstantValue::Character(value) => format!("UINT8_C({value})"),
                 ConstantValue::Boolean(value) => value.to_string(),
@@ -1122,6 +1161,15 @@ static uint64_t sao2_int_magnitude(int64_t value) {
     return value >= 0 ? (uint64_t)value : UINT64_C(1) + (uint64_t)(-(value + INT64_C(1)));
 }
 
+static int sao2_string_compare(sao2_string left, sao2_string right) {
+    size_t length = left->length < right->length ? left->length : right->length;
+    int comparison = memcmp(left->bytes, right->bytes, length);
+    if (comparison != 0) return comparison;
+    if (left->length < right->length) return -1;
+    if (left->length > right->length) return 1;
+    return 0;
+}
+
 static int64_t sao2_shift_right(int64_t value, int64_t amount) {
     uint64_t bits = sao2_int_to_bits(value);
     if (amount == 0) return value;
@@ -1217,6 +1265,25 @@ static _Noreturn void sao2_fail(size_t site, uint32_t operation, const unsigned 
     sao2_write_panic_prefix();
     sao2_write_stderr(reason, length);
     sao2_finish_panic(site);
+}
+
+static uint8_t sao2_string_index(sao2_string value, int64_t index, size_t site) {
+    static const unsigned char reason[] = "string index out of range";
+    uint64_t magnitude;
+    size_t position;
+    sao2_require_operation(site, SAO2_FAILURE_STRING_INDEX);
+    if (index >= 0) {
+        magnitude = (uint64_t)index;
+        if (magnitude >= (uint64_t)value->length)
+            sao2_fail(site, SAO2_FAILURE_STRING_INDEX, reason, sizeof reason - 1);
+        position = (size_t)magnitude;
+    } else {
+        magnitude = sao2_int_magnitude(index);
+        if (magnitude > (uint64_t)value->length)
+            sao2_fail(site, SAO2_FAILURE_STRING_INDEX, reason, sizeof reason - 1);
+        position = value->length - (size_t)magnitude;
+    }
+    return value->bytes[position];
 }
 
 static void sao2_check_integer_add(int64_t left, int64_t right, size_t site) {
@@ -1325,7 +1392,7 @@ static void sao2_check_float_to_int(double operand, size_t site) {
 static _Noreturn void sao2_panic(sao2_string message, size_t site) {
     sao2_require_operation(site, SAO2_FAILURE_EXPLICIT_PANIC);
     sao2_write_panic_prefix();
-    sao2_write_stderr(message.bytes, message.length);
+    sao2_write_stderr(message->bytes, message->length);
     sao2_finish_panic(site);
 }
 
@@ -1377,13 +1444,19 @@ static void sao2_prepare_output(size_t site) {
 }
 "#;
 
-fn collect_strings(program: &ir::Program) -> Vec<Vec<u8>> {
-    let mut strings = Vec::new();
+fn string_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(14695981039346656037_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(1099511628211)
+    })
+}
+
+fn collect_strings(program: &ir::Program) -> Vec<StringLiteral> {
+    let mut strings = Vec::<StringLiteral>::new();
     let mut collect = |operand: &Operand| {
         if let Operand::Constant(ir::Constant { value: ConstantValue::String(bytes), .. }) = operand
-            && !strings.iter().any(|item| item == bytes)
+            && !strings.iter().any(|item| item.bytes.as_slice() == bytes)
         {
-            strings.push(bytes.clone());
+            strings.push(StringLiteral { bytes: bytes.clone(), hash: string_hash(bytes) });
         }
     };
     for function in &program.functions {
@@ -1538,6 +1611,14 @@ mod tests {
         (program, types, location)
     }
 
+    #[test]
+    fn hashes_string_literals_with_fixed_fnv1a_vectors() {
+        assert_eq!(string_hash(b""), 14695981039346656037);
+        assert_eq!(string_hash(b"a"), 12638187200555641996);
+        assert_eq!(string_hash(&[b'a', 0, b'z']), 16560493500796669818);
+        assert_eq!(string_hash(&[0, 127]), 590614798587856096);
+    }
+
     fn constant(ty: TypeId, value: ConstantValue) -> Operand {
         Operand::Constant(Constant { ty, value })
     }
@@ -1597,6 +1678,10 @@ mod tests {
             "double sao2_arg_2, sao2_string sao2_arg_3, bool sao2_arg_4, ",
             "uint8_t sao2_arg_5);\n",
         )));
+        let descriptor = emitted.find("typedef struct sao2_interned_string {").unwrap();
+        let comparison = emitted.find("static int sao2_string_compare(").unwrap();
+        assert!(descriptor < comparison);
+        assert!(!emitted.contains("typedef struct { const unsigned char *bytes; size_t length; } sao2_string;"));
         assert!(emitted.contains("sao2_unit sao2_local_0 = {0};\n"));
         assert!(emitted.contains("    goto sao2_block_0;\nsao2_block_0:\n"));
         assert_eq!(emitted, emit(&program).unwrap());
@@ -1810,7 +1895,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_projection_string_index_unsupported_printing_builtins_and_terminators() {
+    fn rejects_projection_unsupported_printing_builtins_and_terminators() {
         let (mut projection_program, types, location) = program();
         let mut tuple = NominalDefinition::tuple("Tuple");
         let field = tuple.add_tuple_field(types.int);
@@ -1857,7 +1942,9 @@ mod tests {
         );
         let main_id = index_program.add_function(main);
         index_program.entry = Some(main_id);
-        assert_unsupported(emit(&index_program), "string indexing", Some(OperationSite::Operation(0)));
+        let indexed = emit(&index_program).unwrap();
+        assert!(indexed.contains("sao2_string_index(&sao2_string_descriptor_0, INT64_C(0), 0);"));
+        assert!(indexed.contains("static uint8_t sao2_string_index(sao2_string value, int64_t index, size_t site)"));
 
         let (mut print_program, types, location) = program();
         let failure = print_program.intern_failure_site(FailureSite {
@@ -1979,9 +2066,12 @@ mod tests {
         let emitted = emit(&program).unwrap();
         assert!(emitted.contains("static const unsigned char sao2_string_data_0[] = { UINT8_C(97), UINT8_C(0), UINT8_C(122) };"));
         assert!(emitted.contains("static const unsigned char sao2_string_data_1[] = { UINT8_C(0) };"));
+        assert!(emitted.contains("static const sao2_interned_string sao2_string_descriptor_0 = { sao2_string_data_0, 3, UINT64_C(16560493500796669818) };"));
+        assert!(emitted.contains("static const sao2_interned_string sao2_string_descriptor_1 = { sao2_string_data_1, 0, UINT64_C(14695981039346656037) };"));
         assert!(emitted.contains("(-INT64_C(9223372036854775807) - INT64_C(1))"));
         assert!(emitted.contains("sao2_float_from_bits(UINT64_C(9223372036854775808))"));
-        assert!(emitted.contains("(sao2_string){sao2_string_data_1, 0}"));
+        assert!(emitted.contains("sao2_local_2 = &sao2_string_descriptor_1;"));
+        assert!(!emitted.contains("(sao2_string){"));
         assert!(emitted.contains("UINT8_C(127)"));
         assert!(emitted.contains("sao2_local_0 = sao2_fn_0((-INT64_C(7)));"));
         assert!(!emitted.contains("source names never appear"));
@@ -2077,7 +2167,7 @@ mod tests {
 
         let emitted = emit(&program).unwrap();
         assert!(emitted.contains("#ifdef _WIN32\n#include <fcntl.h>\n#include <io.h>\n#endif"));
-        assert!(emitted.contains("fwrite(((sao2_string){sao2_string_data_0, 2}).bytes, 1"));
+        assert!(emitted.contains("fwrite((&sao2_string_descriptor_0)->bytes, 1, (&sao2_string_descriptor_0)->length, stdout) != (&sao2_string_descriptor_0)->length"));
         assert!(emitted.contains("fprintf(stdout, \"%\" PRId64, INT64_C(12)) < 0"));
         assert!(emitted.contains("fwrite(sao2_true_bytes, 1, 4, stdout) != 4"));
         assert_eq!(emitted.matches("if (fputc('\\n', stdout) == EOF) sao2_output_failure(0);").count(), 3);
@@ -2246,7 +2336,7 @@ mod tests {
 
         let emitted = emit(&program).unwrap();
         assert!(emitted.contains("static const unsigned char sao2_string_data_0[] = { UINT8_C(120), UINT8_C(0), UINT8_C(10) };"));
-        assert!(emitted.contains("sao2_panic((sao2_string){sao2_string_data_0, 3}, 0);"));
+        assert!(emitted.contains("sao2_panic(&sao2_string_descriptor_0, 0);"));
         assert!(emitted.contains("sao2_error_panic_char(UINT8_C(10), 1);"));
         assert!(emitted.contains("{ SAO2_FAILURE_EXPLICIT_PANIC, 0, 2, 3 },"));
         assert!(emitted.contains("{ SAO2_FAILURE_UNHANDLED_ERROR, 0, 4, 5 },"));

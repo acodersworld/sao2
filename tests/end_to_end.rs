@@ -208,17 +208,18 @@ fn failing_compiler_reports_captured_failure() {
 }
 
 #[test]
-fn compiles_and_runs_exact_bytes_twice_when_a_compiler_is_available() {
+fn compiles_and_runs_exact_bytes_twice() {
     let directory = TestDirectory::new("exact output");
     let source = br#"/* before */ fn main() { print // between
         ("\\\"\'\n\r\t\0\x41") /* after */ ; }"#;
     let expected = b"\\\"'\n\r\t\0A";
 
     let first = run_source(&directory, source);
-    if compiler_is_missing(&first) {
-        eprintln!("skipping native end-to-end assertions: no C compiler available");
-        return;
-    }
+    assert!(
+        !compiler_is_missing(&first),
+        "native end-to-end tests require a supported C compiler: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
     assert!(
         first.status.success(),
         "{}",
@@ -236,13 +237,14 @@ fn compiles_and_runs_exact_bytes_twice_when_a_compiler_is_available() {
 }
 
 #[test]
-fn runs_an_empty_string_when_a_compiler_is_available() {
+fn runs_an_empty_string() {
     let directory = TestDirectory::new("empty output");
     let output = run_source(&directory, br#"fn main() { print(""); }"#);
-    if compiler_is_missing(&output) {
-        eprintln!("skipping native end-to-end assertions: no C compiler available");
-        return;
-    }
+    assert!(
+        !compiler_is_missing(&output),
+        "native end-to-end tests require a supported C compiler: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         output.status.success(),
         "{}",
@@ -252,7 +254,47 @@ fn runs_an_empty_string_when_a_compiler_is_available() {
 }
 
 #[test]
-fn runs_primitive_computation_mutation_and_shadowing_when_a_compiler_is_available() {
+fn compares_and_indexes_strings() {
+    let directory = TestDirectory::new("string values");
+    let source = br#"fn main() {
+        println("same" == "same");
+        println("same" != "other");
+        println("a" < "b");
+        println("a" < "ab");
+        println("" < "a");
+        println("a\0z" < "b");
+        println("abcd"[0] == 'a');
+        println("abcd"[-1] == 'd');
+        println("abcd"[-4] == 'a');
+    }"#;
+    let output = run_source(&directory, source);
+    assert!(
+        !compiler_is_missing(&output),
+        "native end-to-end tests require a supported C compiler: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n");
+}
+
+#[test]
+fn reports_string_index_failures() {
+    let directory = TestDirectory::new("string index failure");
+    let output = run_source(&directory, b"fn main() { \"x\"[1]; }");
+    assert!(
+        !compiler_is_missing(&output),
+        "native end-to-end tests require a supported C compiler: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("sao2: panic: string index out of range"), "{stderr}");
+    assert!(stderr.contains("program with spaces.sao2:1:"), "{stderr}");
+}
+
+#[test]
+fn runs_primitive_computation_mutation_and_shadowing() {
     let directory = TestDirectory::new("primitive computation");
     let source = br#"fn main() {
         base := 6;
@@ -269,10 +311,11 @@ fn runs_primitive_computation_mutation_and_shadowing_when_a_compiler_is_availabl
         println(value);
     }"#;
     let output = run_source(&directory, source);
-    if compiler_is_missing(&output) {
-        eprintln!("skipping native end-to-end assertions: no C compiler available");
-        return;
-    }
+    assert!(
+        !compiler_is_missing(&output),
+        "native end-to-end tests require a supported C compiler: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         output.status.success(),
         "{}",
@@ -282,13 +325,14 @@ fn runs_primitive_computation_mutation_and_shadowing_when_a_compiler_is_availabl
 }
 
 #[test]
-fn returns_integer_main_result_when_a_compiler_is_available() {
+fn returns_integer_main_result() {
     let directory = TestDirectory::new("integer result");
     let output = run_source(&directory, b"fn main() int { 23 }");
-    if compiler_is_missing(&output) {
-        eprintln!("skipping native end-to-end assertions: no C compiler available");
-        return;
-    }
+    assert!(
+        !compiler_is_missing(&output),
+        "native end-to-end tests require a supported C compiler: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(
         output.status.code(),
         Some(23),
@@ -305,10 +349,11 @@ fn fuzzes_safe_primitive_programs_with_reproducible_seeds() {
         eprintln!("SAO2_FUZZ_SEED={seed}");
         let (source, expected) = fuzzy_primitive_program(seed);
         let output = run_source(&directory, source.as_bytes());
-        if compiler_is_missing(&output) {
-            eprintln!("skipping native fuzz assertions: no C compiler available");
-            return;
-        }
+        assert!(
+            !compiler_is_missing(&output),
+            "native fuzz tests require a supported C compiler: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(
             output.status.success(),
             "SAO2_FUZZ_SEED={seed}\nsource:\n{source}\nstderr:\n{}",

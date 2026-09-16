@@ -284,7 +284,7 @@ mod tests {
         let diagnostic = compile_into(&source, &build_directory)
             .unwrap_err()
             .to_string();
-        assert!(diagnostic.contains("milestone-7 C backend"));
+        assert!(diagnostic.contains("current C backend"));
         assert!(!build_directory.exists());
     }
 
@@ -310,7 +310,7 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(diagnostic.contains(expected), "{text}: {diagnostic}");
-            assert!(!diagnostic.contains("milestone-7 C backend"), "{diagnostic}");
+            assert!(!diagnostic.contains("current C backend"), "{diagnostic}");
             assert!(!build_directory.exists());
         }
     }
@@ -342,7 +342,7 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(diagnostic.contains("milestone-7 C backend"));
+        assert!(diagnostic.contains("current C backend"));
         assert_eq!(fs::read_to_string(output_path).unwrap(), "existing generated C");
         fs::remove_dir_all(build_directory).unwrap();
     }
@@ -368,7 +368,7 @@ mod tests {
                     .to_string();
 
                 assert!(diagnostic.contains(expected), "{diagnostic}");
-                assert!(!diagnostic.contains("milestone-7 C backend"), "{diagnostic}");
+                assert!(!diagnostic.contains("current C backend"), "{diagnostic}");
                 if existing {
                     assert_eq!(
                         fs::read_to_string(&output_path).unwrap(),
@@ -398,7 +398,7 @@ mod tests {
                 .to_string();
 
             assert!(diagnostic.contains("must be declared 'var'"), "{diagnostic}");
-            assert!(!diagnostic.contains("milestone-7 C backend"), "{diagnostic}");
+            assert!(!diagnostic.contains("current C backend"), "{diagnostic}");
             if existing {
                 assert_eq!(
                     fs::read_to_string(&output_path).unwrap(),
@@ -463,7 +463,7 @@ mod tests {
             .unwrap_err();
 
             assert!(failure.to_string().contains("semantic handoff invariant"));
-            assert!(!failure.to_string().contains("milestone-7 C backend"));
+            assert!(!failure.to_string().contains("current C backend"));
             assert!(failure.warnings.to_string().contains("unreachable source"));
             if existing {
                 assert_eq!(fs::read_to_string(&output_path).unwrap(), "existing generated C");
