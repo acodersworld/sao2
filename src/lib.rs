@@ -1,19 +1,12 @@
-// Walking skeleton: milestone 6 constructs and retains validated typed IR while
-// the deliberately limited milestone 4 backend remains active until milestone 7.
-#[allow(dead_code)]
 mod analysis;
 mod ast;
-#[allow(dead_code)]
 mod c_backend;
-mod c_emitter;
 mod cli;
 mod compiler;
 mod diagnostic;
 mod host_compiler;
-#[allow(dead_code)]
 mod ir;
 mod lexer;
-#[allow(dead_code)]
 mod lowering;
 mod parser;
 mod program;

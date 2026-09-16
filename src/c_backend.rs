@@ -1,7 +1,8 @@
 //! C11 core value operations and host entry code generated solely from the validated owned IR.
 //!
-//! This backend is intentionally disconnected from the production compiler
-//! until the milestone-7 activation stage.
+//! This is the production backend for milestone 7. It accepts only validated,
+//! owned IR and retains milestone-8 value operations as explicit capability
+//! boundaries.
 
 use std::fmt::{self, Write as _};
 
