@@ -19,6 +19,8 @@ The milestone has three closely related outcomes:
 
 ## Stage 1: String foundations
 
+Status: complete.
+
 Replace the backend's borrowed `{ bytes, length }` value with the permanent
 inline reference required by `DESIGN.md`, canonicalize the closed set of string
 literals, and implement string equality, ordering, indexing, and hashing.
@@ -323,29 +325,272 @@ IR.
 
 ## Stage 2: Tuple value behavior
 
-Enable tuple construction and tuple-field projection in the C backend. Preserve
-the IR's left-to-right evaluation order and the language's immutable,
-by-value semantics: assignment, arguments, returns, and union payload copies
-copy the tuple value, while any references in future tuple members will remain
-shared.
+Status: current.
 
-Generate or select structural equality and hashing helpers from the closed IR
-type graph. Both operations recurse through nested tuples and strings and must
-agree for all valid map-key tuples. Helpers should be deterministic, avoid
-source-derived C identifiers, and be emitted only from validated type
-information. This lays the value-semantic foundation required by milestone 11
-without adding maps or other containers now.
+Enable the tuple operations already present in validated IR: construction,
+field reads, ordinary value copies, equality, and inequality. Add deterministic
+structural hashing for the tuple types permitted as map keys, and allow tuples
+to participate in the existing supported union value graph. Printing remains
+Stage 3.
 
-Tuple support also removes the milestone-7 restriction on tuples nested in
-otherwise supported unions. Recursive copying must therefore work through both
-tuple and union boundaries wherever the frontend and IR already accept the
-type, and the same type traversal becomes available to Stage 3 printing.
+No frontend, lowering, or IR shape change is expected. Lowering already
+stabilizes tuple constructor arguments from left to right, represents
+construction as `Aggregate::Tuple`, and represents field access as a
+`Projection::TupleField` chain. Stage 2 is a backend capability, rendering, and
+generated-helper change.
 
-Exit criterion: tuple construction, projection, assignment, parameter passing,
-returns, equality, and hashing work recursively through supported tuple fields
-and union payloads while preserving by-value behavior.
+### Supported tuple boundary
+
+Retain the existing nominal C struct layout `sao2_def_<DefinitionId>` and
+`field_<FieldId>` member names. A supported tuple may recursively contain unit,
+any primitive, another supported tuple, or a supported named or anonymous
+union. Struct, list, and map fields remain rejected by the existing storage
+boundary. Inline recursive tuple layouts remain invalid IR or backend layout
+invariants rather than a runtime case.
+
+Tuple values remain immutable and are passed by value. C struct assignment is
+the implementation of a language tuple copy for locals, assignments, function
+arguments, returns, and union payloads. Never use a C pointer as the language
+representation merely to avoid a copy. Future object references stored in a
+tuple will themselves be copied reference values, so this representation does
+not imply a deep copy.
+
+Only tuple-field reads become supported projections. A projected assignment
+destination must remain a capability error even for a handcrafted valid IR
+program, because tuple fields are immutable. Struct-field, list-index, and
+map-index projections remain later features. Permit any validated chain made
+entirely of `TupleField` projections on an operand, including nested tuple
+reads and reads used by calls, binary operations, intrinsics, union injection,
+returns, and terminators.
+
+### Construction and projection rendering
+
+Render a tuple aggregate as explicit statements against its destination local:
+
+```c
+sao2_local_N = (sao2_def_D){0};
+sao2_local_N.field_0 = operand_0;
+sao2_local_N.field_1 = operand_1;
+```
+
+Emit field assignments in stored element order. Do not place all operands in a
+single C initializer whose evaluation order is unspecified. Lowering has
+already materialized source side effects from left to right, but keeping one IR
+operand per C statement preserves the backend's established evaluation-order
+discipline and makes nested aggregate output predictable. The zero assignment
+also gives padding and any future inactive representation bytes a deterministic
+state without making those bytes part of equality or hashing.
+
+Add a renderer for places which starts with `sao2_local_<LocalId>` and appends
+`.field_<FieldId>` for every tuple projection. `operand` must use this renderer
+for `Operand::Copy` rather than discarding projections. Keep physical field
+selection identity-derived; do not recover source member spelling or a numeric
+suffix from source text.
+
+Update renderer-side operand type recovery to walk the same projection chain.
+This is required when a projected field reaches type-directed paths such as
+string comparison, output, union injection, or `Error` handling. Reuse the
+validated definition and field identities; do not query frontend analysis or
+infer a type from emitted C spelling.
+
+### Structural equality
+
+Generate an identity-named helper for each recursively equatable tuple
+definition, for example:
+
+```c
+static inline bool sao2_tuple_equal_def_0(
+    sao2_def_0 left,
+    sao2_def_0 right
+);
+```
+
+Emit helpers after all aggregate definitions and in the existing aggregate
+dependency order, so a nested tuple helper is defined before a helper which
+calls it. `static inline` avoids unused-function warnings for tuple definitions
+which are stored but not compared.
+
+Compare fields structurally in declaration order:
+
+- unit is always equal;
+- `int`, `float`, `bool`, and `char` use their established scalar equality;
+- `str` uses canonical descriptor identity from Stage 1; and
+- a nested tuple calls its identity-derived equality helper.
+
+Combine field results with short-circuiting `&&`. Values are already
+materialized, so short-circuiting changes no source evaluation order. Do not
+use `memcmp` on a tuple struct: padding is not a language value, and string
+references must compare by canonical identity rather than pointer bytes hidden
+inside a wider object.
+
+The IR does not define equality for unions, so a tuple containing a union is a
+valid value but is not recursively equatable. Lists, maps, and structs remain
+outside this backend stage. Mirror the IR equality boundary rather than
+inventing equality for those fields. Render tuple `==` as the helper call and
+tuple `!=` as its logical negation; no ordering operator is added for tuples.
+
+### Structural hashing
+
+Generate a hash helper only for each recursively valid map-key tuple: its fields
+must be unit, `int`, `str`, `bool`, or another valid map-key tuple. `float`,
+`char`, unions, structs, lists, and maps are not hashable tuple fields under
+`DESIGN.md`, even when some of them support equality.
+
+Use the contract:
+
+```c
+static inline uint64_t sao2_tuple_hash_def_0(sao2_def_0 value);
+```
+
+Start with the Stage-1 FNV-1a offset basis. Fold each field in declaration order
+through a shared `sao2_hash_combine(state, value)` helper which feeds the eight
+low-to-high bytes of the `uint64_t` component value through the same FNV-1a
+prime. Derive component values as follows:
+
+- unit uses `UINT64_C(0)`;
+- `int` uses `sao2_int_to_bits`;
+- `bool` uses `UINT64_C(0)` or `UINT64_C(1)`;
+- `str` uses the descriptor's cached Stage-1 hash; and
+- a nested tuple calls its tuple hash helper.
+
+The explicit low-to-high byte order makes hashes independent of host
+endianness. Hash collisions are permitted; equality implies equal hashes, but
+unequal tuples need not have unequal hashes. Tuple nominal identity need not be
+mixed into the value because map key types are statically fixed and distinct
+nominal tuple types are never compared within one map.
+
+Hashing is not yet an IR operation. Emit the `static inline` helpers as the
+stable handoff required by milestone 11, and exercise them with backend-native
+harnesses. Do not add maps, a public hash intrinsic, or physical helper names to
+the IR.
+
+### Tuples in unions
+
+Extend the backend's recursive union capability classification so a nominal
+tuple is supported when every field is itself a supported value. Preserve the
+existing visiting guard and reject any reachable struct or container. This
+allows tuple payload injection, extraction, switching, propagation, copying,
+calls, and returns without changing union tags or payload layout.
+
+A tuple may itself contain a supported union and may be copied regardless of
+whether it is equatable or hashable. Equality and hashing eligibility are
+separate recursive classifications and must not be used as the general storage
+or union-value capability test.
+
+### Capability changes and backend ownership
+
+Replace the blanket projection rejection with an operand-aware check:
+
+- read operands may contain only tuple-field projections;
+- assignment destinations must remain unprojected in this stage; and
+- any struct, list, or map projection retains the contextual `place projection`
+  capability error.
+
+Accept only `Aggregate::Tuple` in `OperationKind::Aggregate`; keep struct, list,
+and map aggregates as precise capability failures. Accept tuple `Equal` and
+`NotEqual` binary operations and continue to reject other non-scalar binary
+operations. Expand supported union values recursively through tuples, but do
+not enable tuple printing in `output_operand` until Stage 3.
+
+Keep all physical behavior in `src/c_backend.rs`. `Program::validate` remains
+the authority for aggregate arity, field types, projection identities, and
+legal equality operators. The backend capability pass decides only whether the
+validated operation belongs to this stage, and rendering continues to consume
+only the owned IR.
+
+### Implementation sequence
+
+Implement Stage 2 in this order:
+
+1. Add backend predicates for supported tuple values, recursively equatable
+   tuples, and recursively hashable map-key tuples. Keep their purposes
+   separate and traverse identities deterministically with cycle guards.
+2. Replace the blanket projected-place capability check with read-versus-write
+   classification. Add renderer `place` and projected `operand_type` support,
+   then convert the existing tuple-projection rejection fixture into positive
+   nested-projection coverage while retaining later projection failures.
+3. Accept and render `Aggregate::Tuple` as zero initialization followed by
+   ordered field assignments. Remove only the tuple variant from the aggregate
+   capability rejection and renderer unreachable path.
+4. Emit equality helpers in dependency order and dispatch nominal tuple
+   `Equal` and `NotEqual` from `binary_expression`. Retain ordinary C struct
+   assignment for all other tuple copies.
+5. Emit the common hash combiner and hash helpers for exactly the recursively
+   valid map-key tuple definitions. Add fixed vectors before treating the
+   helpers as the milestone-11 handoff.
+6. Extend `supports_union_value` through tuple fields and cover tuple payloads
+   in named and anonymous unions. Then update compiler and end-to-end cases for
+   the newly executable source subset without duplicating backend snapshots.
+
+Render tuple equality and hash helpers after the Stage-1 string literal arrays
+and descriptors and before SAO2 function prototypes. At that point all
+aggregate types and scalar helpers such as `sao2_int_to_bits` are already
+defined. Preserve the existing header, metadata, scalar-runtime, function, and
+host-adapter ordering around that new deterministic section.
+
+### Tests and completion
+
+Extend direct backend tests to cover:
+
+- single-field, mixed primitive, nested, and union-containing tuple layouts;
+- construction field order, zero initialization, and source-independent C
+  identifiers;
+- single and chained field reads in copies, comparisons, calls, output,
+  returns, union payloads, and terminators;
+- tuple copies through locals, assignments, parameters, direct and recursive
+  calls, returns, and union injection and extraction;
+- equality and inequality for every supported primitive field, positive and
+  negative zero floats, canonical strings, nested tuples, and differences in
+  each field position;
+- absence of equality helpers for tuple definitions containing unions or other
+  non-equatable fields;
+- fixed hash vectors for unit, signed integers including `INT64_MIN`, booleans,
+  embedded-zero strings, field order, and nested valid-key tuples;
+- equal tuples producing equal hashes, without asserting that unequal tuples
+  cannot collide;
+- absence of hash helpers for tuples containing `float`, `char`, unions, or
+  other invalid map-key fields;
+- named and anonymous unions carrying tuples, including nested tuple/union
+  graphs, switches, and Error propagation around unaffected alternatives;
+- deterministic helper dependency order and byte-for-byte repeated emission;
+  and
+- continued rejection of projected assignment destinations, non-tuple
+  projections, tuple printing, struct/list/map aggregates, and reachable
+  unsupported union payloads.
+
+Add source-to-executable coverage for tuple construction and field reads,
+nested tuples, equality and inequality, parameter and return copies, recursion,
+and tuple payload narrowing through unions. Use a backend-native harness for
+hash helpers because hashing is not yet a source-level operation. Prefer
+observable results at compiler and CLI layers; keep comprehensive generated-C
+spelling assertions in backend tests.
+
+Contributor guidance prohibits compiling, running tests, or formatting during
+implementation. External verification for the completed stage must run from
+the intended worktree with Rust 1.90 or newer and a supported C compiler forced
+so native assertions do not skip:
+
+```text
+rustc --version
+SAO2_CC=cc cargo test
+```
+
+Confirm all tests pass, native tuple and hash harnesses ran, repeated emission
+is identical, no unexpected compiler warnings were introduced, and no
+generated `build/` artifact is included in the handoff.
+
+Exit criterion: tuple construction and nested field reads execute from source;
+ordinary copies preserve immutable by-value behavior across locals, calls,
+returns, and unions; structural equality follows field semantics without
+observing padding; every valid map-key tuple has a deterministic structural
+hash consistent with equality; tuple-bearing supported unions execute without
+changing their tag model; later projections, containers, structs, and tuple
+printing remain explicit capability boundaries; and no frontend or IR
+representation change was required.
 
 ## Stage 3: Complete formatting and handoff
+
+Status: planned.
 
 Replace the temporary output cases with a type-directed formatting layer shared
 by ordinary output and panic paths. Implement the `DESIGN.md` behavior for:
