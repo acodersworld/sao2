@@ -336,7 +336,7 @@ and source-level structs remain an explicit later-stage capability boundary.
 
 ## Stage 2: Physical struct layouts and allocation metadata
 
-Status: current.
+Status: complete.
 
 Plan and emit the physical representation of every struct before enabling any
 source-level struct operation. Stage 2 owns layout facts, generated body types,
@@ -585,25 +585,284 @@ boundaries; and Stage 1 reference and arena behavior is unchanged.
 
 ## Stage 3: Conservative struct construction and value flow
 
-Status: planned.
+Status: current.
 
-Connect the proven arena runtime to generated programs. Initially classify
-every struct construction as GC lifetime and allocate it monotonically through
-the heap-arena interface. This conservative step makes structs executable
-before escape analysis can reduce their lifetimes.
+Connect struct aggregate operations to the Stage 1 heap interface and the
+Stage 2 layout plan. Every construction in this stage receives heap lifetime;
+there is no attempt to infer or encode a shorter lifetime. This makes reference
+values executable end to end while keeping field projection, field mutation,
+escape analysis, and scoped allocation at their later stage boundaries.
 
-Construction must allocate and zero the complete owner body, initialize fields
-in typed-IR order, and return a reference whose decoded owner offset equals its
-member offset. Packed references must then flow unchanged through locals,
-assignments, arguments, returns, tuples, unions, and direct or recursive calls.
-Struct equality and inequality use exact reference identity; ordering remains
-unsupported.
+The existing IR representation is sufficient. `Aggregate::Struct` already
+names its `DefinitionId`, keys every stabilized operand by `FieldId`, and has a
+required `StructAllocation` failure site. Frontend lowering currently sorts the
+field pairs; rendering should nevertheless select them by identity and follow
+the layout's canonical `FieldId` order rather than trusting incidental vector
+order in directly constructed IR. `LayoutPlan` already provides the physical
+body size, body alignment, layout identity, ordered fields, and private body
+type. Do not add allocation policy, a native address, or a heap-versus-scoped
+flag to language IR for this conservative stage.
 
-Initialize both arenas before entering generated SAO2 code and release their
-virtual reservations after normal entry completion. No heap object is reclaimed
-during this stage, so execution remains safe without a collector or
-shadow roots. Generated code must call the heap interface rather than depend on
-the temporary monotonic policy.
+### Construction transaction
+
+Render each struct aggregate as a small block-scoped transaction with private C
+temporaries derived only from the destination `LocalId`:
+
+1. request one root allocation through a narrow struct-allocation wrapper;
+2. resolve the returned reference's member address and cast it to the private
+   body type selected by the aggregate's `DefinitionId`;
+3. initialize every field in ascending `FieldId` order from the already
+   evaluated IR operands; and
+4. publish the completed packed reference to the destination local only after
+   all initialization has finished.
+
+The allocation wrapper accepts the immutable root layout descriptor and the
+aggregate's `FailureSiteId`. It passes the descriptor size, the fixed
+eight-byte root alignment, and the descriptor identity to
+`sao2_heap_allocate`. Generated construction code must not read or advance the
+heap cursor directly and must not duplicate the header-size calculation.
+
+On `SAO2_ARENA_OK`, require a nonzero heap root whose decoded `owner_ptr`
+equals `member_ptr`, whose owner header records the requested body size and
+layout identity, and whose body address satisfies the planned alignment. A
+violation is a compiler/runtime invariant. Return the packed reference without
+storing a native pointer in any language value.
+
+Map `SAO2_ARENA_EXHAUSTED` to a source-attributed panic such as `heap arena
+exhausted`, and map `SAO2_ARENA_COMMIT_FAILED` to a distinct source-attributed
+panic such as `unable to commit heap storage`. Both paths must validate that
+the site names `SAO2_FAILURE_STRUCT_ALLOCATION` and finish through the existing
+failure-location machinery. `SAO2_ARENA_INVALID` is an invariant rather than a
+language panic because the compiler supplied the size, alignment, and layout
+identity. Reservation and initialization failure remains the existing
+location-free pre-entry failure.
+
+Tighten IR validation so the struct aggregate's failure-site location equals
+the enclosing operation location, matching the checks already applied to
+runtime checks, output, built-ins, and terminating panics. This is validation
+of the existing field, not a new IR representation.
+
+Allocate into a temporary `sao2_ref` and retain the old destination value until
+publication. This preserves aggregate semantics even for directly constructed
+IR whose destination is also read by an input operand. A failed allocation
+terminates before publication, and no later operation can observe a partially
+initialized object.
+
+The monotonic heap leak remains intentional. A panic terminates the process;
+construction does not roll back a successfully allocated object if a later
+invariant fails. No source operation performed during field initialization can
+panic because all source argument expressions and their checks were lowered
+before the aggregate operation.
+
+### Field initialization
+
+Stage 1 allocation zeroes the complete physical body before construction sees
+it. Preserve that guarantee and then initialize each materialized field exactly
+once from its stabilized operand:
+
+- primitive, string, tuple, union, and unit fields use ordinary C value
+  assignment into the private body field;
+- a referenced struct field copies the operand's `sao2_ref` unchanged; and
+- an inline struct field resolves the operand's exact `member_ptr`, treats it
+  as the expected private source-body type, and copies that complete body value
+  into the embedded destination slot.
+
+The last rule is construction initialization, not Stage 4 field replacement.
+The destination allocation and all of its embedded slots are new and cannot
+already have observable identities. A whole-body C assignment is therefore
+safe here: nested inline bytes are copied into new slots, while packed
+references stored in referenced fields remain shared. Do not copy an allocation
+header, change the destination owner reference, or preserve the source inline
+slot's address.
+
+Use the existing arena-neutral member resolver for the source of an inline
+copy. During Stage 3 every source struct reference reachable from valid code is
+a root reference, but the generated helper should resolve `member_ptr` rather
+than assume it equals the owner offset so Stage 4 interior references can later
+reuse the path. Reject all-zero references, reserved tags, unresolved offsets,
+or an address which cannot satisfy the expected body alignment as invariants
+before dereferencing. Stage 4 remains responsible for the owner-relative bounds
+check when it creates a new interior reference.
+
+Do not use `memcpy` as a substitute for the typed body assignment unless the
+backend documents and locks the effective-type and aliasing consequences. The
+private generated body type already provides the correct recursive copy shape
+and lets the host C compiler check the assignment.
+
+Constructor arguments continue to evaluate from left to right in source order
+before the aggregate operation. Their later `FieldId` sorting changes only the
+order in which stabilized values are written into fresh storage and must not
+evaluate an operand again.
+
+### Packed-reference value flow
+
+Remove the capability rejection for struct types in ordinary function results,
+parameters, and locals. A struct local is a zero-initialized `sao2_ref`; valid
+source control flow assigns a language value before reading it, while the zero
+state remains safe for inactive locals and union payloads.
+
+The existing general renderers should then carry references without special
+allocation behavior:
+
+- `Copy` and unprojected `Assign` copy both 32-bit fields;
+- direct and recursive calls pass and return `sao2_ref` by value;
+- tuple construction and copying preserve contained references;
+- union injection, payload extraction, switching, copying, argument passing,
+  and return preserve contained references; and
+- local rebinding changes only the local reference and never copies or mutates
+  the referred body.
+
+Extend union capability analysis so a struct is a supported packed-reference
+payload and so tuples and nested unions containing structs are executable.
+This does not make structs printable: the language's printable-value set still
+excludes structs, so a tuple or union with a reachable struct payload remains
+rejected by `print` and `println`.
+
+Continue rejecting every `Projection::StructField`, whether used for a read or
+write. Tuple projection of a tuple containing a struct is already ordinary
+value flow and may produce a copied `sao2_ref`; it does not resolve a struct
+body. Container storage and entry-argument materialization retain their current
+unrelated capability boundaries.
+
+### Reference identity
+
+Add one generated helper equivalent to:
+
+```c
+static inline bool sao2_ref_equal(sao2_ref left, sao2_ref right) {
+    return left.owner_ptr == right.owner_ptr
+        && left.member_ptr == right.member_ptr;
+}
+```
+
+Render struct `==` with this helper and `!=` with its negation. Do not compare
+only owner offsets, decode native pointers, compare body contents, use `memcmp`,
+or rely on C struct equality. Although Stage 3 produces only roots, comparing
+both fields locks the correct semantics for Stage 4 interior references.
+
+Extend tuple equality eligibility and generated tuple equality helpers so
+struct fields use `sao2_ref_equal` recursively. Structs remain invalid map keys,
+so do not add reference hashing or change tuple hash eligibility. Union equality
+remains unsupported by the language and needs no helper.
+
+Distinct constructions with identical field values compare unequal. Copies,
+assignments, arguments, and returned references compare equal to the reference
+from which they came. Equality performs no arena access and remains valid for a
+reference after any unrelated allocation.
+
+### Backend and runtime integration
+
+Retain the generated section order established by Stages 1 and 2. Declare the
+reference-equality, allocation, failure, and typed-body resolution helpers
+before generated functions use them. Keep layout descriptors immutable and use
+the descriptor selected by the aggregate `DefinitionId`; do not perform a
+runtime search by identity during construction.
+
+Narrow `CapabilityValidator` in these places only:
+
+- `storage_type` and `signature_type` accept nominal structs as `sao2_ref`;
+- struct aggregate construction becomes supported;
+- union payload checks accept structs and aggregates containing them; and
+- binary equality checks accept a struct directly and tuples recursively
+  containing structs.
+
+Keep struct projection and projected assignment rejected. Keep struct output,
+ordering, numeric operations, hashing, and use as an entry result rejected by
+their existing semantic or backend rules. Capability validation must still
+finish before rendering so unsupported operations cannot produce partial C.
+
+The host adapter already validates arguments, initializes both arenas before
+entry, retains the entry result, and releases both reservations on every normal
+exit. Do not add per-function arena initialization or cleanup. All four valid
+entry shapes must retain their existing argument, result, exit-status, and
+cleanup behavior. A source-attributed allocation panic terminates and needs no
+explicit arena release.
+
+Update the arena-runtime stage comment now that source allocation is enabled,
+but do not change its heap policy, scoped allocator, reference encoding,
+reservation sizes, header layout, or commitment algorithm. No Stage 3 code may
+call `sao2_scoped_allocate`, take a scoped mark, or restore the scoped cursor.
+
+### Implementation sequence
+
+Implement Stage 3 in the following order:
+
+1. Add and directly test `sao2_ref_equal`, the source-attributed struct
+   allocation failure helper, and the checked wrapper around
+   `sao2_heap_allocate`.
+2. Add a renderer helper which selects a `StructLayout` by `DefinitionId` and
+   emits the allocation transaction without publishing its reference early.
+3. Emit ordinary field assignments, referenced-field copies, and typed inline
+   body copies from the Stage 2 field plan. Keep operands single-evaluation.
+4. Enable struct aggregate construction in `CapabilityValidator` while keeping
+   every struct projection rejected.
+5. Enable struct locals, parameters, results, direct calls, returns, copies,
+   assignments, tuple containment, and union containment.
+6. Add reference identity rendering and extend tuple equality recursively
+   without changing hash eligibility.
+7. Add native end-to-end coverage for construction, value flow, equality,
+   nested inline initialization, and allocation failure, then remove temporary
+   duplicate layout lookups or reference decoding.
+
+### Tests and completion
+
+Direct IR and backend tests should verify:
+
+- each struct aggregate uses the descriptor for its exact `DefinitionId`, its
+  existing `StructAllocation` site, fixed eight-byte allocation alignment, and
+  no direct heap-cursor access;
+- allocation status handling distinguishes exhaustion, commit failure, and
+  invalid compiler input, with only the first two using the source site;
+- the returned root is heap-tagged, nonzero, and has equal decoded owner and
+  member offsets, while its header records the planned size and identity;
+- the body is zero before initialization and every field is written once in
+  canonical `FieldId` order from an already stabilized operand, even if a
+  directly constructed IR aggregate stores its field pairs out of order;
+- referenced fields preserve both reference words and inline fields copy only
+  the expected private body, including nested inline and referenced members;
+- construction publishes the destination only after initialization and does
+  not reevaluate constructor operands;
+- struct values copy through locals, rebinding assignments, parameters,
+  returns, direct and recursive calls, tuples, named and anonymous unions,
+  branches, and loops without decoding or reallocating them;
+- reference equality compares both words, aliases compare equal, distinct
+  equal-looking allocations compare unequal, and tuple equality recurses into
+  reference fields;
+- structs and aggregates containing them remain non-printable and non-hashable,
+  ordering remains rejected, and every struct projection still reports the
+  Stage 4 capability boundary;
+- deterministic C emission and existing scalar, string, tuple, union, failure
+  metadata, entry adapter, and arena-runtime output remain stable; and
+- no scoped allocation, cursor mark, escape summary, collector action, shadow
+  frame, copy helper for existing destinations, or dependency is introduced.
+
+Native end-to-end programs should cover:
+
+- a primitive-only struct constructed in `main` and compared with an alias and
+  a separately constructed object;
+- parameters and results carrying a reference across several calls, including
+  a terminating recursive path;
+- tuples and each union form carrying references through injection, switch,
+  payload extraction, copying, and return;
+- an outer body with inline and referenced instances of the same inner type,
+  including repeated use of one source reference;
+- enough repeated allocation to cross commitment-page boundaries without
+  changing earlier references; and
+- reduced-capacity exhaustion and injected commitment failure with the exact
+  constructor filename, line, column, function, and panic reason.
+
+Retain the established skip policy when no supported C compiler is available.
+Contributor guidance prohibits compiling, running tests, or formatting during
+implementation. External verification should use Rust 1.90 or newer, report
+native skips explicitly, and leave generated artifacts under `build/` only.
+
+Stage 3 is complete when every struct construction allocates a zeroed,
+descriptor-identified heap body; every field representation initializes
+correctly; packed references flow unchanged through all already-supported value
+paths; exact identity equality works directly and inside tuples; allocation
+failures are source-attributed; projections and mutation remain gated for Stage
+4; existing programs retain their behavior; and no allocation receives scoped
+lifetime or is reclaimed.
 
 ## Stage 4: Member access and identity-preserving copy
 
