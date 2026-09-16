@@ -556,19 +556,21 @@ expression as its value. A statement-form `if` does not require an `else`.
 
 Memory is managed automatically by a garbage collector. Primitive and tuple
 values are conceptually stored inline. Referenceable objects are allocated in
-a contiguous virtual-address arena. They have garbage-collected lifetimes
-unless escape analysis proves that they do not outlive the current function, in
-which case their arena storage has a scoped lifetime and is reclaimed when the
-function returns. A compiler may instead use the native C stack when it proves
-that no packed reference to the object must be materialized.
+one of two contiguous virtual-address arenas: a heap arena for
+garbage-collected lifetimes and a scoped arena for allocations proven not to
+outlive the current function. Scoped storage is reclaimed when that function
+returns. A compiler may instead use the native C stack when it proves that no
+packed reference to the object must be materialized.
 
-On a 64-bit target, the runtime reserves one contiguous 4-GiB virtual-address
-arena without initially committing physical storage for the whole arena. Its
-allocator commits and manages storage within that arena on demand. Runtime
-bookkeeping and storage used by the generated program or host C implementation
-outside the arena are not part of the limit. An allocation first permits the
-collector to reclaim unreachable storage; if satisfying it would still exceed
-the arena's capacity, the program panics.
+On a 64-bit target, the runtime reserves a separate 4-GiB virtual-address range
+for each arena without initially committing physical storage for either whole
+range. The heap and scoped allocators commit and manage storage independently
+within their own ranges. Runtime bookkeeping and storage used by the generated
+program or host C implementation outside the arenas are not part of either
+limit. A heap allocation first permits the collector to reclaim unreachable
+storage; if satisfying it would still exceed the heap arena's capacity, the
+program panics. A scoped allocation which would exceed the scoped arena's
+capacity also panics.
 
 An object reference is an 8-byte packed struct rather than a native C pointer.
 Its representation is equivalent to:
@@ -581,26 +583,35 @@ struct ref {
 ```
 
 The all-zero representation is an internal null reference and is not a
-language value. Arena offset zero is permanently reserved, so no allocation or
-embedded object can produce `{ owner_ptr: 0, member_ptr: 0 }`. Generated trace
-code ignores this representation. The zero discriminant is likewise reserved
-as the inactive, non-value state of every runtime union and contains no
-traceable payload. These representations allow root storage to be safely
-zero-initialized before it contains language values.
+language value. Decoded offset zero is permanently reserved in both arenas, so
+no allocation or embedded object can produce
+`{ owner_ptr: 0, member_ptr: 0 }`. Generated trace code ignores this
+representation. The zero discriminant is likewise reserved as the inactive,
+non-value state of every runtime union and contains no traceable payload. These
+representations allow root storage to be safely zero-initialized before it
+contains language values.
 
-Both fields are byte offsets from the global arena base. `owner_ptr` identifies
-the root of the complete enclosing allocation, not merely the referenced
-object's immediate inline parent. `member_ptr` identifies the exact referenced
-object and equals `owner_ptr` for a reference to the allocation's root object.
-For an interior reference it instead identifies the stable embedded slot.
+Every allocation root is aligned to eight bytes. The low three bits of
+`owner_ptr` are therefore available as an arena tag. Tag zero selects the heap
+arena, tag one selects the scoped arena, and the remaining tag values are
+reserved. The aligned offset with those bits cleared still spans the complete
+4-GiB range of either arena.
 
-Generated C derives temporary raw pointers independently from the two fields:
-the enclosing allocation is at `heap_base + owner_ptr`, and the referenced
-object is at `heap_base + member_ptr`. Neither raw pointer is stored as the
-language reference. Allocation metadata reachable from the owner pointer
-records the allocation's size, generated layout, lifetime class, and collector
-timestamp. The runtime rejects any individual allocation or arena position
-that cannot be represented by these 32-bit offsets.
+After removing its tag, `owner_ptr` identifies the root of the complete
+enclosing allocation, not merely the referenced object's immediate inline
+parent. `member_ptr` is an untagged byte offset identifying the exact referenced
+value. It may be unaligned, as for an inline character field. For a reference
+to the allocation root, `member_ptr` equals the decoded owner offset. For an
+interior reference it instead identifies the stable embedded slot.
+
+Generated C derives temporary raw pointers independently from the two fields.
+It selects `heap_base` or `scoped_base` from the `owner_ptr` tag and adds the
+decoded owner offset or the unmodified member offset to that same base. Neither
+raw pointer is stored as the language reference. Allocation metadata reachable
+from the decoded owner records the allocation's size, generated layout,
+lifetime class, and collector timestamp. The runtime rejects reserved owner
+tags and any individual allocation or arena position that cannot be
+represented by the appropriate 32-bit offset.
 
 The compiler performs conservative, context-insensitive escape analysis one
 function at a time. For each function it records only the functions called
@@ -619,10 +630,10 @@ Functions left unresolved after the queue is exhausted are conservatively
 treated as escaping because they are recursive or depend on recursion. Whenever
 safety cannot be proven, allocation uses a garbage-collected lifetime.
 
-The collector is non-moving, stop-the-world, and mark-and-sweep. Each
-garbage-collected arena allocation records one mark timestamp and participates
-in the collector's allocation list. Struct values, including inline
-subobjects, contain no collector mark field.
+The collector is non-moving, stop-the-world, and mark-and-sweep. Each heap
+allocation records one mark timestamp and participates in the collector's
+allocation list. Struct values, including inline subobjects, contain no
+collector mark field.
 
 Generated functions use ordinary native C calls. A function with potentially
 traceable parameters, locals, or temporaries also has a compiler-generated

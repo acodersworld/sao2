@@ -149,10 +149,11 @@ Status: current.
 
 - Generate layouts for inline and referenced struct members.
 - Define the 8-byte packed `owner_ptr` and `member_ptr` reference-struct ABI.
-- Reserve a 4-GiB virtual-address arena and reconstruct native pointers by
-  adding either reference field to its global base.
-- Reserve arena offset zero for the all-zero internal null reference and keep
-  zero-initialized union storage non-traceable.
+- Reserve separate 4-GiB heap and scoped virtual-address arenas. Tag
+  `owner_ptr` using the low bits made available by allocation alignment, then
+  reconstruct both native pointers from the selected base.
+- Reserve decoded offset zero in both arenas for the all-zero internal null
+  reference and keep zero-initialized union storage non-traceable.
 - Give proven non-escaping arena allocations scoped lifetimes.
 - Generate field-copy routines that preserve destination slot identity.
 - Produce context-insensitive escape summaries for functions.
@@ -171,7 +172,7 @@ that pass references to inline structs without letting them escape.
   traversal callback for each function that can hold roots.
 - Link zero-initialized shadow frames for active invocations and traverse their
   generated root fields without inspecting the native C stack.
-- Allocate GC-managed storage within the reserved 4-GiB arena.
+- Allocate GC-managed storage within the reserved 4-GiB heap arena.
 - Mark each referenced object's owning allocation and trace from its exact
   `member_ptr`.
 - Deduplicate tracing by `owner_ptr`, `member_ptr`, and referenced layout.
@@ -181,7 +182,7 @@ that pass references to inline structs without letting them escape.
 Outcome: cyclic object graphs and escaping interior references are reclaimed
 safely without exposing allocation placement to programs.
 
-The reserved arena, packed-reference, and exact-interior-tracing mechanism
+The reserved arenas, packed-reference, and exact-interior-tracing mechanism
 should also receive an early isolated prototype before the full runtime depends
 on it.
 
