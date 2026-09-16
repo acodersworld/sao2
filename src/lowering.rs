@@ -224,8 +224,6 @@ struct BodyLowerer<'a, 'b, 'source, 'ast> {
 #[derive(Clone)]
 struct Narrowing {
     binding: analysis::BindingId,
-    union: ir::Operand,
-    alternative: ir::AlternativeId,
     payload: analysis::TypeId,
     local: ir::LocalId,
 }
@@ -525,7 +523,7 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         let local = self.temporary(test.payload)?;
         self.push(ir::OperationKind::UnionPayload { destination: local, union: test.union.clone(), alternative: test.alternative }, span)?;
         self.narrowings.retain(|entry| entry.binding != binding);
-        self.narrowings.push(Narrowing { binding, union: test.union, alternative: test.alternative, payload: test.payload, local });
+        self.narrowings.push(Narrowing { binding, payload: test.payload, local });
         Ok(())
     }
 
@@ -1156,7 +1154,7 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
                 let local = self.temporary(arm_resolution.payload)?;
                 self.push(ir::OperationKind::UnionPayload { destination: local, union: union.clone(), alternative }, arm.label.span)?;
                 self.narrowings.retain(|entry| entry.binding != binding);
-                self.narrowings.push(Narrowing { binding, union: union.clone(), alternative, payload: arm_resolution.payload, local });
+                self.narrowings.push(Narrowing { binding, payload: arm_resolution.payload, local });
             }
             self.statement_body(&arm.body)?;
             if let Some(block) = self.block.take() { fallthrough.push((block, arm.body.span)); }

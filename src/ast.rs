@@ -13,6 +13,7 @@ pub enum Declaration {
 }
 
 impl Declaration {
+    #[allow(dead_code)] // Used by consumers of the public AST outside this crate.
     pub fn span(&self) -> Span {
         match self {
             Self::Type(type_declaration) => type_declaration.span,

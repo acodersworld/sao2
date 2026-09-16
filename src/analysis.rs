@@ -163,6 +163,7 @@ impl BindingNode<'_> {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Retained as the common diagnostic subject representation.
 pub(crate) enum AstNode<'ast> {
     Declaration(DeclarationNode<'ast>),
     Binding(BindingNode<'ast>),
@@ -172,6 +173,7 @@ pub(crate) enum AstNode<'ast> {
     AssignmentTarget(&'ast AssignmentTarget),
 }
 
+#[allow(dead_code)] // Some variants are only exercised by diagnostic integration tests.
 impl AstNode<'_> {
     pub(crate) fn span(self) -> Span {
         match self {
@@ -186,6 +188,7 @@ impl AstNode<'_> {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Retained for declaration-origin diagnostics.
 pub(crate) struct DeclarationRecord<'ast> {
     pub(crate) id: DeclarationId,
     pub(crate) node: DeclarationNode<'ast>,

@@ -1358,17 +1358,21 @@ impl<'a> Renderer<'a> {
         failure: FailureSiteId,
     ) {
         let site = failure.index();
+        let writer = format!("sao2_output_writer_{site}");
+        self.output.push_str("    {\n");
         let _ = writeln!(self.output, "    sao2_prepare_output({site});");
-        let _ = writeln!(self.output, "    sao2_writer sao2_output_writer = {{ stdout, {site}, true, false }};");
+        let _ = writeln!(self.output, "    sao2_writer {writer} = {{ stdout, {site}, true, false }};");
         if let Some(argument) = arguments.first() {
             let value = self.operand(argument);
-            let call = self.format_call(self.operand_type(function, argument), &value).replace("writer", "&sao2_output_writer");
+            let call = self.format_call(self.operand_type(function, argument), &value)
+                .replace("writer", &format!("&{writer}"));
             let _ = writeln!(self.output, "    {call};");
         }
         if intrinsic == Intrinsic::Println {
-            self.output.push_str("    sao2_writer_char(&sao2_output_writer, UINT8_C(10));\n");
+            let _ = writeln!(self.output, "    sao2_writer_char(&{writer}, UINT8_C(10));");
         }
         let _ = writeln!(self.output, "    sao2_local_{} = (sao2_unit){{0}};", destination.index());
+        self.output.push_str("    }\n");
     }
 
     fn binary_expression(&self, operator: BinaryOperator, ty: TypeId, left: &str, right: &str) -> String {
@@ -2631,7 +2635,7 @@ mod tests {
         let main_id = print_program.add_function(main);
         print_program.entry = Some(main_id);
         let printed = emit(&print_program).unwrap();
-        assert!(printed.contains("sao2_format_char(&sao2_output_writer, UINT8_C(120));"));
+        assert!(printed.contains("sao2_format_char(&sao2_output_writer_0, UINT8_C(120));"));
 
         let (mut builtin_program, types, location) = program();
         let mut main = Function::new("main", types.int);
@@ -2827,10 +2831,10 @@ mod tests {
 
         let emitted = emit(&program).unwrap();
         assert!(emitted.contains("#ifdef _WIN32\n#include <fcntl.h>\n#include <io.h>\n#endif"));
-        assert!(emitted.contains("sao2_format_string(&sao2_output_writer, &sao2_string_descriptor_0);"));
-        assert!(emitted.contains("sao2_format_int(&sao2_output_writer, INT64_C(12));"));
-        assert!(emitted.contains("sao2_format_bool(&sao2_output_writer, true);"));
-        assert_eq!(emitted.matches("sao2_writer_char(&sao2_output_writer, UINT8_C(10));").count(), 3);
+        assert!(emitted.contains("sao2_format_string(&sao2_output_writer_0, &sao2_string_descriptor_0);"));
+        assert!(emitted.contains("sao2_format_int(&sao2_output_writer_0, INT64_C(12));"));
+        assert!(emitted.contains("sao2_format_bool(&sao2_output_writer_0, true);"));
+        assert_eq!(emitted.matches("sao2_writer_char(&sao2_output_writer_0, UINT8_C(10));").count(), 3);
         assert_eq!(emitted.matches("sao2_local_0 = (sao2_unit){0};").count(), 4);
     }
 

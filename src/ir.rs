@@ -16,6 +16,7 @@ macro_rules! index_id {
 
         impl $name {
             pub(crate) fn index(self) -> usize { self.0 }
+            #[allow(dead_code)] // Some IDs are constructed only by direct IR tests.
             pub(crate) fn from_index(index: usize) -> Self { Self(index) }
         }
 
@@ -233,6 +234,7 @@ pub(crate) struct Place {
 
 impl Place {
     pub(crate) fn local(local: LocalId) -> Self { Self { local, projections: Vec::new() } }
+    #[allow(dead_code)] // Direct IR tests construct projected places explicitly.
     pub(crate) fn projected(local: LocalId, projections: Vec<Projection>) -> Self {
         Self { local, projections }
     }
@@ -361,6 +363,7 @@ pub(crate) struct Terminator {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)] // The backend retains this validated IR terminator for later stages.
 pub(crate) enum TerminatorKind {
     Jump(BlockId),
     Branch { condition: Operand, then_block: BlockId, else_block: BlockId },
@@ -432,6 +435,7 @@ impl Program {
 
     pub(crate) fn validate(&self) -> Result<(), ValidationError> { Validator::new(self).validate() }
 
+    #[allow(dead_code)] // Deterministic IR debugging renderer retained for compiler diagnostics.
     pub(crate) fn render(&self) -> String {
         let mut output = String::new();
         Renderer { program: self, output: &mut output }.render();
@@ -473,11 +477,13 @@ struct Validator<'a> {
     site: Option<OperationSite>,
 }
 
+#[allow(dead_code)] // Used by Program::render, which is intentionally debug-only today.
 struct Renderer<'a, 'out> {
     program: &'a Program,
     output: &'out mut String,
 }
 
+#[allow(dead_code)]
 impl Renderer<'_, '_> {
     fn render(&mut self) {
         let _ = writeln!(self.output, "source \"{}\" bytes {}", escape_text(&self.program.source.filename.to_string_lossy()), self.program.source.byte_len);
@@ -640,8 +646,10 @@ impl Renderer<'_, '_> {
     }
 }
 
+#[allow(dead_code)]
 fn escape_text(text: &str) -> String { escape_bytes(text.as_bytes()) }
 
+#[allow(dead_code)]
 fn escape_bytes(bytes: &[u8]) -> String {
     let mut output = String::new();
     for byte in bytes {
@@ -660,16 +668,16 @@ fn escape_bytes(bytes: &[u8]) -> String {
     output
 }
 
-fn primitive_name(value: PrimitiveType) -> &'static str { match value { PrimitiveType::Int => "int", PrimitiveType::Float => "float", PrimitiveType::Str => "str", PrimitiveType::Bool => "bool", PrimitiveType::Char => "char" } }
-fn storage_name(value: MemberStorage) -> &'static str { match value { MemberStorage::Inline => "inline", MemberStorage::Referenced => "referenced" } }
-fn origin_name(value: LocalOrigin) -> &'static str { match value { LocalOrigin::Parameter => "parameter", LocalOrigin::Binding => "binding", LocalOrigin::Temporary => "temporary" } }
-fn unary_name(value: UnaryOperator) -> &'static str { match value { UnaryOperator::LogicalNot => "not", UnaryOperator::BitwiseNot => "bit-not", UnaryOperator::Plus => "positive", UnaryOperator::Minus => "negative" } }
-fn binary_name(value: BinaryOperator) -> &'static str { match value { BinaryOperator::BitwiseOr => "bit-or", BinaryOperator::BitwiseXor => "bit-xor", BinaryOperator::BitwiseAnd => "bit-and", BinaryOperator::Equal => "equal", BinaryOperator::NotEqual => "not-equal", BinaryOperator::Less => "less", BinaryOperator::LessEqual => "less-equal", BinaryOperator::Greater => "greater", BinaryOperator::GreaterEqual => "greater-equal", BinaryOperator::In => "in", BinaryOperator::ShiftLeft => "shift-left", BinaryOperator::ShiftRight => "shift-right", BinaryOperator::Add => "add", BinaryOperator::Subtract => "subtract", BinaryOperator::Multiply => "multiply", BinaryOperator::Divide => "divide", BinaryOperator::Remainder => "remainder" } }
-fn conversion_name(value: NumericConversion) -> &'static str { match value { NumericConversion::IntToFloat => "int-to-float", NumericConversion::FloatToInt => "float-to-int" } }
-fn intrinsic_name(value: Intrinsic) -> &'static str { match value { Intrinsic::Print => "print", Intrinsic::Println => "println" } }
-fn builtin_name(value: BuiltinMethod) -> &'static str { match value { BuiltinMethod::ListAppend => "list.append", BuiltinMethod::ListRemoveIndex => "list.remove-index", BuiltinMethod::ListLen => "list.len", BuiltinMethod::MapRemoveKey => "map.remove-key", BuiltinMethod::MapLen => "map.len", BuiltinMethod::StrLen => "str.len" } }
-fn integer_operation_name(value: IntegerOperation) -> &'static str { match value { IntegerOperation::Add => "add-overflow", IntegerOperation::Subtract => "subtract-overflow", IntegerOperation::Multiply => "multiply-overflow", IntegerOperation::ShiftLeft => "shift-left-overflow" } }
-fn failure_operation_name(value: FailureOperation) -> &'static str { match value {
+#[allow(dead_code)] fn primitive_name(value: PrimitiveType) -> &'static str { match value { PrimitiveType::Int => "int", PrimitiveType::Float => "float", PrimitiveType::Str => "str", PrimitiveType::Bool => "bool", PrimitiveType::Char => "char" } }
+#[allow(dead_code)] fn storage_name(value: MemberStorage) -> &'static str { match value { MemberStorage::Inline => "inline", MemberStorage::Referenced => "referenced" } }
+#[allow(dead_code)] fn origin_name(value: LocalOrigin) -> &'static str { match value { LocalOrigin::Parameter => "parameter", LocalOrigin::Binding => "binding", LocalOrigin::Temporary => "temporary" } }
+#[allow(dead_code)] fn unary_name(value: UnaryOperator) -> &'static str { match value { UnaryOperator::LogicalNot => "not", UnaryOperator::BitwiseNot => "bit-not", UnaryOperator::Plus => "positive", UnaryOperator::Minus => "negative" } }
+#[allow(dead_code)] fn binary_name(value: BinaryOperator) -> &'static str { match value { BinaryOperator::BitwiseOr => "bit-or", BinaryOperator::BitwiseXor => "bit-xor", BinaryOperator::BitwiseAnd => "bit-and", BinaryOperator::Equal => "equal", BinaryOperator::NotEqual => "not-equal", BinaryOperator::Less => "less", BinaryOperator::LessEqual => "less-equal", BinaryOperator::Greater => "greater", BinaryOperator::GreaterEqual => "greater-equal", BinaryOperator::In => "in", BinaryOperator::ShiftLeft => "shift-left", BinaryOperator::ShiftRight => "shift-right", BinaryOperator::Add => "add", BinaryOperator::Subtract => "subtract", BinaryOperator::Multiply => "multiply", BinaryOperator::Divide => "divide", BinaryOperator::Remainder => "remainder" } }
+#[allow(dead_code)] fn conversion_name(value: NumericConversion) -> &'static str { match value { NumericConversion::IntToFloat => "int-to-float", NumericConversion::FloatToInt => "float-to-int" } }
+#[allow(dead_code)] fn intrinsic_name(value: Intrinsic) -> &'static str { match value { Intrinsic::Print => "print", Intrinsic::Println => "println" } }
+#[allow(dead_code)] fn builtin_name(value: BuiltinMethod) -> &'static str { match value { BuiltinMethod::ListAppend => "list.append", BuiltinMethod::ListRemoveIndex => "list.remove-index", BuiltinMethod::ListLen => "list.len", BuiltinMethod::MapRemoveKey => "map.remove-key", BuiltinMethod::MapLen => "map.len", BuiltinMethod::StrLen => "str.len" } }
+#[allow(dead_code)] fn integer_operation_name(value: IntegerOperation) -> &'static str { match value { IntegerOperation::Add => "add-overflow", IntegerOperation::Subtract => "subtract-overflow", IntegerOperation::Multiply => "multiply-overflow", IntegerOperation::ShiftLeft => "shift-left-overflow" } }
+#[allow(dead_code)] fn failure_operation_name(value: FailureOperation) -> &'static str { match value {
     FailureOperation::IntegerAdd => "integer-add", FailureOperation::IntegerSubtract => "integer-subtract",
     FailureOperation::IntegerMultiply => "integer-multiply", FailureOperation::IntegerNegation => "integer-negation",
     FailureOperation::IntegerDivision => "integer-division", FailureOperation::IntegerRemainder => "integer-remainder",

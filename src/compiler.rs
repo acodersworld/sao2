@@ -78,6 +78,7 @@ fn compile_into(
     compile_into_with_pipeline(source, build_directory, |_| {}, || Ok(()), |_| {})
 }
 
+#[cfg(test)]
 fn compile_into_with_semantic(
     source: &SourceFile,
     build_directory: &Path,
@@ -264,7 +265,7 @@ mod tests {
         assert!(output.contains("= (sao2_def_0){0};"));
         assert!(output.matches(".field_0;").count() >= 2);
         assert!(output.contains("sao2_tuple_equal_def_0"));
-        assert!(output.contains("sao2_format_tuple_def_0(&sao2_output_writer"));
+        assert!(output.contains("sao2_format_tuple_def_0(&sao2_output_writer_"));
         fs::remove_dir_all(build_directory).unwrap();
     }
 
@@ -289,9 +290,9 @@ mod tests {
         let output_path = compile_into(&source, &build_directory).unwrap().generated_c;
         let output = fs::read_to_string(&output_path).unwrap();
         assert!(output.contains("fwrite("));
-        assert!(output.contains("sao2_writer sao2_output_writer"));
-        assert!(output.contains("sao2_format_int(&sao2_output_writer"));
-        assert!(output.contains("sao2_format_bool(&sao2_output_writer"));
+        assert!(output.contains("sao2_writer sao2_output_writer_"));
+        assert!(output.contains("sao2_format_int(&sao2_output_writer_"));
+        assert!(output.contains("sao2_format_bool(&sao2_output_writer_"));
         assert!(output.contains("int64_t sao2_result = sao2_fn_0();"));
         fs::remove_dir_all(build_directory).unwrap();
     }
@@ -302,7 +303,7 @@ mod tests {
         let build_directory = temporary_directory("float-output");
         let output_path = compile_into(&source, &build_directory).unwrap().generated_c;
         let output = fs::read_to_string(output_path).unwrap();
-        assert!(output.contains("sao2_format_float(&sao2_output_writer"));
+        assert!(output.contains("sao2_format_float(&sao2_output_writer_"));
         fs::remove_dir_all(build_directory).unwrap();
     }
 
@@ -355,7 +356,7 @@ mod tests {
         let output_path = build_directory.join("program.c");
         fs::write(&output_path, "existing generated C").unwrap();
 
-        let source = source("fn main() { value := [1]; print(value); }");
+        let source = source("fn main() { value := \"x\".len(); }");
         let diagnostic = compile_into(&source, &build_directory)
             .unwrap_err()
             .to_string();
