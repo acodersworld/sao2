@@ -84,6 +84,13 @@ within each IR node. The first occurrence assigns the pool index; later equal
 constants reuse it. Do not use pointer identity, a randomly seeded collection,
 or source spelling to determine pool order.
 
+Replace the renderer's bare `Vec<Vec<u8>>` with a small backend-only literal
+record containing owned bytes and the computed hash. Keep lookup by byte
+equality; the hash is cached output data, not the deduplication authority. A
+simple linear first-occurrence lookup is sufficient for this milestone and
+preserves the current ordering without introducing another dependency or a
+second identity map.
+
 For every pool entry, emit:
 
 1. a `static const unsigned char` backing array containing the exact bytes; and
@@ -110,6 +117,18 @@ prefix with `memcmp` and then compares lengths without subtraction. This gives
 lexicographic ASCII ordering, distinguishes prefixes correctly, and treats an
 embedded zero byte as data.
 
+Use one helper contract:
+
+```c
+static int sao2_string_compare(sao2_string left, sao2_string right);
+```
+
+Return a negative value, zero, or a positive value rather than normalizing to
+`-1`, `0`, and `1`. Compare `min(left->length, right->length)` bytes. If
+`memcmp` is nonzero, return its result; otherwise compare the lengths with
+branches. Map the four IR ordering operators to comparison-with-zero in
+`binary_expression`. Identity equality must not call this helper.
+
 Implement `OperationKind::StringIndex` through a generated helper returning
 `uint8_t`. The helper accepts the materialized string, signed `int64_t` index,
 and `FailureSiteId`. Nonnegative indices count from the start. Negative indices
@@ -119,6 +138,25 @@ or beyond the length, or a negative magnitude greater than the length with the
 reason `string index out of range`. Validate that the site records
 `SAO2_FAILURE_STRING_INDEX` before reporting the existing source-attributed
 panic.
+
+Use this generated helper contract:
+
+```c
+static uint8_t sao2_string_index(
+    sao2_string value,
+    int64_t index,
+    size_t site
+);
+```
+
+For a nonnegative index, convert it to an unsigned magnitude, require it to be
+strictly less than `value->length`, and use it as the byte position. For a
+negative index, obtain the magnitude with the existing
+`sao2_int_magnitude` helper, require it to be no greater than the length, and
+use `value->length - magnitude`. Perform the bounds comparison before the final
+`size_t` conversion. On failure call `sao2_fail` with the string-index failure
+operation and reason; on success return `value->bytes[position]`. This handles
+`INT64_MIN` without signed overflow and makes `-1` select the last byte.
 
 Keep hashing separate from language operations. Add a small Rust backend helper
 for the fixed FNV-1a calculation and use it when planning literal descriptors.
@@ -181,6 +219,49 @@ deterministic. Capability validation must still finish before rendering so a
 rejected program cannot produce a partial translation unit or filesystem side
 effects.
 
+### Implementation sequence and code ownership
+
+Keep the change inside `src/c_backend.rs` apart from compiler and end-to-end
+test expectations. No AST, analysis, semantic, lowering, or IR shape change is
+needed: those layers already accept and lower every Stage-1 operation.
+
+Implement in this order so each step has one clear representation owner:
+
+1. Add a private literal record and `string_hash(&[u8]) -> u64`. Change
+   `collect_strings` and `Renderer::strings` to retain canonical bytes plus the
+   fixed hash while preserving first occurrence. Add direct Rust hash-vector
+   tests before using the value in generated C.
+2. Change the fixed helper types emitted by `Renderer::render`, then extend
+   `render_string_data` to emit each backing array followed immediately by its
+   immutable descriptor using `UINT64_C(hash)`. Change `operand` to render the
+   descriptor address.
+3. Migrate the existing consumers in `render_intrinsic` and `SCALAR_RUNTIME`'s
+   `sao2_panic` from field access on a slice value to field access through the
+   descriptor pointer. Update existing exact-C assertions at the same time and
+   prove no `(sao2_string){...}` construction remains.
+4. Add `sao2_string_compare` to the generated scalar runtime after the string
+   descriptor is fully defined. Relax `CapabilityValidator::operation` for
+   validated string `Binary` operations, and make `binary_expression` dispatch
+   string equality to pointer comparison and string ordering to the helper.
+5. Add `sao2_string_index` after the common failure helpers it calls. Relax the
+   capability case for `OperationKind::StringIndex`, render the destination
+   assignment in `render_operation`, and remove that variant from the
+   renderer's unreachable unsupported group. Preserve the operand order
+   `string`, `index`, then failure-site index in the emitted call.
+6. Replace the combined backend rejection fixture's string-index portion with
+   positive rendering and failure-helper coverage while retaining its other
+   capability assertions. Update compiler assertions to the stable `current C
+   backend` diagnostic prefix, then add focused source and native cases rather
+   than duplicating all exact-C assertions at the compiler boundary.
+
+Keep generated section ordering stable: headers and fixed types, aggregate
+declarations and definitions, runtime metadata, scalar runtime helpers, string
+literal arrays and descriptors, prototypes, functions, and the host adapter.
+The descriptor definition must precede `SCALAR_RUNTIME`; literal objects need
+only precede generated SAO2 functions. Do not split string support into a
+second Rust module or introduce a general runtime abstraction before another
+value family needs it.
+
 ### Tests and completion
 
 Extend direct backend tests to cover:
@@ -217,6 +298,19 @@ Contributor guidance prohibits compiling, running tests, or formatting during
 implementation. External verification for the completed stage must exercise
 the new native cases with `SAO2_CC` selecting a supported compiler and confirm
 that no native assertion was skipped.
+
+Run the required verification outside this implementation session from the
+intended worktree:
+
+```text
+rustc --version
+SAO2_CC=cc cargo test
+```
+
+Replace `cc` only with another explicitly selected supported compiler. Confirm
+Rust is at least 1.90, the complete suite passes, native cases ran rather than
+skipped, repeated generated C is identical, and no generated `build/` artifact
+is included in the stage handoff.
 
 Exit criterion: every executable string value is a reference to one immutable
 canonical descriptor; distinct occurrences of equal literal bytes share that
