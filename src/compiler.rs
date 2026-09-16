@@ -251,6 +251,23 @@ mod tests {
     }
 
     #[test]
+    fn tuple_source_writes_construction_projection_and_equality_c() {
+        let source = source(concat!(
+            "type Pair(int, int); type Nested(Pair, bool); ",
+            "fn identity(value Pair) Pair { value } ",
+            "fn main() { pair := Pair(20, 22); nested := Nested(pair, true); ",
+            "println(nested.0.0); println(pair == identity(pair)); }",
+        ));
+        let build_directory = temporary_directory("tuple-c-output");
+        let output_path = compile_into(&source, &build_directory).unwrap().generated_c;
+        let output = fs::read_to_string(&output_path).unwrap();
+        assert!(output.contains("= (sao2_def_0){0};"));
+        assert!(output.matches(".field_0;").count() >= 2);
+        assert!(output.contains("sao2_tuple_equal_def_0"));
+        fs::remove_dir_all(build_directory).unwrap();
+    }
+
+    #[test]
     fn repeated_compilation_has_deterministic_ir_backend_output() {
         let source = source("fn main() int { value := 6 * 7; println(value); value }");
         let build_directory = temporary_directory("lowered-identical-c");

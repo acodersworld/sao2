@@ -195,7 +195,9 @@ impl<'a> CapabilityValidator<'a> {
         if self.operation_uses_entry_args(operation) {
             return self.unsupported("use of the entry args parameter");
         }
-        if operation_has_projection(operation) {
+        if matches!(operation, OperationKind::Assign { destination, .. } if !destination.projections.is_empty())
+            || operation_operands_have_unsupported_projection(operation)
+        {
             return self.unsupported("place projection");
         }
         match operation {
@@ -217,9 +219,12 @@ impl<'a> CapabilityValidator<'a> {
             OperationKind::Unary { operand, .. } => {
                 self.require_scalar_operand(function, operand, "non-scalar unary operation")
             }
-            OperationKind::Binary { left, .. } => {
+            OperationKind::Binary { operator, left, .. } => {
                 let ty = self.operand_type(function, left);
-                if self.is_scalar(ty) {
+                if self.is_scalar(ty)
+                    || matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual)
+                        && self.is_equatable_tuple(ty, &mut Vec::new())
+                {
                     Ok(())
                 } else {
                     self.unsupported("non-scalar binary operation")
@@ -230,6 +235,7 @@ impl<'a> CapabilityValidator<'a> {
                 self.executable_union_use(self.place_type(function, destination))?;
                 self.executable_union_use(self.operand_type(function, value))
             }
+            OperationKind::Aggregate { aggregate: ir::Aggregate::Tuple { .. }, .. } => Ok(()),
             OperationKind::Aggregate { .. } => self.unsupported("aggregate construction"),
             OperationKind::StringIndex { .. } => Ok(()),
             OperationKind::Intrinsic { intrinsic, arguments, .. } => match intrinsic {
@@ -251,6 +257,9 @@ impl<'a> CapabilityValidator<'a> {
     fn terminator(&self, function: &Function, terminator: &TerminatorKind) -> Result<(), CEmissionError> {
         if self.terminator_uses_entry_args(terminator) {
             return self.unsupported("use of the entry args parameter");
+        }
+        if terminator_operands_have_unsupported_projection(terminator) {
+            return self.unsupported("place projection");
         }
         match terminator {
             TerminatorKind::Jump(_) | TerminatorKind::Branch { .. }
@@ -320,6 +329,13 @@ impl<'a> CapabilityValidator<'a> {
                 supported
             }
             Type::Nominal(definition) => match &self.program.definitions[definition.index()].layout {
+                DefinitionLayout::Tuple(fields) => {
+                    visiting.push(ty);
+                    let supported = fields.iter()
+                        .all(|field| self.supports_union_value(*field, visiting));
+                    visiting.pop();
+                    supported
+                }
                 DefinitionLayout::Union(alternatives) => {
                     visiting.push(ty);
                     let supported = alternatives.iter()
@@ -327,10 +343,25 @@ impl<'a> CapabilityValidator<'a> {
                     visiting.pop();
                     supported
                 }
-                DefinitionLayout::Tuple(_) | DefinitionLayout::Struct(_) => false,
+                DefinitionLayout::Struct(_) => false,
             },
             Type::List(_) | Type::Map { .. } => false,
         }
+    }
+
+    fn is_equatable_tuple(&self, ty: TypeId, visiting: &mut Vec<TypeId>) -> bool {
+        if visiting.contains(&ty) { return true; }
+        let Type::Nominal(definition) = &self.program.types[ty.index()] else { return false; };
+        let DefinitionLayout::Tuple(fields) = &self.program.definitions[definition.index()].layout
+            else { return false; };
+        visiting.push(ty);
+        let equatable = fields.iter().all(|field| match &self.program.types[field.index()] {
+            Type::Unit | Type::Primitive(_) => true,
+            Type::Nominal(_) => self.is_equatable_tuple(*field, visiting),
+            Type::Union(_) | Type::List(_) | Type::Map { .. } => false,
+        });
+        visiting.pop();
+        equatable
     }
 
     fn union_alternatives(&self, ty: TypeId) -> Option<&[ir::UnionAlternative]> {
@@ -541,6 +572,7 @@ impl<'a> Renderer<'a> {
         self.render_runtime_metadata();
         self.render_scalar_helpers();
         self.render_string_data();
+        self.render_tuple_helpers();
         if !self.program.functions.is_empty() {
             self.output.push('\n');
             for index in 0..self.program.functions.len() {
@@ -661,6 +693,122 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    fn render_tuple_helpers(&mut self) {
+        let tuples = self.definitions.iter().filter_map(|aggregate| {
+            let AggregateId::Definition(definition) = aggregate else { return None; };
+            matches!(&self.program.definitions[definition.index()].layout, DefinitionLayout::Tuple(_))
+                .then_some(*definition)
+        }).collect::<Vec<_>>();
+        let equal = tuples.iter().copied().filter(|definition| {
+            self.is_equatable_tuple_definition(*definition, &mut Vec::new())
+        }).collect::<Vec<_>>();
+        let hashed = tuples.iter().copied().filter(|definition| {
+            self.is_hashable_tuple_definition(*definition, &mut Vec::new())
+        }).collect::<Vec<_>>();
+        if equal.is_empty() && hashed.is_empty() { return; }
+
+        self.output.push('\n');
+        for definition in equal {
+            self.render_tuple_equal_helper(definition);
+        }
+        if !hashed.is_empty() {
+            self.output.push_str(concat!(
+                "static inline uint64_t sao2_hash_combine(uint64_t state, uint64_t value) {\n",
+                "    for (unsigned int byte = 0; byte < 8; ++byte) {\n",
+                "        state ^= value & UINT64_C(255);\n",
+                "        state *= UINT64_C(1099511628211);\n",
+                "        value >>= 8;\n",
+                "    }\n",
+                "    return state;\n",
+                "}\n\n",
+            ));
+            for definition in hashed {
+                self.render_tuple_hash_helper(definition);
+            }
+        }
+    }
+
+    fn render_tuple_equal_helper(&mut self, definition: DefinitionId) {
+        let name = format!("sao2_def_{}", definition.index());
+        let _ = writeln!(self.output, "static inline bool sao2_tuple_equal_def_{}({name} left, {name} right) {{", definition.index());
+        let DefinitionLayout::Tuple(fields) = &self.program.definitions[definition.index()].layout else { unreachable!() };
+        let fields = fields.clone();
+        self.output.push_str("    return ");
+        for (index, field) in fields.iter().enumerate() {
+            if index != 0 { self.output.push_str("\n        && "); }
+            self.output.push_str(&self.tuple_equal_expression(*field, index));
+        }
+        self.output.push_str(";\n}\n\n");
+    }
+
+    fn tuple_equal_expression(&self, ty: TypeId, field: usize) -> String {
+        let left = format!("left.field_{field}");
+        let right = format!("right.field_{field}");
+        match &self.program.types[ty.index()] {
+            Type::Unit => "true".to_owned(),
+            Type::Primitive(PrimitiveType::Str) => format!("{left} == {right}"),
+            Type::Primitive(_) => format!("{left} == {right}"),
+            Type::Nominal(definition) => format!(
+                "sao2_tuple_equal_def_{}({left}, {right})",
+                definition.index(),
+            ),
+            Type::Union(_) | Type::List(_) | Type::Map { .. } => unreachable!(),
+        }
+    }
+
+    fn render_tuple_hash_helper(&mut self, definition: DefinitionId) {
+        let name = format!("sao2_def_{}", definition.index());
+        let _ = writeln!(self.output, "static inline uint64_t sao2_tuple_hash_def_{}({name} value) {{", definition.index());
+        self.output.push_str("    uint64_t hash = UINT64_C(14695981039346656037);\n");
+        let DefinitionLayout::Tuple(fields) = &self.program.definitions[definition.index()].layout else { unreachable!() };
+        let fields = fields.clone();
+        for (index, field) in fields.iter().enumerate() {
+            let component = self.tuple_hash_component(*field, index);
+            let _ = writeln!(self.output, "    hash = sao2_hash_combine(hash, {component});");
+        }
+        self.output.push_str("    return hash;\n}\n\n");
+    }
+
+    fn tuple_hash_component(&self, ty: TypeId, field: usize) -> String {
+        let value = format!("value.field_{field}");
+        match &self.program.types[ty.index()] {
+            Type::Unit => "UINT64_C(0)".to_owned(),
+            Type::Primitive(PrimitiveType::Int) => format!("sao2_int_to_bits({value})"),
+            Type::Primitive(PrimitiveType::Str) => format!("{value}->hash"),
+            Type::Primitive(PrimitiveType::Bool) => format!("({value} ? UINT64_C(1) : UINT64_C(0))"),
+            Type::Nominal(definition) => format!("sao2_tuple_hash_def_{}({value})", definition.index()),
+            Type::Primitive(PrimitiveType::Float | PrimitiveType::Char) | Type::Union(_)
+            | Type::List(_) | Type::Map { .. } => unreachable!(),
+        }
+    }
+
+    fn is_equatable_tuple_definition(&self, definition: DefinitionId, visiting: &mut Vec<DefinitionId>) -> bool {
+        if visiting.contains(&definition) { return true; }
+        let DefinitionLayout::Tuple(fields) = &self.program.definitions[definition.index()].layout else { return false; };
+        visiting.push(definition);
+        let equatable = fields.iter().all(|field| match &self.program.types[field.index()] {
+            Type::Unit | Type::Primitive(_) => true,
+            Type::Nominal(inner) => self.is_equatable_tuple_definition(*inner, visiting),
+            Type::Union(_) | Type::List(_) | Type::Map { .. } => false,
+        });
+        visiting.pop();
+        equatable
+    }
+
+    fn is_hashable_tuple_definition(&self, definition: DefinitionId, visiting: &mut Vec<DefinitionId>) -> bool {
+        if visiting.contains(&definition) { return true; }
+        let DefinitionLayout::Tuple(fields) = &self.program.definitions[definition.index()].layout else { return false; };
+        visiting.push(definition);
+        let hashable = fields.iter().all(|field| match &self.program.types[field.index()] {
+            Type::Unit | Type::Primitive(PrimitiveType::Int | PrimitiveType::Str | PrimitiveType::Bool) => true,
+            Type::Nominal(inner) => self.is_hashable_tuple_definition(*inner, visiting),
+            Type::Primitive(PrimitiveType::Float | PrimitiveType::Char) | Type::Union(_)
+            | Type::List(_) | Type::Map { .. } => false,
+        });
+        visiting.pop();
+        hashable
+    }
+
     fn aggregate_roots(&self) -> Vec<AggregateId> {
         let mut aggregates = self.program.definitions.iter().enumerate()
             .filter(|(_, definition)| !matches!(&definition.layout, DefinitionLayout::Struct(_)))
@@ -776,7 +924,8 @@ impl<'a> Renderer<'a> {
             }
             OperationKind::Assign { destination, value } => {
                 let value = self.operand(value);
-                let _ = writeln!(self.output, "    sao2_local_{} = {value};", destination.local.index());
+                let destination = self.place(destination);
+                let _ = writeln!(self.output, "    {destination} = {value};");
             }
             OperationKind::Call { destination, function: callee, arguments } => {
                 let arguments = arguments.iter().map(|argument| self.operand(argument)).collect::<Vec<_>>().join(", ");
@@ -815,6 +964,14 @@ impl<'a> Renderer<'a> {
                     destination.index(),
                     failure.index(),
                 );
+            }
+            OperationKind::Aggregate { destination, aggregate: ir::Aggregate::Tuple { definition: _, elements } } => {
+                let c_ty = self.c_type(function.locals[destination.index()].ty);
+                let _ = writeln!(self.output, "    sao2_local_{} = ({c_ty}){{0}};", destination.index());
+                for (index, element) in elements.iter().enumerate() {
+                    let value = self.operand(element);
+                    let _ = writeln!(self.output, "    sao2_local_{}.field_{index} = {value};", destination.index());
+                }
             }
             OperationKind::Check(check) => self.render_check(function, check),
             OperationKind::Aggregate { .. } | OperationKind::Builtin { .. }
@@ -993,6 +1150,15 @@ impl<'a> Renderer<'a> {
                 _ => unreachable!("validated string binary operation"),
             };
         }
+        if let Type::Nominal(definition) = &self.program.types[ty.index()]
+            && matches!(&self.program.definitions[definition.index()].layout, DefinitionLayout::Tuple(_))
+        {
+            return match operator {
+                BinaryOperator::Equal => format!("sao2_tuple_equal_def_{}({left}, {right})", definition.index()),
+                BinaryOperator::NotEqual => format!("!sao2_tuple_equal_def_{}({left}, {right})", definition.index()),
+                _ => unreachable!("capability validation rejected tuple binary operation"),
+            };
+        }
         match operator {
             BinaryOperator::BitwiseOr => format!("sao2_int_from_bits(sao2_int_to_bits({left}) | sao2_int_to_bits({right}))"),
             BinaryOperator::BitwiseXor => format!("sao2_int_from_bits(sao2_int_to_bits({left}) ^ sao2_int_to_bits({right}))"),
@@ -1018,7 +1184,7 @@ impl<'a> Renderer<'a> {
 
     fn operand(&self, operand: &Operand) -> String {
         match operand {
-            Operand::Copy(place) => format!("sao2_local_{}", place.local.index()),
+            Operand::Copy(place) => self.place(place),
             Operand::Constant(constant) => match &constant.value {
                 ConstantValue::Unit => "(sao2_unit){0}".to_owned(),
                 ConstantValue::Integer(value) if *value == i64::MIN =>
@@ -1040,8 +1206,40 @@ impl<'a> Renderer<'a> {
     fn operand_type(&self, function: &Function, operand: &Operand) -> TypeId {
         match operand {
             Operand::Constant(constant) => constant.ty,
-            Operand::Copy(place) => function.locals[place.local.index()].ty,
+            Operand::Copy(place) => self.place_type(function, place),
         }
+    }
+
+    fn place(&self, place: &Place) -> String {
+        let mut rendered = format!("sao2_local_{}", place.local.index());
+        for projection in &place.projections {
+            match projection {
+                Projection::TupleField { field, .. } => {
+                    let _ = write!(rendered, ".field_{}", field.index());
+                }
+                Projection::StructField { .. } | Projection::ListIndex { .. } | Projection::MapIndex { .. } => {
+                    unreachable!("capability validation rejected projection")
+                }
+            }
+        }
+        rendered
+    }
+
+    fn place_type(&self, function: &Function, place: &Place) -> TypeId {
+        let mut ty = function.locals[place.local.index()].ty;
+        for projection in &place.projections {
+            ty = match projection {
+                Projection::TupleField { definition, field } => {
+                    let DefinitionLayout::Tuple(fields) = &self.program.definitions[definition.index()].layout
+                        else { unreachable!("validated tuple projection") };
+                    fields[field.index()]
+                }
+                Projection::StructField { .. } | Projection::ListIndex { .. } | Projection::MapIndex { .. } => {
+                    unreachable!("capability validation rejected projection")
+                }
+            };
+        }
+        ty
     }
 
     fn is_entry_args(&self, function: FunctionId, ty: TypeId) -> bool {
@@ -1573,9 +1771,27 @@ fn visit_terminator_places(terminator: &TerminatorKind, visitor: &mut impl FnMut
     }
 }
 
-fn operation_has_projection(operation: &OperationKind) -> bool {
+fn place_has_unsupported_read_projection(place: &Place) -> bool {
+    place.projections.iter().any(|projection| !matches!(projection, Projection::TupleField { .. }))
+}
+
+fn operation_operands_have_unsupported_projection(operation: &OperationKind) -> bool {
     let mut found = false;
-    visit_operation_places(operation, &mut |place| found |= !place.projections.is_empty());
+    visit_operation_operands(operation, &mut |operand| {
+        if let Operand::Copy(place) = operand {
+            found |= place_has_unsupported_read_projection(place);
+        }
+    });
+    found
+}
+
+fn terminator_operands_have_unsupported_projection(terminator: &TerminatorKind) -> bool {
+    let mut found = false;
+    visit_terminator_operands(terminator, &mut |operand| {
+        if let Operand::Copy(place) = operand {
+            found |= place_has_unsupported_read_projection(place);
+        }
+    });
     found
 }
 
@@ -1617,6 +1833,90 @@ mod tests {
         assert_eq!(string_hash(b"a"), 12638187200555641996);
         assert_eq!(string_hash(&[b'a', 0, b'z']), 16560493500796669818);
         assert_eq!(string_hash(&[0, 127]), 590614798587856096);
+    }
+
+    #[test]
+    fn renders_tuple_value_helpers_only_for_eligible_definitions() {
+        let (mut program, types, location) = program();
+        let mut inner = NominalDefinition::tuple("Inner");
+        inner.add_tuple_field(types.int);
+        inner.add_tuple_field(types.string);
+        inner.add_tuple_field(types.boolean);
+        let inner_definition = program.add_definition(inner);
+        let inner_type = program.intern_type(Type::Nominal(inner_definition));
+
+        let mut outer = NominalDefinition::tuple("Outer");
+        outer.add_tuple_field(inner_type);
+        outer.add_tuple_field(types.int);
+        let outer_definition = program.add_definition(outer);
+        let outer_type = program.intern_type(Type::Nominal(outer_definition));
+
+        let mut float_tuple = NominalDefinition::tuple("FloatTuple");
+        float_tuple.add_tuple_field(types.float);
+        let float_definition = program.add_definition(float_tuple);
+        program.intern_type(Type::Nominal(float_definition));
+
+        let union = program.intern_type(Type::Union(vec![
+            UnionAlternative::untagged(types.int),
+            UnionAlternative::untagged(types.boolean),
+        ]));
+        let mut union_tuple = NominalDefinition::tuple("UnionTuple");
+        union_tuple.add_tuple_field(union);
+        let union_definition = program.add_definition(union_tuple);
+        program.intern_type(Type::Nominal(union_definition));
+
+        let mut main = Function::new("main", types.int);
+        let inner_value = main.add_local(inner_type, None, LocalOrigin::Temporary);
+        let outer_value = main.add_local(outer_type, None, LocalOrigin::Temporary);
+        let equal = main.add_local(types.boolean, None, LocalOrigin::Temporary);
+        let block = main.add_block();
+        main.entry = Some(block);
+        main.blocks[block.index()].push(OperationKind::Aggregate {
+            destination: inner_value,
+            aggregate: Aggregate::Tuple {
+                definition: inner_definition,
+                elements: vec![
+                    constant(types.int, ConstantValue::Integer(-7)),
+                    constant(types.string, ConstantValue::String(b"a\0z".to_vec())),
+                    constant(types.boolean, ConstantValue::Boolean(true)),
+                ],
+            },
+        }, location);
+        main.blocks[block.index()].push(OperationKind::Aggregate {
+            destination: outer_value,
+            aggregate: Aggregate::Tuple {
+                definition: outer_definition,
+                elements: vec![
+                    Operand::Copy(Place::local(inner_value)),
+                    constant(types.int, ConstantValue::Integer(9)),
+                ],
+            },
+        }, location);
+        main.blocks[block.index()].push(OperationKind::Binary {
+            destination: equal,
+            operator: BinaryOperator::Equal,
+            left: Operand::Copy(Place::local(outer_value)),
+            right: Operand::Copy(Place::local(outer_value)),
+        }, location);
+        main.blocks[block.index()].terminate(
+            TerminatorKind::Return(constant(types.int, ConstantValue::Integer(0))), location,
+        );
+        let main = program.add_function(main);
+        program.entry = Some(main);
+
+        let emitted = emit(&program).unwrap();
+        assert!(emitted.contains("static inline bool sao2_tuple_equal_def_0(sao2_def_0 left, sao2_def_0 right)"));
+        assert!(emitted.contains("sao2_tuple_equal_def_0(left.field_0, right.field_0)"));
+        assert!(emitted.contains("static inline bool sao2_tuple_equal_def_1(sao2_def_1 left, sao2_def_1 right)"));
+        assert!(!emitted.contains("sao2_tuple_equal_def_3"));
+        assert!(emitted.contains("static inline uint64_t sao2_hash_combine(uint64_t state, uint64_t value)"));
+        assert!(emitted.contains("static inline uint64_t sao2_tuple_hash_def_0(sao2_def_0 value)"));
+        assert!(emitted.contains("value.field_1->hash"));
+        assert!(emitted.contains("sao2_tuple_hash_def_0(value.field_0)"));
+        assert!(emitted.contains("sao2_local_0 = (sao2_def_0){0};\n    sao2_local_0.field_0 = (-INT64_C(7));"));
+        assert!(emitted.contains("sao2_local_2 = sao2_tuple_equal_def_1(sao2_local_1, sao2_local_1);"));
+        assert!(!emitted.contains("sao2_tuple_hash_def_2"));
+        assert!(!emitted.contains("sao2_tuple_hash_def_3"));
     }
 
     fn constant(ty: TypeId, value: ConstantValue) -> Operand {
@@ -1824,7 +2124,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_structs_containers_tuple_operations_and_entry_args_use() {
+    fn rejects_structs_containers_and_entry_args_use_while_rendering_tuple_aggregates() {
         let (mut structure, types, location) = program();
         let mut definition = NominalDefinition::structure("keyword while");
         definition.add_struct_field("field", types.int, ir::MemberStorage::Inline);
@@ -1870,7 +2170,8 @@ mod tests {
         );
         let main_id = tuple_program.add_function(main);
         tuple_program.entry = Some(main_id);
-        assert_unsupported(emit(&tuple_program), "aggregate construction", Some(OperationSite::Operation(0)));
+        let emitted = emit(&tuple_program).unwrap();
+        assert!(emitted.contains("sao2_local_0 = (sao2_def_0){0};\n    sao2_local_0.field_0 = INT64_C(1);"));
 
         let (mut args_program, types, location) = program();
         let args_ty = args_program.intern_type(Type::List(types.string));
@@ -1895,7 +2196,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_projection_unsupported_printing_builtins_and_terminators() {
+    fn renders_tuple_projection_and_rejects_later_projection_printing_builtins_and_terminators() {
         let (mut projection_program, types, location) = program();
         let mut tuple = NominalDefinition::tuple("Tuple");
         let field = tuple.add_tuple_field(types.int);
@@ -1917,7 +2218,32 @@ mod tests {
         );
         let main_id = projection_program.add_function(main);
         projection_program.entry = Some(main_id);
-        assert_unsupported(emit(&projection_program), "place projection", Some(OperationSite::Operation(0)));
+        let emitted = emit(&projection_program).unwrap();
+        assert!(emitted.contains("sao2_local_1 = sao2_local_0.field_0;"));
+
+        let (mut assignment_program, types, location) = program();
+        let mut tuple = NominalDefinition::tuple("Tuple");
+        let field = tuple.add_tuple_field(types.int);
+        let definition = assignment_program.add_definition(tuple);
+        let tuple_ty = assignment_program.intern_type(Type::Nominal(definition));
+        let mut main = Function::new("main", types.int);
+        let tuple_local = main.add_local(tuple_ty, None, LocalOrigin::Temporary);
+        let block = main.add_block();
+        main.entry = Some(block);
+        main.blocks[block.index()].push(OperationKind::Assign {
+            destination: Place::projected(tuple_local, vec![Projection::TupleField { definition, field }]),
+            value: constant(types.int, ConstantValue::Integer(1)),
+        }, location);
+        main.blocks[block.index()].terminate(
+            TerminatorKind::Return(constant(types.int, ConstantValue::Integer(0))), location,
+        );
+        let main = assignment_program.add_function(main);
+        assignment_program.entry = Some(main);
+        assert_unsupported(
+            emit(&assignment_program),
+            "place projection",
+            Some(OperationSite::Operation(0)),
+        );
 
         let (mut index_program, types, location) = program();
         let failure = index_program.intern_failure_site(FailureSite {
@@ -2527,7 +2853,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_executable_union_with_a_reachable_tuple_payload() {
+    fn renders_executable_union_with_a_reachable_tuple_payload() {
         let (mut program, types, location) = program();
         let mut tuple = NominalDefinition::tuple("Tuple");
         tuple.add_tuple_field(types.int);
@@ -2553,11 +2879,9 @@ mod tests {
         let main = program.add_function(main);
         program.entry = Some(main);
 
-        assert_unsupported(
-            emit(&program),
-            "union operation with a non-scalar reachable payload",
-            Some(OperationSite::Operation(0)),
-        );
+        let emitted = emit(&program).unwrap();
+        assert!(emitted.contains("sao2_def_0 alternative_0; /* tag 1 */"));
+        assert!(emitted.contains("sao2_local_1 = (sao2_local_0).tag == UINT32_C(2);"));
     }
 
     #[test]

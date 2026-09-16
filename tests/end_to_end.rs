@@ -278,6 +278,33 @@ fn compares_and_indexes_strings() {
 }
 
 #[test]
+fn constructs_compares_projects_and_narrows_tuples() {
+    let directory = TestDirectory::new("tuple values");
+    let source = br#"
+        type Pair(int, int);
+        type Nested(Pair, bool);
+        type Choice(Pair | int);
+        fn identity(value Pair) Pair { value }
+        fn main() {
+            pair := Pair(20, 22);
+            nested := Nested(pair, true);
+            println(nested.0.0);
+            println(pair == identity(pair));
+            choice := Choice(pair);
+            if choice is Pair: println(choice.1);
+        }
+    "#;
+    let output = run_source(&directory, source);
+    assert!(
+        !compiler_is_missing(&output),
+        "native end-to-end tests require a supported C compiler: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"20\ntrue\n22\n");
+}
+
+#[test]
 fn reports_string_index_failures() {
     let directory = TestDirectory::new("string index failure");
     let output = run_source(&directory, b"fn main() { \"x\"[1]; }");

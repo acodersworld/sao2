@@ -325,7 +325,7 @@ IR.
 
 ## Stage 2: Tuple value behavior
 
-Status: current.
+Status: complete.
 
 Enable the tuple operations already present in validated IR: construction,
 field reads, ordinary value copies, equality, and inequality. Add deterministic
@@ -590,7 +590,7 @@ representation change was required.
 
 ## Stage 3: Complete formatting and handoff
 
-Status: planned.
+Status: current.
 
 Replace the temporary output cases with a type-directed formatting layer shared
 by ordinary output and panic paths. Implement the `DESIGN.md` behavior for:
