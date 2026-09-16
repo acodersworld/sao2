@@ -671,59 +671,198 @@ or tuple value behavior.
 
 ## Stage 5: Pipeline replacement and handoff
 
-Replace the production temporary backend call with the IR emitter. Pass only
-the owned validated `ir::Program`; do not pass the AST, analysis, semantic
-tables, or frontend entry signature. The IR entry-function identity becomes
-authoritative for adapter selection.
+Activate the IR backend as the sole production C-generation path. This stage
+does not add another value representation or language feature; it replaces the
+last resolved-AST dependency in the source-to-executable path and proves that
+the Stage-1 through Stage-4 backend is a complete milestone-7 handoff.
 
-Remove the temporary resolved-AST capability checker and renderer. Remove or
-rewrite compiler tests whose assertions intentionally describe its generated C
-or unsupported-subset messages. Do not retain duplicate lowering or semantic
-logic in the new backend.
+### Production pipeline cutover
 
-Preserve semantic warnings on backend and filesystem failures. An emitter
-failure must occur before build-directory creation or output writes, leaving an
-existing `program.c` unchanged. Keep `build`, `run`, `--show-c`, host compiler
-invocation, generated filenames, and `CompileOutput` unchanged.
+Keep the existing frontend and lowering order:
 
-Update module documentation to state that milestone 7 consumes typed IR and
-that milestone 8 supplies the next runtime-value layer.
+1. parse the source;
+2. perform name and type analysis;
+3. perform semantic analysis and validate its handoff;
+4. lower to the owned `ir::Program`;
+5. validate the completed IR; and
+6. emit C from that IR.
+
+At step 6, call the private IR emitter with only `&ir::Program`. Do not pass the
+source file, syntax tree, analysis state, semantic result, or a separately
+recovered frontend entry signature. Do not query any of those structures to
+guide C generation after lowering has completed. `Program::entry`, the entry
+function's IR signature, the IR failure-site table, and the IR source metadata
+are the authoritative backend inputs for adapter selection and runtime
+diagnostics.
+
+Keep the explicit post-lowering `Program::validate` boundary in the compiler
+pipeline even though the backend defensively validates its own input. The
+pipeline check continues to identify a broken lowering handoff before backend
+capability planning; the backend check protects direct callers and tests. Do
+not add a second lowering pass, reconstruct IR facts from the frontend, or
+special-case production source programs around backend capability validation.
+
+Convert every `CEmissionError` into a compiler diagnostic at the orchestration
+boundary while retaining its complete rendered context. Invalid IR and backend
+invariants are compiler failures. A valid but post-milestone feature remains a
+milestone-7 backend capability failure, not a new parser, name-resolution,
+typing, or semantic source error. Preserve the existing failure-category and
+exit-status behavior seen by `build` and `run`.
+
+### Output transaction and warning preservation
+
+Complete IR emission into an owned C string before creating the build
+directory, opening `program.c`, or changing any filesystem state. If parsing,
+analysis, semantic validation, lowering, IR validation, capability validation,
+layout planning, or rendering fails:
+
+- return the failure with all semantic warnings accumulated before it;
+- do not invoke the host C compiler or the generated program;
+- do not create a previously absent build directory; and
+- leave an existing `build/program.c` byte-for-byte unchanged.
+
+Only after emission succeeds may the existing filesystem path create the build
+directory and write `program.c`. Filesystem failures likewise retain semantic
+warnings and their established compiler-diagnostic wording. Keep the generated
+filename, build-directory rules, and `CompileOutput { generated_c, warnings }`
+contract unchanged; do not return generated text through a second public path.
+
+Warnings remain nonfatal and preserve their current ordering. On an emission
+failure, the CLI prints warnings before the compiler diagnostic. On successful
+emission, the same warnings travel in `CompileOutput` and are printed before
+host compilation. Backend activation must neither duplicate warnings nor turn
+them into errors.
+
+The `--show-c` path reads the newly written IR-generated `program.c` through
+the existing `CompileOutput` path and prints it unchanged before host
+compilation. `build` still compiles that file and reports the executable;
+`run` still compiles the same file and returns the generated program's status.
+Do not change host-compiler discovery, `SAO2_CC`, child-process argument
+construction, toolchain diagnostics, executable naming, stdout behavior, or
+program-failure reporting.
+
+### Retire the temporary backend
+
+Remove the production import and invocation of the resolved-AST emitter, then
+remove its module registration and implementation once no test or helper uses
+it. The repository must contain one C backend, not a dormant alternative whose
+capability rules can diverge. Remove the old resolved-AST capability checker,
+C renderer, temporary `main` construction, and test-only rendering helpers
+with it.
+
+Rewrite compiler tests that intentionally assert the temporary emitter's C
+spelling or messages. Delete tests whose only purpose was to prove that typed
+lowering still reproduced the old emitter byte for byte. Replace them with
+tests of the production IR boundary and observable behavior. Do not copy old
+AST traversal, source-name handling, entry-signature inspection, expression
+ordering, arithmetic, or diagnostic logic into `compiler`; all such behavior
+must remain owned by the frontend, lowering, or IR backend layer which already
+defines it.
+
+Update crate and compiler module documentation to describe the active pipeline
+as source analysis followed by typed-IR lowering and IR-only C generation.
+Remove obsolete dead-code allowances which existed only because the IR backend
+was disconnected, while retaining any allowance still justified independently.
+Document milestone 8, rather than the deleted emitter, as the owner of
+permanent strings, tuple value behavior, and complete printing.
+
+### Compiler-boundary tests
+
+Keep direct IR backend tests as the exhaustive specification of C spelling,
+capability classification, physical layouts, helper ordering, and invariants.
+At the compiler layer, construct source programs and assert that the completed
+frontend/lowering output reaches that same backend. Add or rewrite coverage
+for:
+
+- production output containing the canonical IR-backend sections, generated
+  SAO2 function, and exactly one host entry adapter;
+- byte-for-byte identical `program.c` from repeated compilation of identical
+  source, including a second compilation over an existing output file;
+- scalar helper calls, direct and recursive SAO2 calls, forward and backward
+  CFG edges, branches, loops, and lowered short-circuit control flow;
+- checked integer and floating-point operations retaining their failure-site
+  metadata and source attribution;
+- named and anonymous supported unions, union switches, nested payloads,
+  postfix `?`, success reinjection, and Error propagation;
+- each of the four validated entry signatures selecting its corresponding
+  adapter solely from `Program::entry` and the IR function signature;
+- a backend capability failure after successful lowering, with full IR
+  context, retained warnings, no new build directory, and an unchanged
+  existing `program.c`;
+- injected invalid post-lowering IR failing at the validation boundary before
+  backend emission, again preserving warnings and output; and
+- successful emission followed by a filesystem failure retaining warnings and
+  the established filesystem diagnostic.
+
+Use backend-supported programs for successful compiler tests. Programs using
+containers, tuple value operations, permanent string behavior, union printing,
+or another milestone-8-or-later feature should test the precise capability
+boundary, not expect the temporary emitter's former unsupported-subset text.
+Frontend errors must still precede lowering and backend checks, and must remain
+source diagnostics with their original spans.
 
 ### Integration tests and completion
 
-Add compiler and end-to-end coverage for:
+Exercise the public CLI from source file through the host executable. Add or
+rewrite end-to-end coverage for:
 
 - deterministic generated C from repeated compilation;
-- scalar functions, recursion, branches, loops, and short-circuit CFG;
-- checked integer and floating-point success and failure paths;
-- supported unions and Error propagation;
-- all four `main` adapters;
-- runtime panic source attribution;
-- backend limitations preserving warnings and generated output;
-- `--show-c`, toolchain failures, and program exit statuses; and
-- the existing exact-byte output and reproducible primitive fuzz programs.
+- scalar calls and recursion, branches, loops, and short-circuit expressions;
+- checked integer and floating-point success paths and every locked failure
+  class exercised by a source program;
+- supported union construction, narrowing, switching, and Error propagation;
+- all four `main` adapters, including ASCII argument acceptance, pre-entry
+  non-ASCII rejection where the host permits constructing such an argument,
+  unit success, representable integer statuses, and out-of-range rejection;
+- explicit panic, supported Error panic, arithmetic failure, and
+  compiler-unreachable diagnostics with exact source filename, function, line,
+  and column where applicable;
+- exact stdout bytes for strings with escapes and embedded zero bytes,
+  integers, booleans, and newlines;
+- `--show-c` displaying the IR-generated translation unit without changing the
+  subsequent build or run result;
+- missing and failing configured C compilers remaining toolchain failures, and
+  generated-program nonzero statuses remaining program results; and
+- the existing reproducible safe-primitive fuzz programs under the checked
+  backend.
 
 Replace obsolete byte-for-byte expectations tied to the temporary emitter with
-new canonical IR-backend expectations. Preserve observable behavior rather than
-the old implementation's C spelling.
+new canonical IR-backend expectations only where exact C is material to the
+compiler boundary. Prefer executable results and exact diagnostics for CLI
+tests; the backend's own unit tests remain responsible for comprehensive C
+snapshots. A native test may skip only under the repository's ordinary
+no-compiler policy. The required milestone verification below fixes `SAO2_CC`,
+so its native assertions must execute rather than skip.
 
 Contributor guidance prohibits compiling, running tests, or formatting during
-implementation. External verification must run:
+implementation. Review the final diff with read-only checks, but leave all
+compilation, execution, and formatting to external verification. That
+verification must run from a clean intended worktree:
 
 ```text
 rustc --version
 SAO2_CC=cc cargo test
 ```
 
-Replace `cc` only when another supported compiler is required. Native
-end-to-end assertions must run rather than skip. After that evidence succeeds,
-mark milestone 7 complete in `ROADMAP.md`; milestone 8 then becomes current.
+Replace `cc` only when another supported compiler is explicitly selected and
+available. Confirm Rust is at least 1.90, all unit and integration tests pass,
+and native end-to-end assertions actually ran. Also inspect the test output for
+unexpected skips and confirm no generated `build/` artifact is committed.
+
+Only after that evidence succeeds, update `ROADMAP.md` in a final handoff
+commit: mark milestone 7 complete and milestone 8 current. Update this
+document's status consistently or archive/replace it according to the
+repository's established current-work practice. Do not declare the milestone
+complete merely because the production call was switched.
 
 Exit criterion: production C generation consumes only closed validated IR;
 supported scalar and union programs compile and execute with portable checked
-semantics; the source-to-executable walking skeleton remains operational; and
-later runtime milestones can add value representations without revisiting the
-frontend or lowering.
+semantics; runtime and adapter failures retain their locked diagnostics;
+warnings and filesystem transaction boundaries are preserved; no temporary
+resolved-AST C backend or assertions remain; `build`, `run`, and `--show-c`
+operate through the IR-generated file; the required native verification has
+passed without skips; and later runtime milestones can add value
+representations without revisiting the frontend or lowering.
 
 ## Boundaries
 
