@@ -866,7 +866,7 @@ lifetime or is reclaimed.
 
 ## Stage 4: Member access and identity-preserving copy
 
-Status: current.
+Status: complete.
 
 Enable the `Projection::StructField` paths already produced by lowering and
 validated by typed IR. Stage 4 resolves packed references only while executing
@@ -1208,27 +1208,361 @@ escape, scoped-lifetime, and collector behavior remain unchanged.
 
 ## Stage 5: Context-insensitive escape summaries
 
-Status: planned.
+Status: current.
 
-Add a compiler analysis pass independent of physical C layout. For each
-function, record its direct callees, direct callers, and unresolved-callee
-count. Analyze leaf functions first, then update callers and enqueue them when
-their unresolved count reaches zero. Process each direct call edge once.
+Add a compiler-owned escape-analysis pass over validated typed IR. The pass
+computes context-insensitive parameter summaries and a deterministic lifetime
+classification for every struct aggregate operation. Stage 5 does not change
+generated allocation calls: the backend continues to allocate every source
+object through the monotonic heap until Stage 6 consumes the plan.
 
-Each summary records which parameters may escape, including escape through an
-inline member. Track provenance through copies, projections, tuple and union
-construction, assignments, branches, calls, and returns. If an interior
-reference escapes, the complete owner allocation escapes.
+Keep this pass independent of physical C layout. It may inspect language types,
+nominal definitions, `MemberStorage`, places, projections, operations, and the
+control-flow graph, but it must not inspect body sizes, byte offsets, C types,
+arena tags, descriptors, or rendered names. A packed root reference and any
+interior reference derived from it share one abstract owner provenance.
 
-A caller uses the callee's summary without specializing it for a call site.
-Any function left unresolved after the queue drains is recursive or depends on
-recursion and is conservatively treated as escaping. Unknown or otherwise
-unprovable flows receive the same treatment.
+### Analysis boundary and result
 
-Produce an allocation plan that classifies an allocation as scoped only when
-all paths prove that neither the root nor any inline reference outlives the
-allocating invocation. Keep analysis facts compiler-side; do not encode native
-addresses or backend layout details in language IR.
+Implement the pass in a dedicated module such as `src/escape.rs`, after typed
+IR validation and before C capability validation and layout planning. Its
+public crate-level entry point accepts `&ir::Program` and returns either an
+`AllocationPlan` or a compiler-invariant error with function, block, and
+operation context where available.
+
+Identify an allocation site by its stable IR coordinates:
+
+```text
+AllocationId = (FunctionId, BlockId, operation index)
+```
+
+Only `OperationKind::Aggregate` containing `Aggregate::Struct` is an
+allocation. Do not use source locations as identities because distinct lowered
+operations may share a span. Enumerate functions, blocks, and operations in ID
+order so repeated analysis produces byte-for-byte equal results.
+
+The plan records:
+
+- one `FunctionSummary` per `FunctionId`, containing one escape bit per
+  parameter in signature order and whether the summary was proven or assigned
+  conservatively;
+- one `AllocationClass` (`Scoped` or `Heap`) for every `AllocationId`; and
+- enough per-function indexing to answer whether a function contains any
+  scoped allocation without rescanning or changing IR.
+
+An allocation may be classified `Scoped` only when its function was analysed
+successfully and no escape constraint reaches its owner origin. Allocations in
+unreachable blocks, unresolved functions, recursive dependency regions, or
+otherwise conservative functions are `Heap`. The plan must cover every struct
+aggregate, including unreachable ones, so Stage 6 never needs a default.
+
+Do not attach summaries or allocation classes to `ir::Program`. Do not add an
+allocation-lifetime enum to `Aggregate::Struct`. Keep the analysis result as a
+separate immutable compiler artifact passed beside the validated IR.
+
+### Reference-bearing types
+
+Centralize a recursive predicate for whether a value representation can carry
+a struct reference:
+
+- a nominal struct is reference-bearing;
+- a tuple is reference-bearing when any member is;
+- a named or anonymous union is reference-bearing when any payload is;
+- unit and primitive values are not;
+- a list whose element cannot carry a struct reference and a map whose key and
+  value cannot carry one contribute no Stage 5 owner provenance; and
+- a list or map whose contents can carry a struct reference is conservatively
+  unsupported by the Stage 5 retention model because its executable storage
+  belongs to milestone 11.
+
+Use a visiting set for nominal and anonymous aggregate recursion and preserve
+the validated type identities. Encountering a reference-bearing list or map, a
+malformed recursive value layout, or another representation the pass cannot
+model makes the affected function conservative; it must never turn uncertainty
+into a scoped classification.
+
+String pointers are not struct-owner origins. They retain their existing
+interned lifetime and do not participate in this analysis.
+
+### Abstract owner provenance
+
+Within an analysed function, assign an origin to:
+
+- every reference-bearing parameter, identified by parameter position; and
+- every reachable struct allocation, identified by `AllocationId`.
+
+Also use an `ExternalHeap` fact for a reference-bearing value returned by an
+already analysed callee when its exact callee-local allocation identity is not
+available to the caller. `ExternalHeap` is already safe to retain and is never
+classified by the caller.
+
+A local's provenance is a deterministic set of possible origins. A tuple or
+union value carries the union of the provenances of its reference-bearing
+contents. A struct reference carries the provenance of its complete owner,
+not a distinct origin for its current `member_ptr`.
+
+Use may-analysis throughout: joins union facts, assignments add possible
+origins rather than relying on a path-specific kill, and loops iterate to a
+fixed point. This is intentionally conservative. The result must not depend on
+block visitation order.
+
+For place reads, use these transfer rules:
+
+- an unprojected local has the local's current may-provenance;
+- tuple projection preserves the subset conservatively carried by its base;
+- inline struct projection preserves the exact owner provenance of its base;
+- referenced struct projection conservatively uses the base owner's
+  provenance as a proxy for objects reachable through that field; and
+- a chain of projections applies those rules in order.
+
+The referenced-field proxy may classify the containing owner as escaping even
+when only a referenced child escapes. This false positive is accepted. Stores
+into that owner create the dependency which also forces any compiler-visible
+child allocation to a safe lifetime. If the owner came from a parameter, the
+caller's corresponding storage constraints provide that transitive safety.
+
+`ExternalHeap` remains external through copies, projections, tuples, and
+unions. If provenance cannot be expressed as parameter, allocation, or known
+external heap, abandon the optimistic analysis of that function and use its
+conservative result.
+
+### Local value-flow constraints
+
+Compute structurally reachable blocks from the function entry by following
+`Jump`, both `Branch` successors, and every `Switch` target. Do not use constant
+folding to remove an edge. Operations in unreachable blocks receive heap plans
+but do not add call-graph or provenance constraints.
+
+For reachable operations, propagate local provenance as follows:
+
+- `Copy` and an unprojected `Assign` add the operand provenance to the
+  destination local;
+- tuple construction unions all element provenances into its destination;
+- union injection adds payload provenance, and union payload extraction copies
+  the union provenance to its destination;
+- struct construction gives its destination only the new allocation origin;
+  its field operands instead become containment dependencies of that origin;
+- ordinary scalar operations, conversions, tests, checks, and string indexing
+  produce no owner provenance; and
+- a direct call result of reference-bearing type is `ExternalHeap` after the
+  callee's parameter effects have been applied.
+
+A call result needs no return-alias component in the summary. If a result can
+derive from a callee parameter, returning or otherwise exposing it makes that
+parameter's escape bit true, so the caller classifies its argument safely at
+the call. If the result derives from a callee-local allocation, that allocation
+is classified heap in the callee because it is returned. The caller may
+therefore treat the result as already external heap.
+
+Build monotone subset constraints between locals and solve them with a
+deterministic work queue. Flow-insensitive reuse of a mutable local may add a
+false origin from another path or iteration; it must never remove an origin.
+This avoids path explosion while handling branches, joins, and loops safely.
+
+### Containment and lifetime constraints
+
+After local provenance reaches a fixed point, derive owner-containment edges.
+An edge from owner `A` to origin `B` means that if `A` requires heap lifetime,
+then `B` also requires heap lifetime because a value derived from `B` may be
+retained in `A`.
+
+Add such edges for:
+
+- every reference-bearing field operand of a struct construction, from the new
+  allocation to each operand origin; and
+- every projected assignment into a struct body, from each possible
+  destination-owner allocation to each possible source origin.
+
+For an inline struct field, the language copies fields rather than retaining
+the source owner itself. Stage 5 may nevertheless add the source owner as a
+dependency; that is a documented conservative approximation which avoids a
+second field-content points-to analysis. Referenced fields and ref-bearing
+tuple or union fields require the dependency directly.
+
+If a projected assignment may target a parameter-owned object or an
+`ExternalHeap` object, mark every non-external source origin as escaping
+immediately: the destination can outlive the current invocation. This is also
+how a function summary records that a parameter stored into another parameter
+may escape. A context-insensitive summary intentionally does not specialize
+this decision when a particular caller's destination happens to be local.
+
+Unprojected local assignment is rebinding, not containment, and adds only the
+local value-flow constraint. Reads and identity comparisons add no lifetime
+edge. Mutation of primitive-only fields adds no owner dependency.
+
+Containment cycles are valid. Escape propagation uses a work queue and visits
+each origin edge at most once after deduplication.
+
+### Escape sinks
+
+Seed escape propagation from every reachable operation or terminator which can
+make a value outlive the current invocation:
+
+- returning a reference-bearing operand, including a tuple, union, root
+  reference, or inline interior reference;
+- passing an argument to a callee parameter whose proven summary bit is set;
+- storing a reference-bearing value into a parameter-owned or external object;
+  and
+- any operation whose retention behavior is unknown to this stage.
+
+When a seed contains an allocation origin, classify that allocation heap. When
+it contains a parameter origin, set that parameter's summary bit. Then follow
+containment edges until no new origin escapes. Because inline projections keep
+their owner's provenance, returning or passing an interior reference marks the
+complete enclosing allocation, not merely the embedded layout.
+
+Known `print`, `println`, scalar checks, comparisons, and non-retaining value
+operations are not escape sinks. Panics terminate the process and do not make
+their operands escape. Until containers are executable, a list/map aggregate,
+indexing path, mutation, iteration, or built-in which can transport struct
+provenance makes the containing function conservative rather than relying on
+incomplete retention rules. Primitive-only containers and the special `[str]`
+entry argument carry no struct owner and do not by themselves poison an
+otherwise analysable function.
+
+When intraprocedural analysis encounters such an unknown, stop optimistic
+classification for that function: mark every reference-bearing parameter as
+escaping, classify every allocation in the function heap, and record a
+conservative summary. The function is still resolved for call-graph scheduling,
+so its callers may proceed using that conservative summary. Do not leave an
+acyclic caller unresolved merely because a callee required this local fallback.
+
+### Direct-call dependency queue
+
+Build the call graph from reachable `OperationKind::Call` operations only.
+For every function, record sorted, deduplicated direct callees and direct
+callers plus an unresolved count equal to its number of distinct direct
+callees. Multiple call sites to one callee are one scheduling edge, although
+the intraprocedural analysis still applies the callee summary at every call
+site.
+
+Initialize a FIFO queue with all functions whose unresolved count is zero, in
+ascending `FunctionId` order. For each dequeued function:
+
+1. analyse it using summaries of its already resolved direct callees;
+2. store its parameter summary and allocation classifications;
+3. visit its direct callers in ascending `FunctionId` order; and
+4. decrement each caller's unresolved count once for this callee, enqueueing the
+   caller when the count reaches zero.
+
+Each unique call-graph edge is processed once. Do not recursively traverse call
+paths and do not reanalyse a resolved function for different callers or call
+sites.
+
+After the queue drains, every unresolved function is recursive or depends
+directly or transitively on recursion. Give each reference-bearing parameter in
+such a function an escaping summary, classify all of its allocations heap, and
+mark the summary conservative. This applies to self recursion, mutually
+recursive components, and acyclic callers which depend on them, matching the
+roadmap's conservative recursive boundary.
+
+An invalid callee identity is already rejected by IR validation. If a future
+IR gains indirect or foreign calls, those calls must use a documented
+conservative summary until a stronger contract exists.
+
+### Pipeline and backend handoff
+
+Run escape analysis after the existing post-lowering `ir_program.validate()`
+boundary. Convert an analysis invariant into a compiler diagnostic while
+preserving semantic warnings and before creating `build/` or writing generated
+C.
+
+Pass `&AllocationPlan` beside `&ir::Program` into the C backend. At the backend
+boundary, validate that:
+
+- summaries and function plans cover every function exactly once;
+- parameter-bit counts match function signatures;
+- every struct aggregate has exactly one matching allocation entry;
+- no entry names a non-struct operation or invalid IR coordinate; and
+- the plan contains no duplicates or omissions.
+
+Stage 5 deliberately ignores `Scoped` when choosing the generated allocator:
+both plan classes continue to render the Stage 3 heap call. This locks the
+analysis handoff without changing observable execution. Stage 6 becomes the
+only place which maps `Scoped` to the scoped allocator and adds function marks.
+
+Backend layout planning must not feed facts back into escape analysis. The
+allocation plan may be queried by IR coordinates, never by C symbol, layout
+identity, body offset, or source span.
+
+### Implementation sequence
+
+Implement Stage 5 in the following order:
+
+1. Add allocation identities, summaries, plan validation, deterministic result
+   rendering for tests, and the reference-bearing type predicate.
+2. Compute reachable blocks and the sorted direct-callee/direct-caller graph.
+   Lock duplicate-call, diamond, self-recursive, and mutually recursive cases.
+3. Add parameter/allocation origins and solve monotone local provenance through
+   copies, assignments, projections, tuple and union flow, branches, and loops.
+4. Add construction and projected-store containment edges, escape sinks, and
+   transitive propagation to allocation classes and parameter bits.
+5. Apply resolved callee summaries at every call site and conservatively finish
+   all functions left after the dependency queue drains.
+6. Integrate the plan into compiler orchestration and the backend boundary while
+   retaining heap allocation for both classes.
+7. Add regression coverage for diagnostics, warnings, deterministic output, and
+   the unchanged generated-C/runtime behavior, then remove duplicate ad hoc
+   escape reasoning.
+
+### Tests and completion
+
+Direct analysis tests should verify:
+
+- allocation IDs remain distinct when sites share a source location and are
+  stable in function, block, and operation order;
+- primitive-only parameters and locals create no origins, while structs and
+  nested tuple/union carriers do;
+- copies, local rebinding, tuple construction/projection, union
+  injection/extraction, inline projections, and branch or loop joins propagate
+  all possible owner origins;
+- returning a root or any depth of inline interior reference marks its complete
+  owner heap and sets the originating parameter bit when applicable;
+- referenced-field proxies plus construction and mutation dependencies retain
+  compiler-visible child allocations whenever their containing owner escapes;
+- storing a local allocation or parameter-derived reference into a parameter or
+  external object forces the source heap/escape summary;
+- an allocation stored only in another non-escaping local allocation remains
+  scoped, including containment cycles confined to one invocation;
+- a non-escaping callee parameter permits a caller allocation to remain scoped,
+  while an escaping parameter forces it heap at every call site without
+  specialization;
+- callee-returned local allocations are heap in the callee and appear as
+  `ExternalHeap` in the caller without requiring a result-alias summary;
+- distinct call sites create one dependency edge but each applies argument
+  effects; leaf chains and diamonds resolve in deterministic order;
+- self recursion, mutual recursion, and callers depending on recursion receive
+  conservative summaries and heap-only allocation plans, while unrelated
+  acyclic functions remain analysable;
+- unreachable calls do not create scheduling dependencies and unreachable
+  allocations receive explicit heap entries;
+- unknown reference-bearing container or retention behavior makes the affected
+  function conservative rather than scoped, while `[str]` and primitive-only
+  containers introduce no owner provenance;
+- plan validation rejects missing, duplicate, mistyped, or out-of-range entries
+  before rendering; and
+- repeated analysis produces identical summaries, allocation classes, and
+  diagnostic context without unordered-collection dependence.
+
+Compiler and backend regression tests should verify that analysis failure
+preserves warnings and transactional output behavior, a valid plan reaches the
+backend intact, and generated C remains unchanged apart from any nonsemantic
+test-only assertions needed to lock the handoff. Existing native programs must
+retain their output, identity behavior, panic locations, and heap allocation
+behavior regardless of whether their plan says `Scoped` or `Heap`.
+
+Contributor guidance prohibits compiling, running tests, or formatting during
+implementation. External verification should use Rust 1.90 or newer, report
+native skips explicitly, and confirm that no Stage 5 program calls the scoped
+allocator or restores the scoped cursor.
+
+Stage 5 is complete when every struct aggregate has a deterministic validated
+lifetime class; every resolved function has a context-insensitive parameter
+summary; direct-callee scheduling processes acyclic dependencies once;
+recursive, unreachable, container-dependent, and unknown cases are
+conservative; interior escape always marks the complete owner; compiler and
+backend boundaries carry the separate plan without changing IR; and generated
+programs still allocate every object in the monotonic heap pending Stage 6.
 
 ## Stage 6: Scoped arena lifetimes
 
