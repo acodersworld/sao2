@@ -1,4 +1,4 @@
-//! C11 declarations and scalar function bodies generated solely from the validated owned IR.
+//! C11 core value operations and host entry code generated solely from the validated owned IR.
 //!
 //! This backend is intentionally disconnected from the production compiler
 //! until the milestone-7 activation stage.
@@ -7,9 +7,9 @@ use std::fmt::{self, Write as _};
 
 use crate::ir::{
     self, BinaryOperator, ConstantValue, DefinitionId, DefinitionLayout, FailureOperation,
-    FailureSiteId, Function, FunctionId, IntegerOperation, Intrinsic, LocalId, NumericConversion,
-    OperationKind, OperationSite, Operand, Place, PrimitiveType, Projection, RuntimeCheck,
-    TerminatorKind, Type, TypeId, UnaryOperator, ValidationError,
+    FailureSiteId, Function, FunctionId, IntegerOperation, Intrinsic, LocalId,
+    NumericConversion, OperationKind, OperationSite, Operand, Place, PrimitiveType, Projection,
+    RuntimeCheck, TerminatorKind, Type, TypeId, UnaryOperator, ValidationError,
 };
 
 pub(crate) fn emit(program: &ir::Program) -> Result<String, CEmissionError> {
@@ -141,6 +141,9 @@ impl<'a> CapabilityValidator<'a> {
             let function = self.program.functions[index].clone();
             let function_id = FunctionId::from_index(index);
             self.function = Some(function_id);
+            if Some(function_id) == self.program.entry {
+                self.validate_entry_shape(&function)?;
+            }
             self.signature_type(function.result, false, "function result")?;
             for (position, parameter) in function.parameters.iter().enumerate() {
                 let ty = function.locals[parameter.index()].ty;
@@ -158,6 +161,19 @@ impl<'a> CapabilityValidator<'a> {
             self.validate_body(&function)?;
         }
         Ok(())
+    }
+
+    fn validate_entry_shape(&self, function: &Function) -> Result<(), CEmissionError> {
+        if !matches!(&self.program.types[function.result.index()],
+            Type::Unit | Type::Primitive(PrimitiveType::Int))
+        {
+            return self.unsupported("entry function result is not unit or int");
+        }
+        match function.parameters.as_slice() {
+            [] => Ok(()),
+            [parameter] if self.is_string_list(function.locals[parameter.index()].ty) => Ok(()),
+            _ => self.unsupported("entry function parameters are not empty or a single [str] argument"),
+        }
     }
 
     fn validate_body(&mut self, function: &Function) -> Result<(), CEmissionError> {
@@ -183,9 +199,21 @@ impl<'a> CapabilityValidator<'a> {
             return self.unsupported("place projection");
         }
         match operation {
-            OperationKind::Copy { .. } | OperationKind::Call { .. } => Ok(()),
-            OperationKind::UnionInject { .. } | OperationKind::UnionTest { .. }
-            | OperationKind::UnionPayload { .. } => self.unsupported("union operation"),
+            OperationKind::Copy { destination, operand } => {
+                self.executable_union_use(function.locals[destination.index()].ty)?;
+                self.executable_union_use(self.operand_type(function, operand))
+            }
+            OperationKind::Call { destination, arguments, .. } => {
+                self.executable_union_use(function.locals[destination.index()].ty)?;
+                for argument in arguments {
+                    self.executable_union_use(self.operand_type(function, argument))?;
+                }
+                Ok(())
+            }
+            OperationKind::UnionInject { union_type, .. } => self.require_executable_union(*union_type),
+            OperationKind::UnionTest { union, .. } | OperationKind::UnionPayload { union, .. } => {
+                self.require_executable_union(self.operand_type(function, union))
+            }
             OperationKind::Unary { operand, .. } => {
                 self.require_scalar_operand(function, operand, "non-scalar unary operation")
             }
@@ -200,7 +228,10 @@ impl<'a> CapabilityValidator<'a> {
                 }
             }
             OperationKind::Convert { .. } => Ok(()),
-            OperationKind::Assign { .. } => Ok(()),
+            OperationKind::Assign { destination, value } => {
+                self.executable_union_use(self.place_type(function, destination))?;
+                self.executable_union_use(self.operand_type(function, value))
+            }
             OperationKind::Aggregate { .. } => self.unsupported("aggregate construction"),
             OperationKind::StringIndex { .. } => self.unsupported("string indexing"),
             OperationKind::Intrinsic { intrinsic, arguments, .. } => match intrinsic {
@@ -225,9 +256,13 @@ impl<'a> CapabilityValidator<'a> {
         }
         match terminator {
             TerminatorKind::Jump(_) | TerminatorKind::Branch { .. }
-            | TerminatorKind::Return(_)
             | TerminatorKind::Panic { .. } | TerminatorKind::Unreachable => Ok(()),
-            TerminatorKind::Switch { .. } => self.unsupported("union switch"),
+            TerminatorKind::Return(value) => {
+                self.executable_union_use(self.operand_type(function, value))
+            }
+            TerminatorKind::Switch { union, .. } => {
+                self.require_executable_union(self.operand_type(function, union))
+            }
             TerminatorKind::ErrorPanic { payload, .. } => {
                 match &self.program.types[self.operand_type(function, payload).index()] {
                     Type::Primitive(PrimitiveType::Int | PrimitiveType::Bool | PrimitiveType::Char) => Ok(()),
@@ -261,6 +296,54 @@ impl<'a> CapabilityValidator<'a> {
 
     fn is_scalar(&self, ty: TypeId) -> bool {
         matches!(&self.program.types[ty.index()], Type::Unit | Type::Primitive(_))
+    }
+
+    fn executable_union_use(&self, ty: TypeId) -> Result<(), CEmissionError> {
+        if self.union_alternatives(ty).is_some() { self.require_executable_union(ty) } else { Ok(()) }
+    }
+
+    fn require_executable_union(&self, ty: TypeId) -> Result<(), CEmissionError> {
+        if self.union_alternatives(ty).is_none() {
+            return self.unsupported("union operation on a non-union value");
+        }
+        if self.supports_union_value(ty, &mut Vec::new()) { Ok(()) }
+        else { self.unsupported("union operation with a non-scalar reachable payload") }
+    }
+
+    fn supports_union_value(&self, ty: TypeId, visiting: &mut Vec<TypeId>) -> bool {
+        if visiting.contains(&ty) { return true; }
+        match &self.program.types[ty.index()] {
+            Type::Unit | Type::Primitive(_) => true,
+            Type::Union(alternatives) => {
+                visiting.push(ty);
+                let supported = alternatives.iter()
+                    .all(|alternative| self.supports_union_value(alternative.payload, visiting));
+                visiting.pop();
+                supported
+            }
+            Type::Nominal(definition) => match &self.program.definitions[definition.index()].layout {
+                DefinitionLayout::Union(alternatives) => {
+                    visiting.push(ty);
+                    let supported = alternatives.iter()
+                        .all(|alternative| self.supports_union_value(alternative.payload, visiting));
+                    visiting.pop();
+                    supported
+                }
+                DefinitionLayout::Tuple(_) | DefinitionLayout::Struct(_) => false,
+            },
+            Type::List(_) | Type::Map { .. } => false,
+        }
+    }
+
+    fn union_alternatives(&self, ty: TypeId) -> Option<&[ir::UnionAlternative]> {
+        match &self.program.types[ty.index()] {
+            Type::Union(alternatives) => Some(alternatives),
+            Type::Nominal(definition) => match &self.program.definitions[definition.index()].layout {
+                DefinitionLayout::Union(alternatives) => Some(alternatives),
+                DefinitionLayout::Tuple(_) | DefinitionLayout::Struct(_) => None,
+            },
+            _ => None,
+        }
     }
 
     fn output_operand(&self, function: &Function, operand: &Operand) -> bool {
@@ -421,7 +504,7 @@ impl<'a> Renderer<'a> {
         self.output.push_str("/* Generated by sao2. */\n\n");
         self.output.push_str(concat!(
             "#include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n",
-            "#include <float.h>\n#include <inttypes.h>\n#include <math.h>\n",
+            "#include <float.h>\n#include <inttypes.h>\n#include <limits.h>\n#include <math.h>\n",
             "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n",
             "#ifdef _WIN32\n#include <fcntl.h>\n#include <io.h>\n#endif\n\n",
         ));
@@ -459,6 +542,8 @@ impl<'a> Renderer<'a> {
                 self.render_function(FunctionId::from_index(index), &function);
                 if index + 1 != self.program.functions.len() { self.output.push('\n'); }
             }
+            self.output.push('\n');
+            self.render_entry_adapter();
         }
         self.output
     }
@@ -679,13 +764,32 @@ impl<'a> Renderer<'a> {
                 let arguments = arguments.iter().map(|argument| self.operand(argument)).collect::<Vec<_>>().join(", ");
                 let _ = writeln!(self.output, "    sao2_local_{} = sao2_fn_{}({arguments});", destination.index(), callee.index());
             }
+            OperationKind::UnionInject { destination, union_type, alternative, payload } => {
+                let c_ty = self.c_type(*union_type);
+                let payload = self.operand(payload);
+                let destination = destination.index();
+                let alternative = alternative.index();
+                let _ = writeln!(self.output, "    sao2_local_{destination} = ({c_ty}){{0}};");
+                let _ = writeln!(self.output, "    sao2_local_{destination}.payload.alternative_{alternative} = {payload};");
+                let _ = writeln!(self.output, "    sao2_local_{destination}.tag = UINT32_C({});", alternative + 1);
+            }
+            OperationKind::UnionTest { destination, union, alternative } => {
+                let union = self.operand(union);
+                let tag = alternative.index() + 1;
+                let _ = writeln!(self.output, "    sao2_local_{} = ({union}).tag == UINT32_C({tag});", destination.index());
+            }
+            OperationKind::UnionPayload { destination, union, alternative } => {
+                let union = self.operand(union);
+                let alternative = alternative.index();
+                let tag = alternative + 1;
+                let _ = writeln!(self.output, "    if (({union}).tag != UINT32_C({tag})) sao2_compiler_invariant();");
+                let _ = writeln!(self.output, "    sao2_local_{} = ({union}).payload.alternative_{alternative};", destination.index());
+            }
             OperationKind::Intrinsic { destination, intrinsic, arguments, failure } => {
                 self.render_intrinsic(function, *destination, *intrinsic, arguments, *failure);
             }
             OperationKind::Check(check) => self.render_check(function, check),
-            OperationKind::Aggregate { .. } | OperationKind::UnionInject { .. }
-            | OperationKind::UnionTest { .. } | OperationKind::UnionPayload { .. }
-            | OperationKind::StringIndex { .. } | OperationKind::Builtin { .. }
+            OperationKind::Aggregate { .. } | OperationKind::StringIndex { .. } | OperationKind::Builtin { .. }
             | OperationKind::BeginIteration { .. } | OperationKind::EndIteration { .. }
             | OperationKind::IterationValue { .. } => unreachable!("capability validation rejected operation"),
         }
@@ -723,8 +827,63 @@ impl<'a> Renderer<'a> {
                 let _ = writeln!(self.output, "    {helper}({payload_value}, {});", failure.index());
             }
             TerminatorKind::Unreachable => self.output.push_str("    sao2_compiler_invariant();\n"),
-            TerminatorKind::Switch { .. } => unreachable!("capability validation rejected union switch"),
+            TerminatorKind::Switch { union, targets } => {
+                let union = self.operand(union);
+                let mut targets = targets.clone();
+                targets.sort_by_key(|(alternative, _)| *alternative);
+                let _ = writeln!(self.output, "    switch (({union}).tag) {{");
+                for (alternative, target) in targets {
+                    let _ = writeln!(
+                        self.output,
+                        "        case UINT32_C({}): goto sao2_block_{};",
+                        alternative.index() + 1,
+                        target.index(),
+                    );
+                }
+                self.output.push_str("        default: sao2_compiler_invariant();\n    }\n");
+            }
         }
+    }
+
+    fn render_entry_adapter(&mut self) {
+        let entry = self.program.entry.expect("validated program entry");
+        let function = &self.program.functions[entry.index()];
+        let has_args = !function.parameters.is_empty();
+        if has_args {
+            self.output.push_str(concat!(
+                "int main(int argc, char **argv) {\n",
+                "    int sao2_argument;\n",
+                "    for (sao2_argument = 1; sao2_argument < argc; ++sao2_argument) {\n",
+                "        const unsigned char *sao2_byte = (const unsigned char *)argv[sao2_argument];\n",
+                "        while (*sao2_byte != UINT8_C(0)) {\n",
+                "            if (*sao2_byte > UINT8_C(127))\n",
+                "                sao2_pre_entry_panic_argument((size_t)(sao2_argument - 1));\n",
+                "            ++sao2_byte;\n",
+                "        }\n",
+                "    }\n",
+                "    sao2_args sao2_entry_args = { argc > 0 ? argc - 1 : 0, argc > 0 ? argv + 1 : argv };\n",
+            ));
+        } else {
+            self.output.push_str("int main(void) {\n");
+        }
+
+        let arguments = if has_args { "sao2_entry_args" } else { "" };
+        match &self.program.types[function.result.index()] {
+            Type::Unit => {
+                let _ = writeln!(self.output, "    (void)sao2_fn_{}({arguments});", entry.index());
+                self.output.push_str("    return EXIT_SUCCESS;\n");
+            }
+            Type::Primitive(PrimitiveType::Int) => {
+                let _ = writeln!(self.output, "    int64_t sao2_result = sao2_fn_{}({arguments});", entry.index());
+                self.output.push_str(concat!(
+                    "    if (sao2_result < INT_MIN || sao2_result > INT_MAX)\n",
+                    "        sao2_pre_entry_panic_exit_status();\n",
+                    "    return (int)sao2_result;\n",
+                ));
+            }
+            _ => unreachable!("capability validation accepted an invalid entry result"),
+        }
+        self.output.push_str("}\n");
     }
 
     fn render_check(&mut self, function: &Function, check: &RuntimeCheck) {
@@ -984,6 +1143,34 @@ static void sao2_write_stderr_size(size_t value) {
 
 static void sao2_write_stderr_int(int64_t value) {
     if (fprintf(stderr, "%" PRId64, value) < 0) return;
+}
+
+static _Noreturn void sao2_pre_entry_panic(
+    const unsigned char *message,
+    size_t message_length,
+    bool append_argument,
+    size_t argument
+) {
+    static const unsigned char prefix[] = "sao2: panic: ";
+    static const unsigned char argument_suffix[] = " is not ASCII";
+    sao2_write_stderr(prefix, sizeof prefix - 1);
+    sao2_write_stderr(message, message_length);
+    if (append_argument) {
+        sao2_write_stderr_size(argument);
+        sao2_write_stderr(argument_suffix, sizeof argument_suffix - 1);
+    }
+    sao2_write_stderr_char('\n');
+    exit(EXIT_FAILURE);
+}
+
+static _Noreturn void sao2_pre_entry_panic_exit_status(void) {
+    static const unsigned char message[] = "main returned an exit status outside the host int range";
+    sao2_pre_entry_panic(message, sizeof message - 1, false, 0);
+}
+
+static _Noreturn void sao2_pre_entry_panic_argument(size_t argument) {
+    static const unsigned char message[] = "command-line argument ";
+    sao2_pre_entry_panic(message, sizeof message - 1, true, argument);
 }
 
 static _Noreturn void sao2_compiler_invariant(void) {
@@ -1394,14 +1581,14 @@ mod tests {
         function.blocks[block.index()].terminate(
             TerminatorKind::Return(constant(types.unit, ConstantValue::Unit)), location,
         );
-        let main = program.add_function(function);
-        program.entry = Some(main);
+        program.add_function(function);
+        add_main(&mut program, types, location);
 
         let emitted = emit(&program).unwrap();
         assert!(emitted.starts_with(concat!(
             "/* Generated by sao2. */\n\n",
             "#include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n",
-            "#include <float.h>\n#include <inttypes.h>\n#include <math.h>\n",
+            "#include <float.h>\n#include <inttypes.h>\n#include <limits.h>\n#include <math.h>\n",
             "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n",
         )));
         assert!(emitted.contains(concat!(
@@ -1442,14 +1629,12 @@ mod tests {
         let mut signature = Function::new("mutual-a", anonymous);
         signature.add_local(outer_type, Some("for".to_owned()), LocalOrigin::Parameter);
         signature.add_local(named_type, Some("switch".to_owned()), LocalOrigin::Parameter);
-        let result = signature.add_local(anonymous, None, LocalOrigin::Temporary);
+        signature.add_local(anonymous, None, LocalOrigin::Temporary);
         let block = signature.add_block();
         signature.entry = Some(block);
-        signature.blocks[block.index()].terminate(
-            TerminatorKind::Return(Operand::Copy(Place::local(result))), location,
-        );
-        let first = program.add_function(signature);
-        program.entry = Some(first);
+        signature.blocks[block.index()].terminate(TerminatorKind::Unreachable, location);
+        program.add_function(signature);
+        add_main(&mut program, types, location);
 
         let emitted = emit(&program).unwrap();
         let forwards = concat!(
@@ -1913,7 +2098,9 @@ mod tests {
         });
 
         let emitted = emit(&program).unwrap();
-        assert!(emitted.contains("#include <float.h>\n#include <inttypes.h>\n#include <math.h>\n"));
+        assert!(emitted.contains(
+            "#include <float.h>\n#include <inttypes.h>\n#include <limits.h>\n#include <math.h>\n"
+        ));
         assert!(emitted.contains("_Static_assert(FLT_RADIX == 2"));
         assert!(emitted.contains("_Static_assert(DBL_MANT_DIG == 53"));
         assert!(emitted.contains("_Static_assert(DBL_MIN_EXP == -1021"));
@@ -2062,6 +2249,224 @@ mod tests {
         assert!(emitted.contains("sao2_error_panic_char(UINT8_C(10), 1);"));
         assert!(emitted.contains("{ SAO2_FAILURE_EXPLICIT_PANIC, 0, 2, 3 },"));
         assert!(emitted.contains("{ SAO2_FAILURE_UNHANDLED_ERROR, 0, 4, 5 },"));
+    }
+
+    #[test]
+    fn renders_union_injection_tests_guarded_payloads_and_ordered_switches() {
+        let (mut program, types, location) = program();
+        let union = program.intern_type(Type::Union(vec![
+            UnionAlternative::tagged("source-name-a", types.int),
+            UnionAlternative::tagged("source-name-b", types.boolean),
+        ]));
+        let first = ir::AlternativeId::from_index(0);
+        let second = ir::AlternativeId::from_index(1);
+        let mut main = Function::new("main", types.int);
+        let value = main.add_local(union, None, LocalOrigin::Temporary);
+        let tested = main.add_local(types.boolean, None, LocalOrigin::Temporary);
+        let payload = main.add_local(types.int, None, LocalOrigin::Temporary);
+        let entry = main.add_block();
+        let first_target = main.add_block();
+        let second_target = main.add_block();
+        main.entry = Some(entry);
+        main.blocks[entry.index()].push(OperationKind::UnionInject {
+            destination: value,
+            union_type: union,
+            alternative: first,
+            payload: constant(types.int, ConstantValue::Integer(7)),
+        }, location);
+        main.blocks[entry.index()].push(OperationKind::UnionTest {
+            destination: tested,
+            union: Operand::Copy(Place::local(value)),
+            alternative: first,
+        }, location);
+        main.blocks[entry.index()].push(OperationKind::UnionPayload {
+            destination: payload,
+            union: Operand::Copy(Place::local(value)),
+            alternative: first,
+        }, location);
+        main.blocks[entry.index()].terminate(TerminatorKind::Switch {
+            union: Operand::Copy(Place::local(value)),
+            targets: vec![(second, second_target), (first, first_target)],
+        }, location);
+        main.blocks[first_target.index()].terminate(
+            TerminatorKind::Return(Operand::Copy(Place::local(payload))), location,
+        );
+        main.blocks[second_target.index()].terminate(
+            TerminatorKind::Return(constant(types.int, ConstantValue::Integer(0))), location,
+        );
+        let main = program.add_function(main);
+        program.entry = Some(main);
+
+        let emitted = emit(&program).unwrap();
+        let zero = emitted.find("    sao2_local_0 = (sao2_union_ty_6){0};").unwrap();
+        let payload_write = emitted.find("    sao2_local_0.payload.alternative_0 = INT64_C(7);").unwrap();
+        let tag_write = emitted.find("    sao2_local_0.tag = UINT32_C(1);").unwrap();
+        assert!(zero < payload_write && payload_write < tag_write);
+        assert!(emitted.contains("sao2_local_1 = (sao2_local_0).tag == UINT32_C(1);"));
+        assert!(emitted.contains(concat!(
+            "if ((sao2_local_0).tag != UINT32_C(1)) sao2_compiler_invariant();\n",
+            "    sao2_local_2 = (sao2_local_0).payload.alternative_0;",
+        )));
+        assert!(emitted.contains(concat!(
+            "switch ((sao2_local_0).tag) {\n",
+            "        case UINT32_C(1): goto sao2_block_1;\n",
+            "        case UINT32_C(2): goto sao2_block_2;\n",
+            "        default: sao2_compiler_invariant();\n",
+        )));
+        assert!(!emitted.contains("source-name-a"));
+        assert_eq!(emitted, emit(&program).unwrap());
+    }
+
+    #[test]
+    fn preserves_nested_named_unions_through_copies_calls_and_results() {
+        let (mut program, types, location) = program();
+        let mut inner_definition = NominalDefinition::union("Inner source name");
+        let inner_int = inner_definition.add_alternative(UnionAlternative::untagged(types.int));
+        inner_definition.add_alternative(UnionAlternative::untagged(types.boolean));
+        let inner_definition = program.add_definition(inner_definition);
+        let inner = program.intern_type(Type::Nominal(inner_definition));
+        let mut outer_definition = NominalDefinition::union("Outer source name");
+        let outer_inner = outer_definition.add_alternative(UnionAlternative::untagged(inner));
+        outer_definition.add_alternative(UnionAlternative::untagged(types.character));
+        let outer_definition = program.add_definition(outer_definition);
+        let outer = program.intern_type(Type::Nominal(outer_definition));
+
+        let mut identity = Function::new("union identity", outer);
+        let parameter = identity.add_local(outer, Some("value".to_owned()), LocalOrigin::Parameter);
+        let block = identity.add_block();
+        identity.entry = Some(block);
+        identity.blocks[block.index()].terminate(
+            TerminatorKind::Return(Operand::Copy(Place::local(parameter))), location,
+        );
+        let identity = program.add_function(identity);
+
+        let mut main = Function::new("main", types.int);
+        let inner_value = main.add_local(inner, None, LocalOrigin::Temporary);
+        let outer_value = main.add_local(outer, None, LocalOrigin::Temporary);
+        let copied = main.add_local(outer, None, LocalOrigin::Temporary);
+        let result = main.add_local(outer, None, LocalOrigin::Temporary);
+        let block = main.add_block();
+        main.entry = Some(block);
+        main.blocks[block.index()].push(OperationKind::UnionInject {
+            destination: inner_value,
+            union_type: inner,
+            alternative: inner_int,
+            payload: constant(types.int, ConstantValue::Integer(9)),
+        }, location);
+        main.blocks[block.index()].push(OperationKind::UnionInject {
+            destination: outer_value,
+            union_type: outer,
+            alternative: outer_inner,
+            payload: Operand::Copy(Place::local(inner_value)),
+        }, location);
+        main.blocks[block.index()].push(OperationKind::Copy {
+            destination: copied,
+            operand: Operand::Copy(Place::local(outer_value)),
+        }, location);
+        main.blocks[block.index()].push(OperationKind::Call {
+            destination: result,
+            function: identity,
+            arguments: vec![Operand::Copy(Place::local(copied))],
+        }, location);
+        main.blocks[block.index()].terminate(
+            TerminatorKind::Return(constant(types.int, ConstantValue::Integer(0))), location,
+        );
+        let main = program.add_function(main);
+        program.entry = Some(main);
+
+        let emitted = emit(&program).unwrap();
+        assert!(emitted.contains("sao2_def_0 alternative_0; /* tag 1 */"));
+        assert!(emitted.contains("sao2_local_2 = sao2_local_1;"));
+        assert!(emitted.contains("sao2_local_3 = sao2_fn_0(sao2_local_2);"));
+        assert!(!emitted.contains("Inner source name"));
+        assert!(!emitted.contains("Outer source name"));
+    }
+
+    #[test]
+    fn renders_all_four_entry_adapter_shapes_and_raw_diagnostics() {
+        for (with_args, unit_result) in [(false, false), (false, true), (true, false), (true, true)] {
+            let (mut program, types, location) = program();
+            let result = if unit_result { types.unit } else { types.int };
+            let value = if unit_result {
+                constant(types.unit, ConstantValue::Unit)
+            } else {
+                constant(types.int, ConstantValue::Integer(0))
+            };
+            let mut main = Function::new("main", result);
+            if with_args {
+                let args = program.intern_type(Type::List(types.string));
+                main.add_local(args, Some("args".to_owned()), LocalOrigin::Parameter);
+            }
+            let block = main.add_block();
+            main.entry = Some(block);
+            main.blocks[block.index()].terminate(TerminatorKind::Return(value), location);
+            let main = program.add_function(main);
+            program.entry = Some(main);
+
+            let emitted = emit(&program).unwrap();
+            if with_args {
+                assert!(emitted.contains("int main(int argc, char **argv) {"));
+                assert!(emitted.contains("for (sao2_argument = 1; sao2_argument < argc; ++sao2_argument)"));
+                assert!(emitted.contains("sao2_pre_entry_panic_argument((size_t)(sao2_argument - 1));"));
+                assert!(emitted.contains(concat!(
+                    "sao2_args sao2_entry_args = { argc > 0 ? argc - 1 : 0, ",
+                    "argc > 0 ? argv + 1 : argv };",
+                )));
+            } else {
+                assert!(emitted.contains("int main(void) {"));
+            }
+            if unit_result {
+                let call = if with_args { "(void)sao2_fn_0(sao2_entry_args);" }
+                    else { "(void)sao2_fn_0();" };
+                assert_eq!(emitted.matches(call).count(), 1);
+                assert!(emitted.contains("return EXIT_SUCCESS;"));
+            } else {
+                let call = if with_args { "int64_t sao2_result = sao2_fn_0(sao2_entry_args);" }
+                    else { "int64_t sao2_result = sao2_fn_0();" };
+                assert_eq!(emitted.matches(call).count(), 1);
+                assert!(emitted.contains("sao2_result < INT_MIN || sao2_result > INT_MAX"));
+                assert!(emitted.contains("return (int)sao2_result;"));
+            }
+            assert!(emitted.contains("main returned an exit status outside the host int range"));
+            assert!(emitted.contains("command-line argument "));
+            assert!(emitted.contains(" is not ASCII"));
+            assert!(emitted.ends_with('\n'));
+            assert!(!emitted.ends_with("\n\n"));
+        }
+    }
+
+    #[test]
+    fn rejects_executable_union_with_a_reachable_tuple_payload() {
+        let (mut program, types, location) = program();
+        let mut tuple = NominalDefinition::tuple("Tuple");
+        tuple.add_tuple_field(types.int);
+        let tuple_definition = program.add_definition(tuple);
+        let tuple_type = program.intern_type(Type::Nominal(tuple_definition));
+        let union = program.intern_type(Type::Union(vec![
+            UnionAlternative::untagged(tuple_type),
+            UnionAlternative::untagged(types.int),
+        ]));
+        let mut main = Function::new("main", types.int);
+        let value = main.add_local(union, None, LocalOrigin::Temporary);
+        let tested = main.add_local(types.boolean, None, LocalOrigin::Temporary);
+        let block = main.add_block();
+        main.entry = Some(block);
+        main.blocks[block.index()].push(OperationKind::UnionTest {
+            destination: tested,
+            union: Operand::Copy(Place::local(value)),
+            alternative: ir::AlternativeId::from_index(1),
+        }, location);
+        main.blocks[block.index()].terminate(
+            TerminatorKind::Return(constant(types.int, ConstantValue::Integer(0))), location,
+        );
+        let main = program.add_function(main);
+        program.entry = Some(main);
+
+        assert_unsupported(
+            emit(&program),
+            "union operation with a non-scalar reachable payload",
+            Some(OperationSite::Operation(0)),
+        );
     }
 
     #[test]
