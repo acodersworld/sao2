@@ -592,54 +592,315 @@ representation change was required.
 
 Status: current.
 
-Replace the temporary output cases with a type-directed formatting layer shared
-by ordinary output and panic paths. Implement the `DESIGN.md` behavior for:
+Replace the remaining type-specific output statements with one generated,
+type-directed formatting layer. It must serve `print`, `println`, explicit
+`panic`, and unhandled `Error` payloads without changing the IR or exposing C
+helper identities to the language. Complete primitive formatting, recursively
+printable tuples and unions, output-failure handling, and the milestone handoff
+in this stage.
 
-- unit, integers, finite floats, booleans, characters, and strings;
-- recursively printable tuples;
-- named and anonymous, tagged and untagged unions, including `Error`; and
-- zero-argument `println` and newline handling.
+### Required design decisions
 
-Float output must use the shortest decimal form that round-trips exactly.
-Strings and characters write their bytes without quotes, and all output must
-continue to handle embedded zero bytes and report write failures through the
-existing panic machinery.
+Update `DESIGN.md` before implementing or snapshotting tuple and float output.
+The design currently declares tuples printable without specifying their text,
+and “shortest decimal representation” does not fully select one spelling when
+several decimal strings round-trip to the same binary64 value. Do not encode
+either decision only in backend tests.
 
-Explicit `panic` consumes the permanent string representation. An unhandled
-`Error` can now format every permitted primitive payload, including `float` and
-`str`, while preserving the existing failure-site filename, line, column, and
-function reporting. Formatting must not introduce a second, inconsistent path
-for stdout, stderr, or runtime failure metadata.
+Use this proposed tuple contract unless an explicit design decision chooses a
+different one:
 
-Before locking exact output snapshots, resolve and document any presentation
-detail not already fixed by `DESIGN.md`, especially the textual form of printed
-tuple values. Do not silently make a backend-only language decision.
+- a tuple prints in constructor form as `Name(value_0, value_1)`;
+- fields retain declaration order and are separated by comma followed by one
+  space;
+- the nominal tuple name is preserved, including inside another tuple or
+  union; and
+- every field is formatted recursively without quotes.
 
-### Integration and verification
+For example, `Pair(1, true)` prints exactly `Pair(1, true)`. Tuple declarations
+are nominal and always have at least one field, so no anonymous or empty-tuple
+spelling is required; unit remains `()`.
 
-Remove milestone-7 capability rejections and temporary helpers only after
-their permanent replacements are executable end to end. Keep direct backend
-coverage as the detailed specification of generated runtime support, and add
-source-to-executable coverage for each newly accepted operation.
+Use this proposed float contract unless the design selects another canonical
+policy:
 
-Retain exact-byte tests for embedded zeros and newlines, recursive tuple and
-union cases, string canonicalization, equality/hash agreement, shortest
-round-tripping floats, output failures, explicit panic, and every permitted
-unhandled-`Error` payload. Repeated emission must remain byte-for-byte
-deterministic. Confirm that compiler failures still occur before filesystem or
-toolchain side effects and preserve accumulated warnings.
+- choose the smallest significant-digit precision from 1 through 17 whose
+  decimal text parses back to the identical binary64 bit pattern;
+- use the C-locale `%g` fixed-versus-scientific selection at that precision;
+- use lowercase `e`, remove a positive exponent sign and redundant leading
+  exponent zeros, and retain a negative exponent sign;
+- print positive zero as `0` and negative zero as `-0`; and
+- never emit infinity or NaN because accepted SAO2 float values are finite.
+
+This defines “shortest” by significant digits with a canonical notation rule,
+not merely by the fewest output bytes. If the language instead requires a
+different Ryu/Schubfach-style spelling, revise the implementation plan and
+test vectors with the design change.
+
+### Shared writer contract
+
+Introduce one generated writer abstraction used by every value formatter. It
+contains the target `FILE *`, the output failure-site index when applicable, a
+mode distinguishing checked standard output from best-effort standard error,
+and a failed flag for stderr. Provide byte, single-character, and formatted
+buffer writes on top of it.
+
+For checked stdout, a short `fwrite`, `EOF`, or formatting failure calls the
+existing `sao2_output_failure(site)` and does not return. Preserve the
+`FailureOperation::Output` check and the intrinsic's source location. For panic
+stderr, record a failed write and suppress later writes rather than recursively
+panicking; the process must still terminate through the original panic path.
+Pre-entry diagnostics have no `FailureSiteId` and may continue to use the same
+best-effort low-level stderr behavior.
+
+Keep Windows binary-mode setup once per `print` or `println` intrinsic before
+the first write. A `println` newline is a writer operation after its optional
+value. Assign the intrinsic's unit destination only after every requested write
+succeeds. Do not call `fprintf` or `fputc` directly from type-specific generated
+operation rendering once the writer is active.
+
+Use generated formatter contracts of this shape:
+
+```c
+static void sao2_format_int(sao2_writer *writer, int64_t value);
+static void sao2_format_tuple_def_0(sao2_writer *writer, sao2_def_0 value);
+static void sao2_format_union_ty_4(sao2_writer *writer, sao2_union_ty_4 value);
+```
+
+Passing aggregate values by value matches the existing tuple and union ABI.
+Formatters return only after the value has been written or the stderr writer
+has entered its failed state; checked stdout failures do not return.
+
+### Primitive formatting
+
+Provide fixed helpers for every primitive and unit:
+
+- unit writes `()`;
+- `int` writes base-10 signed digits using `PRId64` into a bounded buffer;
+- `bool` writes `true` or `false`;
+- `char` writes its one ASCII byte;
+- `str` writes its descriptor bytes and explicit length without quotes; and
+- `float` uses the canonical shortest-round-trip algorithm below.
+
+All intermediate `snprintf` calls must check for a negative result and for a
+reported length outside the destination buffer before handing bytes to the
+writer. Keep embedded zero bytes ordinary data for strings and characters;
+never route language strings through `%s` or `strlen`.
+
+For floats, add a bit-extraction helper using `memcpy`, mirroring
+`sao2_float_from_bits`. For precisions 1 through 17, render a `%g` candidate
+into a fixed buffer, normalize its exponent spelling, parse the normalized
+candidate with `strtod`, require complete consumption, and compare the parsed
+bits to the original. Emit the first matching candidate. The C runtime begins
+in the `C` locale and SAO2 exposes no locale mutation, so decimal point and
+parsing remain stable. The binary64 assertions already emitted by the backend
+make 17 significant digits sufficient; failure to find a candidate is a
+compiler-runtime invariant, not a language panic.
+
+Keep candidate construction and output failure distinct. A `snprintf` failure
+while servicing checked stdout reports that intrinsic's output failure. The
+same failure during panic formatting marks stderr failed and continues to
+termination. An impossible successful-format/no-roundtrip result calls the
+compiler-invariant path.
+
+### Tuple formatting
+
+Generate a formatter for every recursively printable nominal tuple, in the
+Stage-2 aggregate dependency order. Write the design-approved constructor
+prefix, format fields in declaration order through the type dispatcher, write
+the exact separator between fields, and close the constructor. Nested tuples
+call their identity-derived helpers.
+
+Tuple names are observable output data even though they must never become C
+identifiers. Emit their ASCII bytes as deterministic `static const unsigned
+char` arrays using the existing byte-array renderer, then write those arrays by
+length. Do not use C string escaping, struct padding, tuple equality helpers,
+or source re-analysis to format a tuple.
+
+### Union formatting
+
+Generate formatters for recursively printable named and anonymous unions in
+aggregate dependency order. Switch on the existing one-based physical tag,
+call `sao2_compiler_invariant` for zero or an unknown tag, and format the active
+payload recursively. Preserve the exact `DESIGN.md` constructor rules:
+
+- named untagged: `Union(payload)`;
+- named tagged: `Union.Tag(payload)`;
+- anonymous untagged: the payload with no wrapper;
+- anonymous tagged: `Tag(payload)`; and
+- the special alternative: `Error(payload)`.
+
+Apply those rules independently at every nesting level. Source-owned nominal
+names and tags must be emitted as byte data, never incorporated into helper or
+member identifiers. Deduplicate identical formatting-label byte sequences by
+first occurrence in a deterministic scan of aggregate helper order, without
+interning them as SAO2 string values.
+
+Named and anonymous unions already have complete physical definitions and tag
+assignments. Stage 3 adds no tag, wrapper, or flattened-union concept to the
+IR. Printing eligibility is a recursive type property separate from equality,
+hashing, and the general supported-value classification.
+
+### Panic and Error integration
+
+Retain the existing diagnostic shape:
+
+```text
+sao2: panic: <message> at <filename>:<line>:<column> in <function>
+```
+
+Refactor explicit `panic(str)` to create a best-effort stderr writer and invoke
+the same string formatter used by ordinary output between the fixed prefix and
+source suffix. It still requires `SAO2_FAILURE_EXPLICIT_PANIC` and never
+returns.
+
+Replace the separate integer, boolean, and character Error-panic bodies with a
+common typed payload path, or make them thin wrappers over the shared writer.
+Add `float` and `str`, the two primitive Error payloads still rejected by the
+backend. Every variant writes `Error(`, invokes the corresponding primitive
+formatter, writes `)`, appends the original failure location and function, and
+exits nonzero. Do not add tuple or union Error payloads: the language restricts
+the special alternative to one primitive payload.
+
+An stderr write failure must not change the selected language failure, attempt
+another panic, or return to SAO2 code. Existing raw arithmetic, index, adapter,
+and compiler-invariant diagnostics retain their wording and failure
+classification even if their low-level writes are routed through the writer.
+
+### Capability planning and helper ordering
+
+Replace `output_operand`'s scalar subset with a recursive printable predicate
+over the validated IR type graph. Accept unit and every primitive, printable
+tuples, and named or anonymous unions whose every payload is printable. Retain
+capability errors for structs, lists, maps, and any value graph which reaches
+them. `Program::validate` remains authoritative for intrinsic arity and the
+language-level printable-type rule.
+
+Permit every primitive in `TerminatorKind::ErrorPanic`, including `float` and
+`str`, while retaining the IR validation that rejects nonprimitive Error
+payloads. No capability change is needed for explicit panic because it already
+accepts the permanent string representation.
+
+Plan formatting helpers from the closed IR before rendering. Emit sections in
+this order:
+
+1. existing headers, fixed types, aggregate definitions, and runtime metadata;
+2. low-level failure and writer support plus primitive formatters;
+3. SAO2 string literal data;
+4. Stage-2 tuple equality and hash helpers;
+5. formatting-label byte arrays;
+6. tuple and union formatters in aggregate dependency order; and
+7. function prototypes, definitions, and the host entry adapter.
+
+Use stable `DefinitionId`, `TypeId`, and `AlternativeId` components for helper
+names. Label pool order follows formatter order, field or alternative order,
+then prefix/separator/suffix use within the helper. Repeated emission must
+remain byte-for-byte identical.
+
+### Implementation sequence
+
+Implement Stage 3 in walking-skeleton order:
+
+1. Make and document the tuple and float presentation decisions in
+   `DESIGN.md`. Add design-level examples which lock exact spaces,
+   punctuation, exponent spelling, and signed zero before backend snapshots.
+2. Split or reorganize `SCALAR_RUNTIME` only as needed to introduce the writer
+   without changing existing panic reasons. Migrate current string, integer,
+   boolean, and newline output first so the existing executable subset remains
+   working through the new path.
+3. Add unit and character formatters, then implement and directly test the
+   bounded float candidate algorithm across raw binary64 values before enabling
+   float output in capability validation.
+4. Plan formatting labels and emit tuple formatters. Enable tuple output only
+   after nested tuple values execute through the shared writer.
+5. Emit named and anonymous union formatters, including every constructor form
+   and recursive nesting. Then enable recursively printable union output.
+6. Route explicit panic through the string formatter and generalize
+   `ErrorPanic` across all five permitted primitive payloads. Preserve exact
+   source attribution and nonzero termination.
+7. Remove the old intrinsic type switch, obsolete scalar output arrays or
+   helpers, and the `printing this value type` and `Error panic payload
+   formatting` capability cases only after their replacements have direct and
+   end-to-end coverage.
+8. Update stale compiler/IR documentation, complete integration coverage, and
+   perform the milestone handoff only after external native verification.
+
+Keep the implementation in `src/c_backend.rs` except for the explicit
+`DESIGN.md` decision, focused compiler/end-to-end tests, and documentation
+cleanup. Do not add a Rust dependency, a separate runtime object, or frontend
+formatting annotations.
+
+### Tests and completion
+
+Extend direct backend and generated-C native tests to cover:
+
+- exact unit, integer minimum and maximum, booleans, every ASCII character
+  boundary, empty strings, embedded zeros, and strings without quotes;
+- float positive and negative zero, ordinary integers and fractions, powers of
+  ten around `%g` notation transitions, values adjacent to rounding boundaries,
+  minimum and maximum normal values, minimum subnormal, and maximum finite;
+- parsing every emitted float back to identical bits and proving no selected
+  higher precision was necessary under the approved algorithm;
+- tuple constructor spelling, separators, single-field and nested tuples,
+  primitive fields, and source names which resemble C keywords;
+- every named/anonymous and tagged/untagged union form, `Error`, unit payloads,
+  nested unions, tuple payloads, and every active alternative;
+- zero and invalid physical tags reaching the compiler-invariant path in
+  handcrafted native fixtures;
+- `print`, one-argument `println`, and zero-argument `println`, including exact
+  newline counts and destination assignment only after successful writes;
+- stdout setup failure, short writes, formatted-write failure handling where it
+  can be injected, and absence of recursive panic on stderr failure;
+- explicit panic strings with embedded zeros and exact source suffixes;
+- unhandled `Error` payloads for `int`, `float`, `str`, `bool`, and `char`, with
+  exact constructor text and source attribution;
+- deterministic label pooling, helper dependency order, one final newline, and
+  byte-for-byte repeated generated C; and
+- continued capability rejection of structs, containers, iteration, string
+  `len`, and actual use of the entry `[str]` value.
+
+At compiler and CLI layers, add source programs which print every primitive,
+the approved tuple forms, all union constructor forms, and recursive
+combinations. Add exact stdout cases for embedded zero bytes and newlines, and
+exact stderr cases for explicit panic, all Error payload types, output failure
+where portable, and unchanged arithmetic/index failures. Keep comprehensive C
+spelling and handcrafted invalid-tag cases in backend tests rather than
+duplicating them at every layer.
+
+Retain all Stage-1 and Stage-2 native coverage, warning propagation,
+transactional output behavior, `--show-c`, compiler discovery, and program exit
+status tests. A backend capability failure must still occur before creating or
+overwriting `program.c`, and generated-program failures remain distinct from
+compiler/toolchain failures.
 
 Contributor guidance prohibits compiling, running tests, or formatting during
-implementation. Final verification is therefore external to this work plan and
-must use Rust 1.90 or newer and run the complete suite with a supported C
-compiler selected so native assertions do not skip.
+implementation. Final verification must run externally from the intended
+worktree with Rust 1.90 or newer and a supported compiler forced so native
+assertions do not skip:
 
-Exit criterion: `print`, `println`, explicit `panic`, and unhandled `Error`
-format every milestone-8 value through the permanent type-directed path with
-exact output bytes and unchanged source-attributed failure behavior; the
-production pipeline accepts the complete milestone-8 subset; no temporary
-milestone-7 string or output implementation remains; and external verification
-passes with native end-to-end assertions enabled.
+```text
+rustc --version
+SAO2_CC=cc cargo test
+```
+
+Confirm the complete suite passes, native formatting and failure cases ran,
+there are no unexpected host-compiler warnings, repeated emission is
+identical, and no generated `build/` artifact is included in the handoff.
+
+Only after that evidence succeeds, update `ROADMAP.md` to mark milestone 8
+complete and milestone 9 current, mark this document complete, and remove any
+remaining comments which describe the IR backend's implemented value support
+as temporary or incomplete.
+
+Exit criterion: the tuple and float presentation rules are explicit in
+`DESIGN.md`; every printable primitive, tuple, and union is accepted and emits
+the exact recursive text through one writer abstraction; explicit panic and
+all permitted Error payloads share that formatting while retaining their
+failure sites; stdout failures still become language panics and stderr failures
+cannot recurse; generated output remains deterministic; no temporary scalar
+output path or milestone-8 capability rejection remains; external verification
+passes without native skips; and the repository is handed off with milestone 9
+current.
 
 ## Completion criteria
 
