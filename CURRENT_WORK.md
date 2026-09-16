@@ -1,6 +1,6 @@
 # Current Work: Complete Core C Backend
 
-Status: in progress.
+Status: complete.
 
 This document expands milestone 7 of `ROADMAP.md`. The objective is to replace
 the temporary resolved-AST emitter with deterministic C11 generation from the

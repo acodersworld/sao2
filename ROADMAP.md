@@ -121,7 +121,7 @@ evaluation details.
 
 ## 7. Complete core C backend
 
-Status: current.
+Status: complete.
 
 - Replace the temporary direct C emitter with typed-IR-based generation.
 - Emit C declarations for primitive, tuple, union, and function types.
@@ -133,6 +133,8 @@ Status: current.
 Outcome: primitive-only SAO2 programs compile and run end to end.
 
 ## 8. Runtime value foundations
+
+Status: current.
 
 - Implement immutable ASCII string interning.
 - Implement tuple construction, copying, equality, and hashing.
