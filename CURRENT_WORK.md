@@ -142,44 +142,167 @@ backend.
 
 ## Stage 2: Scalar functions and explicit control flow
 
-Emit executable functions for unit, integer, float, boolean, and character
-values. Declare locals at function entry and zero-initialize them. Function
-parameters retain IR signature order, and every IR destination names explicit
-C storage.
+Extend the Stage-1 translation unit with scalar support helpers, temporary
+string-literal data, and function definitions. Preserve the existing generated
+comment, base-header order, helper types, aggregate declarations, and function
+prototypes. Add any required standard headers after the Stage-1 headers in a
+fixed order, including `<inttypes.h>`, `<stdio.h>`, `<stdlib.h>`, and
+`<string.h>`. Keep the Windows-only `<fcntl.h>` and `<io.h>` includes behind an
+`_WIN32` guard. Emit scalar helpers and string data before the function
+prototypes, then emit definitions in `FunctionId` order. Continue to use `\n`
+line endings and exactly one final newline.
 
-Emit constants from their exact IR values. Reconstruct binary64 constants from
-their recorded bits without violating C aliasing rules or depending on decimal
-formatting. Emit copies, local assignments, scalar unary and binary operations,
-numeric conversions, and direct calls.
+### Function storage and control flow
 
-Render every IR basic block as an identity-derived C label. Enter through an
-explicit jump to the function's IR entry block, and translate jumps, branches,
-returns, and unreachable terminators directly. Do not recover structured source
-control flow or depend on C expression evaluation order.
+Give every IR local explicit C storage named `sao2_local_<LocalId>`, independent
+of its source name or origin. At function entry, declare all locals in
+`LocalId` order and zero-initialize them with `{0}`. Keep C parameters in IR
+signature order using the Stage-1 `sao2_arg_<position>` names, then copy each
+argument into its parameter local in signature order. The reserved entry
+`[str]` parameter uses `sao2_args` for both its C parameter and its otherwise
+unused local. After the prologue, jump explicitly to the function's IR entry
+block.
 
-Implement signed bitwise operations and arithmetic right shift without relying
-on implementation-defined host behavior. Source operations which have explicit
-IR checks remain adjacent to their generated checked operation; Stage 3 supplies
-the permanent helper implementations before pipeline activation.
+Render blocks in `BlockId` table order and name their labels
+`sao2_block_<BlockId>`. Emit operations in stored order and end every block with
+its explicit terminator. Translate jumps to `goto`, branches to an `if` whose
+two arms jump to their identity-derived labels, and returns directly from the C
+function. Back edges, unreachable stored blocks, and a nonzero entry block need
+no special ordering. Do not recover loops, short-circuit expressions, or any
+other source-level structure.
 
-Preserve the existing output walking skeleton through a visibly temporary
-string-slice representation. It supports string literals and copies plus the
-currently exercised `print` and `println` forms for strings, integers, and
-booleans. Preserve Windows binary stdout handling. Check output calls for
-failure through their recorded IR failure sites rather than silently ignoring
-host I/O errors. Milestone 8 replaces this compatibility representation with
-interned strings and complete universal printing.
+An IR `Unreachable` terminator calls a declaration-only compiler-invariant hook
+and is followed by no ordinary control-flow edge. Explicit panic and Error panic
+terminators likewise call declaration-only failure hooks carrying their operand
+and `FailureSiteId`. Stage 3 defines all three paths and their diagnostics.
+Stage 4 retains ownership of union switches and other union-specific executable
+behavior.
+
+### Constants and operands
+
+Render operands only as constants or reads of unprojected local storage. Never
+nest emitted IR operations inside a C expression: calls, assignments, and
+operator statements consume already-materialized operands, so unspecified C
+operand or argument evaluation order cannot affect SAO2 behavior.
+
+Render scalar constants from their owned IR values:
+
+- Use `INT64_C` decimal forms for integers. Render negative values without
+  applying unary minus to an out-of-range positive literal, and spell
+  `i64::MIN` as `(-INT64_C(9223372036854775807) - INT64_C(1))`.
+- Reconstruct floats from their recorded `u64` bits through a small `memcpy`
+  helper. Do not use decimal formatting, pointer punning, or inactive union
+  members.
+- Use `true` and `false` for booleans, `UINT8_C` for characters, and an
+  all-zero `sao2_unit` compound value for unit.
+- Collect string bytes before rendering. Emit deterministic identity-derived
+  `static const unsigned char` backing arrays and construct `sao2_string`
+  values from a pointer and exact byte length. Give an empty string a one-byte
+  zero backing array but a logical length of zero. Source spelling and C string
+  escaping must not affect the representation.
+
+The temporary string slice is copied by value. Pooling identical literal byte
+sequences is permitted only by first occurrence in the deterministic IR scan;
+it must not introduce observable identity or become the permanent milestone-8
+interning design.
+
+### Scalar operations and calls
+
+Emit copies, unprojected local assignments, scalar unary and binary operations,
+numeric conversions, and direct calls. Every operation writes its recorded
+destination local. Direct calls use `sao2_fn_<FunctionId>`, preserve argument
+order, and assign the returned value before the next IR operation. This permits
+direct and mutual recursion through the Stage-1 prototypes.
+
+Use ordinary C operators only where their semantics match SAO2 after the
+adjacent IR checks have succeeded. Logical negation operates on `bool`; unary
+plus and checked negation operate on numeric values; arithmetic and comparisons
+operate on their validated scalar types. Unit equality and inequality render as
+constant boolean results. Int-to-float uses an explicit `double` conversion;
+float-to-int uses an explicit `int64_t` conversion only after its recorded
+range check.
+
+Do not depend on the C implementation's representation or shifts of signed
+negative integers. Add helpers that map an `int64_t` value to its mathematical
+two's-complement `uint64_t` bit pattern and back without out-of-range signed
+casts. Use those helpers for bitwise complement, AND, OR, XOR, and left shift.
+Implement arithmetic right shift with an unsigned logical shift plus explicit
+sign-bit fill, handling a zero shift count separately so no operation shifts by
+64. Stage 3 guarantees shift range and checked-left-shift preconditions before
+these operations execute.
+
+### Runtime-check bridge
+
+Preserve every explicit `RuntimeCheck` as a separate C statement at its exact
+IR position. Call a stable helper family named for the check, such as
+`sao2_check_integer_add`, with the already-materialized operands and a final
+`size_t` failure-site index. A precondition check remains immediately before
+its checked operation; a finite-result check remains immediately after the
+float operation and names its destination local.
+
+Stage 2 emits declarations for these check helpers but deliberately does not
+define them. Stage 3 supplies their portable semantics and failure reporting.
+Consequently, Stage-2 native verification may compile and execute only IR
+fixtures which contain no `RuntimeCheck`; check-bearing functions receive exact
+C rendering tests but are not linked or executed during this stage. Do not add
+temporary checks which reject valid arithmetic, and do not move Stage-3
+arithmetic or diagnostic behavior into this stage.
+
+### Temporary output compatibility
+
+Preserve the output walking skeleton for `print` and `println` with strings,
+integers, booleans, and zero-argument `println`. Write string slices with
+`fwrite`, integers with `PRId64`, booleans from fixed `true` and `false` byte
+sequences, and newlines as a separate checked byte. Embedded zero bytes remain
+ordinary string data. Assign the intrinsic's unit destination only after all
+requested output succeeds.
+
+Before an output attempt on Windows, ensure stdout is in binary mode with
+`_setmode(_fileno(stdout), _O_BINARY)`. Treat setup failure, a short `fwrite`, a
+negative formatted write, or `EOF` from newline output as failure at the
+intrinsic's recorded `FailureSiteId`. Route these cases through a visibly
+temporary nonzero-terminating output-failure helper which accepts and retains
+the site index; Stage 3 replaces its body with the permanent source-attributed
+panic path. Do not silently return from the current SAO2 function or translate
+an output failure into one of its ordinary result values.
+
+Float, character, unit, tuple, and union printing remain capability errors in
+this stage. Milestone 8 replaces the temporary string representation and output
+subset with interned strings and universal printing.
 
 ### Tests and completion
 
-Add direct emitter tests for every scalar constant, local origin, copy,
-assignment, unary and binary operation, conversion, direct and mutual call,
-block order, branch, return, and unreachable path. Compile and execute generated
-C only during the required external verification, not during implementation.
+Construct IR directly and add exact-C coverage for:
 
-Exit criterion: direct IR tests can render complete scalar functions and CFGs,
-including recursion and the existing output subset, while the production
-compiler still uses the old emitter.
+- every scalar constant, including signed minimum, positive and negative zero
+  float bits, empty strings, embedded zero bytes, and character boundaries;
+- parameter, binding, and temporary locals; zero initialization; parameter
+  copying; and source-independent local names;
+- copies, assignments, every supported unary and binary operation, both numeric
+  conversions, and unit comparisons;
+- zero- and multi-argument calls, returned values, direct recursion, and mutual
+  recursion;
+- a nonzero entry block, stored block order, forward and backward jumps,
+  diamonds, dead blocks, branches, returns, and unreachable terminators;
+- every runtime-check declaration and call at the required side of its checked
+  operation, without executing the placeholder;
+- string, integer, boolean, and empty-line output, with and without newlines,
+  plus exact failure-site propagation and Windows guards; and
+- byte-for-byte equality across repeated rendering, one final newline, and the
+  absence of source names in generated identifiers.
+
+Contributor guidance continues to prohibit compiling or executing generated C
+during implementation. During the required external verification, compile and
+run only check-free Stage-2 fixtures by appending a test-only C harness which
+calls the generated `sao2_fn_<FunctionId>` entry. Exercise scalar calls, CFGs,
+recursion, and the temporary output subset through that harness. The backend
+does not emit a host `main` adapter until Stage 4.
+
+Exit criterion: direct IR tests render complete scalar functions and literal
+CFGs deterministically; check-free generated functions execute through the
+external harness; check sites are preserved for Stage 3 without provisional
+semantics; and the production compiler remains on the working temporary
+resolved-AST emitter.
 
 ## Stage 3: Checked arithmetic and runtime failures
 
