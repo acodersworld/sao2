@@ -488,47 +488,186 @@ declaration-only scalar and failure hook introduced by Stage 2.
 
 ## Stage 4: Core unions and entry adapters
 
-Emit union injection by zero-initializing the destination, assigning its payload,
-and then publishing its one-based tag. Emit union copies, parameters, results,
-tests, payload extraction, exhaustive switches, and Error propagation for
-recursively supported scalar unions. Distinct alternatives may share a target
-block, and anonymous and nominal unions retain separate generated identities.
+Extend executable value support to recursively supported scalar unions. A
+supported union alternative may contain unit, `int`, `float`, the temporary
+string slice, `bool`, `char`, or another recursively supported named or
+anonymous union. Do not treat tuples, structs, lists, or maps as supported union
+payloads in this stage. Union declarations and function signatures may retain
+the broader Stage-1 layout groundwork, but an executable union operation whose
+reachable payload graph leaves this subset is a deterministic capability
+error.
 
-Tuple declarations remain available for ABI and dependency groundwork, but
-tuple construction, projection, equality, hashing, and printing remain
-milestone-8 operations. A tuple operation reaching this backend is a
-deterministic capability error.
+### Union values and operations
 
-Generate all four validated entry adapter shapes:
+Enable `UnionInject`, `UnionTest`, `UnionPayload`, and union `Switch` during
+capability validation. Preserve their function, block, operation, or terminator
+context on failure. Continue to reject tuple construction and projection,
+tuple equality, hashing, and printing, and every struct or container operation.
+Union equality, hashing, and printing also remain later runtime work.
+
+Emit injection in this exact order:
+
+1. assign an all-zero value to the complete destination union;
+2. assign the payload to `payload.alternative_<AlternativeId>`; and
+3. assign the alternative's one-based physical tag to `tag`.
+
+The tag write publishes the active payload only after its storage is valid.
+Zero remains the reserved inactive representation and is never emitted as a
+language alternative. Derive field names and physical tags only from IR
+identities; tagged and untagged source spelling has no effect on generated C.
+
+Copy unions with ordinary by-value C assignment. The existing generic local,
+parameter, result, assignment, direct-call, and recursive-call paths must retain
+the complete tag and payload representation without type-specific copying.
+Nested unions remain nested C values with independent discriminants and are
+never flattened or renumbered relative to their own `AlternativeId` tables.
+
+Emit a union test as a comparison between the materialized union tag and the
+selected alternative's one-based tag. Before extracting a payload, compare the
+active tag with the requested alternative. A mismatch enters the Stage-3
+compiler-invariant path before generated C reads an inactive union member; do
+not rely solely on source-flow assumptions to avoid undefined C behavior.
+
+Render an IR union switch as a C `switch` over the materialized tag. Emit one
+`case` per alternative in `AlternativeId` order, with each case jumping directly
+to its recorded `BlockId`. Multiple cases may jump to the same target. Emit no
+fallthrough and no source-derived structure. Tag zero and every unknown tag use
+`default` to enter the compiler-invariant path. The IR validator remains
+responsible for exhaustive alternative coverage; the generated default handles
+corrupt runtime state rather than a source-level `else` arm.
+
+Postfix `?` requires no backend-specific reconstruction. Execute its lowered IR
+literally: switch on the source union, extract the selected payload, return a
+single success payload directly, reinject multiple success alternatives into
+their result union, or reinject `Error` into the enclosing function's result
+union before returning. Source and destination unions use their own physical
+tags, so Error propagation must assign the destination `AlternativeId` rather
+than copying the source tag. In `main`, retain Stage 3's supported
+`ErrorPanic` path. Float and string Error payloads may propagate through
+ordinary unions but remain capability errors when an `ErrorPanic` would need to
+format them.
+
+Tuple declarations and signatures remain available for ABI and dependency
+groundwork. Any actual tuple construction, projection, comparison, hashing, or
+printing remains a deterministic capability error until milestone 8.
+
+### Host entry adapters
+
+After all SAO2 function definitions, emit exactly one host entry adapter for
+the IR function named by `Program::entry`. Select one of the four semantically
+validated shapes:
 
 1. no arguments and unit result;
 2. no arguments and integer result;
 3. `[str]` arguments and unit result; and
 4. `[str]` arguments and integer result.
 
-The no-argument adapters call the IR entry function, translate unit to exit
-status zero, and translate an integer result to the host process exit status.
+Use `int main(void)` for the two no-argument shapes and `int main(int argc,
+char **argv)` for the two borrowed-argument shapes. Call
+`sao2_fn_<Program::entry>` exactly once. For a unit result, discard the returned
+`sao2_unit` explicitly and return `EXIT_SUCCESS`.
 
-For `main(args [str])`, validate every byte of `argv[1..]` as ASCII before
-entering SAO2 code. Pass a clearly marked temporary borrowed-argv value to the
-entry function. Permit this adapter only when the IR does not inspect, copy,
-return, pass onward, index, or iterate the `args` parameter. Actual `[str]`
-behavior waits for the permanent string and container runtimes; using the
-parameter before then is a backend capability error. A non-ASCII argument
-panics before entering SAO2 code with a stable adapter-specific diagnostic that
-does not invent a source location.
+For an integer result, retain it as `int64_t` until it has been checked against
+`INT_MIN..=INT_MAX`. Include `<limits.h>` in the fixed standard-header order.
+Only then cast to C `int` and return it. If the result is outside the host
+`int` range, best-effort write this exact diagnostic to `stderr` and terminate
+with `exit(EXIT_FAILURE)`:
+
+```text
+sao2: panic: main returned an exit status outside the host int range
+```
+
+This is an adapter failure rather than a source operation, so do not invent a
+failure site, filename, function, line, or column. The eventual operating
+system remains responsible for any platform-specific interpretation of a
+representable C `int` returned from `main`.
+
+For `main(args [str])`, scan every byte of `argv[1]` through
+`argv[argc - 1]` as `unsigned char` before entering SAO2 code. Empty arguments
+are valid; reject the first byte greater than 127. Count arguments from zero in
+SAO2 space, excluding the executable name. On failure, best-effort write this
+exact adapter diagnostic with the decimal index and terminate through
+`exit(EXIT_FAILURE)`:
+
+```text
+sao2: panic: command-line argument <index> is not ASCII
+```
+
+Do not print the invalid argument bytes. Like exit-status failure, this path has
+no source location because the SAO2 entry function has not begun.
+
+After successful validation, construct the visibly temporary borrowed view as
+`sao2_args`. Set `count` to `argc > 0 ? argc - 1 : 0` and `values` to
+`argc > 0 ? argv + 1 : argv`. This preserves user-argument order, excludes the
+executable name, and handles a conforming hosted implementation which supplies
+zero arguments. Pass the view by value to the generated SAO2 entry function.
+
+Capability validation permits the adapter and generated function prologue to
+copy this parameter into its reserved local, but rejects any IR operation or
+terminator which otherwise reads, copies, returns, forwards as a call argument,
+indexes, projects, or iterates that local. Scan nested operands and places, not
+only top-level operation variants, so no route exposes borrowed `argv` as a
+language list. General `[str]` behavior waits for the permanent string and
+container runtimes.
+
+Factor the two adapter panics through a small non-returning helper for raw
+pre-entry diagnostics. Keep it separate from Stage 3's source-attributed
+failure table, ignore secondary `stderr` failures, and always terminate
+nonzero. Existing Windows binary stdout handling remains owned by the output
+path and is not duplicated in the entry adapter.
 
 ### Tests and completion
 
-Add deterministic rendering and native execution tests for scalar union
-construction, testing, switches, propagation, nested supported unions, shared
-switch targets, and union-valued calls. Add all four adapter shapes, integer
-exit results, ASCII argument ordering, non-ASCII rejection, and deterministic
-rejection of actual `args` use.
+Construct IR directly and add exact-C and native execution coverage for:
 
-Exit criterion: supported scalar unions execute through physical C tags and
-payloads without exposing layout to IR, and every validated entry signature has
-a generated adapter without prematurely implementing lists or interned strings.
+- named and anonymous unions, tagged alternatives with identical payload C
+  types, every supported scalar payload, and nested named and anonymous unions;
+- injection zeroing, payload-before-tag ordering, union copies, parameters,
+  results, assignments, direct calls, and recursive calls;
+- positive and negative union tests, guarded payload extraction, inactive or
+  unknown tags entering the invariant path, and source-independent identities;
+- switches in `AlternativeId` order, distinct and shared targets, nested
+  switches, no fallthrough, and the defensive default case;
+- postfix `?` with one success alternative, multiple success alternatives,
+  success reinjection, Error propagation between differently ordered unions,
+  and supported Error panic payloads in `main`;
+- deterministic rejection of unions with reachable tuple, struct, or container
+  payload operations, plus continued rejection of union printing and
+  unsupported Error panic formatting;
+- all four entry adapter shapes, exactly one call to the selected IR entry,
+  unit success, and integer results at `INT_MIN`, `INT_MAX`, zero, positive, and
+  negative representable values;
+- both out-of-range integer-result directions with the exact adapter diagnostic;
+- zero, one, and multiple ASCII arguments, empty arguments, order-preserving
+  borrowed-view construction, and exclusion of the executable name;
+- non-ASCII rejection at the first invalid byte with the correct zero-based
+  SAO2 argument index and exact diagnostic bytes; and
+- deterministic capability errors for every direct and nested use of the
+  reserved `args` local.
+
+Use exact-C assertions to prove borrowed argument ordering because accepted
+SAO2 code cannot inspect the temporary view. Native tests may prove that valid
+ASCII arguments reach an otherwise args-ignoring entry function and that
+invalid arguments fail before it runs. Account for platform limitations when
+constructing a non-ASCII native `argv`, while retaining unconditional renderer
+and helper tests.
+
+Assert byte-for-byte repeated rendering, one final newline, backend-private tag
+numbers, exact pre-entry `stderr`, and nonzero failure statuses without relying
+on one particular numeric failure code. Generated Stage-4 C now contains its
+own host `main`, so native tests no longer append the Stage-2 harness.
+
+Contributor guidance continues to prohibit compilation, execution, and
+formatting during implementation. Native cases run only in the required
+external verification, and the production compiler remains on the temporary
+resolved-AST emitter until Stage 5.
+
+Exit criterion: recursively supported scalar unions execute through guarded
+physical tags and payloads without exposing layout to IR; Error propagation
+remaps alternatives correctly; every validated entry signature has exactly one
+executable adapter; invalid host inputs fail through stable pre-entry
+diagnostics; and the backend still does not implement lists, permanent strings,
+or tuple value behavior.
 
 ## Stage 5: Pipeline replacement and handoff
 
