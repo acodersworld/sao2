@@ -1,6 +1,6 @@
 # Current Work: Runtime Value Foundations
 
-Status: current.
+Status: complete.
 
 This document gives a high-level view of milestone 8 of `ROADMAP.md`. The
 milestone replaces the remaining temporary string and output support with the
@@ -590,7 +590,7 @@ representation change was required.
 
 ## Stage 3: Complete formatting and handoff
 
-Status: current.
+Status: complete.
 
 Replace the remaining type-specific output statements with one generated,
 type-directed formatting layer. It must serve `print`, `println`, explicit

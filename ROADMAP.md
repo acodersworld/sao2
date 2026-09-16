@@ -134,7 +134,7 @@ Outcome: primitive-only SAO2 programs compile and run end to end.
 
 ## 8. Runtime value foundations
 
-Status: current.
+Status: complete.
 
 - Implement immutable ASCII string interning.
 - Implement tuple construction, copying, equality, and hashing.
@@ -144,6 +144,8 @@ Outcome: primitive, string, and tuple programs have complete runtime behavior
 and observable output.
 
 ## 9. Struct layout and escape analysis
+
+Status: current.
 
 - Generate layouts for inline and referenced struct members.
 - Define the 8-byte packed `owner_ptr` and `member_ptr` reference-struct ABI.
