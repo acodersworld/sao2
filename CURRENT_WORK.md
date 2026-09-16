@@ -62,7 +62,7 @@ frames, or collection triggers.
 
 ## Stage 1: Packed-reference and arena prototype
 
-Status: current.
+Status: complete.
 
 Build the arena runtime as an isolated generated-C layer before struct layout
 or construction depends on it. Stage 1 fixes the representation, operating-
@@ -336,28 +336,252 @@ and source-level structs remain an explicit later-stage capability boundary.
 
 ## Stage 2: Physical struct layouts and allocation metadata
 
-Status: planned.
+Status: current.
 
-Teach the C backend to plan physical layouts for every executable struct:
+Plan and emit the physical representation of every struct before enabling any
+source-level struct operation. Stage 2 owns layout facts, generated body types,
+layout descriptors, and the IR failure-site handoff needed by Stage 3. It does
+not allocate a struct, resolve a struct reference, project a member, copy an
+inline object, or weaken the capability boundary around those operations.
 
-- a language struct value is the packed reference, while a private generated C
-  body type contains the actual fields;
-- primitive, string, tuple, union, and inline-struct fields occupy inline
-  storage according to their existing value representations;
-- referenced-struct fields store packed references;
-- each inline struct embeds its body at a stable member offset within the
-  enclosing allocation; and
-- layout planning uses checked sizes, alignments, and offsets and diagnoses
-  impossible or cyclic inline layouts before rendering.
+An otherwise executable program may contain unused struct definitions after
+this stage. Struct construction, struct-typed function storage, and struct
+projections remain explicit capability errors. This lets the generated C and
+its layout assertions exercise the new declarations without accidentally
+making a partial struct implementation observable.
 
-Assign deterministic layout identities and emit the metadata needed to locate
-and describe an owner allocation. Preserve DefinitionId and FieldId ordering
-rather than deriving layout order from unordered collections.
+### Representation boundary
 
-Add a source-attributed allocation failure site for struct construction if the
-existing failure-operation representation cannot express it. Arena reservation
-or platform setup failures remain compiler/runtime environment failures before
-entry; capacity exhaustion caused by a source allocation is a program panic.
+Keep the language value and allocation body as separate C types:
+
+- every value whose SAO2 type is a struct has C type `sao2_ref`, including
+  locals, parameters, results, tuple fields, union payloads, and referenced
+  struct fields;
+- every struct definition has a private body type named only from its
+  `DefinitionId`, for example `sao2_body_def_3`;
+- a direct struct field whose `MemberStorage` is `Inline` uses the selected
+  struct's private body type instead of `sao2_ref`;
+- a direct struct field whose storage is `Referenced` uses `sao2_ref`; and
+- all other body fields use the backend's existing physical value
+  representation. Tuples and unions remain inline C aggregates and strings
+  remain interned-string pointers.
+
+Do not put an owner offset, mark, layout identity, or allocation header in a
+body type. An inline body is the same type whether it is the root body or is
+embedded at a nonzero offset. The root's heap header remains immediately before
+the complete owner body, as established in Stage 1.
+
+Continue using the backend's one-byte C carrier for `sao2_unit`. Its physical
+space is an implementation detail and does not change the language's single,
+zero-information unit value. All body sizes and offsets describe actual bytes
+used by generated C, including that carrier and ordinary C padding.
+
+Use two namespaces in layout planning: value aggregates for tuples and unions,
+and struct bodies for struct definitions. A nominal struct encountered in an
+ordinary value aggregate is a `sao2_ref` and is therefore not a body-layout
+dependency. An inline struct field is a body-layout dependency. Referenced
+struct fields deliberately break that dependency. This distinction must be
+centralized rather than inferred separately by declaration rendering,
+metadata rendering, and later field access.
+
+### Compiler-side layout plan
+
+Extend the existing `LayoutPlanner` into the single owner of physical layout
+facts. Its result should contain an ordered aggregate-emission plan plus one
+`StructLayout` per struct definition. The exact Rust spelling may vary, but the
+plan must make these facts explicit:
+
+- struct `DefinitionId` and layout identity;
+- physical body size and alignment;
+- fields in `FieldId` order; and
+- for each field, its `FieldId`, `TypeId`, `MemberStorage`, byte offset,
+  physical size and alignment, and any inline struct layout identity.
+
+Compute sizes and alignments recursively with checked integer operations.
+Align an offset using checked remainder arithmetic, add each field size with a
+checked addition, and round the final body size up to the maximum field
+alignment the same way. Reject a zero alignment, an offset or size that cannot
+be represented by the arena ABI, and any calculation overflow. Do not rely on
+wrapping Rust arithmetic or on a host C compiler silently choosing a layout
+which the compiler did not plan.
+
+The currently supported generated-C ABI has these physical carriers:
+
+- `sao2_unit`, `bool`, and `uint8_t` have size one and alignment one;
+- `int64_t` and `double` have size eight and alignment eight;
+- `sao2_string` is a native pointer with size eight and alignment eight;
+- `sao2_ref` is eight bytes with `uint32_t` alignment; and
+- tuple and union size and alignment are computed from their recursively
+  planned fields, including the union's `uint32_t` discriminant and aligned C
+  union payload.
+
+Emit `_Static_assert` checks for the scalar carrier assumptions. For every
+tuple, union, and struct body, also assert its planned `sizeof`, `_Alignof`, and
+each materialized field's `offsetof`. These checks are a target-ABI guard, not
+a substitute for compiler-side planning. Keep forward declarations separate
+from complete definitions so dependency order is deterministic.
+
+Semantic analysis remains responsible for the source diagnostic for an
+infinitely recursive tuple or inline-struct definition. The backend must still
+detect a by-value cycle in directly constructed or corrupted IR and report a
+`BackendInvariant` before rendering. A layout which is acyclic but cannot fit
+the packed-offset ABI is a target representability error associated with its
+`DefinitionId`, also reported before any C is returned.
+
+### Deterministic identities and descriptors
+
+Assign every struct definition the 64-bit layout identity obtained by a checked
+widening of `DefinitionId.index()`. Zero is therefore a valid identity for the
+first definition; validity comes from the allocation header and descriptor,
+not from a sentinel identity value. Do not hash source names or depend on
+traversal order, pointer identity, or an unordered collection. Fields and
+descriptors use `DefinitionId`, `FieldId`, and `TypeId` order throughout.
+
+Emit one immutable descriptor for every struct body. It records the layout
+identity, body size, body alignment, and an ordered field table. Each field
+entry records its byte offset, physical size, storage class, and the identity
+of an inline or referenced struct layout when applicable. Use explicit numeric
+storage-kind constants; do not encode meaning in generated symbol names.
+
+Descriptors are compiler-owned metadata and are not exposed to SAO2 programs.
+Stage 3 passes the root descriptor's identity to `sao2_heap_allocate`, which
+stores it in the existing heap header. Stage 4 uses the same planned offsets
+for projections. Milestone 10 may extend or pair the descriptors with tracing
+callbacks, but must not renumber existing layout identities or reinterpret the
+recorded field offsets.
+
+Fields containing tuples or unions retain their `TypeId` in the compiler-side
+plan so later tracing can recurse through their value representation. Stage 2
+does not add collector traversal, shadow frames, marking, or a generic runtime
+descriptor interpreter merely to consume this information.
+
+### Allocation-failure IR handoff
+
+Add `FailureOperation::StructAllocation` now so every struct construction has
+the source location needed when Stage 3 begins allocating. Extend the struct
+aggregate operation to carry a required `FailureSiteId`; tuple, list, and map
+aggregates remain unchanged. Lowering interns the site at the complete struct
+constructor expression, after preserving the current left-to-right argument
+evaluation and `FieldId` sorting behavior.
+
+IR validation must require that site to name `StructAllocation`, and IR text
+rendering must include it so snapshots expose the association. Add the new
+operation to the generated failure-operation constants and diagnostic-name
+mapping, but emit no allocation call or panic path in Stage 2. The capability
+validator continues to reject the struct aggregate before operation rendering.
+
+Arena reservation, initial commitment, and runtime initialization failures
+remain pre-entry environment failures with no source site. Once Stage 3 calls
+the allocator, logical exhaustion or commitment failure at a constructor uses
+its `StructAllocation` site and is a program panic. Invalid allocator input
+remains a compiler/runtime invariant.
+
+### Backend integration
+
+Refactor the current blanket `struct definitions` rejection into narrower
+capability checks:
+
+- accept and plan struct definitions and their legal field representations;
+- continue rejecting a struct type used in a function signature or local until
+  Stage 3 enables packed-reference value flow;
+- continue rejecting struct aggregate operations until Stage 3; and
+- continue rejecting every struct projection or projected assignment until
+  Stage 4.
+
+Run capability validation and layout planning in an order which permits unused
+struct definitions to be emitted but guarantees that no unsupported operation
+reaches `Renderer`. Planning must finish before rendering starts. A failure in
+either step returns no partial C text.
+
+Extend `Renderer` to receive the completed immutable layout plan. Emit in this
+order:
+
+1. existing feature macros, headers, fixed value types, and ABI assertions;
+2. forward declarations for tuple and union value aggregates and private
+   struct bodies;
+3. complete aggregate and body definitions in dependency order, followed by
+   their size, alignment, and offset assertions;
+4. immutable struct layout and field descriptors;
+5. existing failure metadata, writer, scalar, string, tuple, formatting, and
+   arena-runtime sections; and
+6. generated functions and the host adapter last.
+
+Make `c_type` return `sao2_ref` for a nominal struct. Add a separate helper for
+body-field storage which consults `MemberStorage` and the layout plan; do not
+teach general value-type rendering to return a body type. Generated names stay
+identity-only and must never contain source identifiers.
+
+Do not change the Stage 1 arena algorithms or header format in this stage. The
+prototype header already has the required 64-bit layout-identity field. Do not
+add a second header, a side lookup from member address to owner, or allocation
+policy to a descriptor.
+
+### Implementation sequence
+
+Implement Stage 2 in the following order:
+
+1. Add `StructAllocation` and the required struct-aggregate failure site across
+   lowering, IR validation and rendering, and failure metadata. Keep backend
+   execution of the aggregate rejected.
+2. Separate value-aggregate and struct-body identities in `LayoutPlanner`, add
+   struct roots, and encode inline-versus-referenced dependency edges.
+3. Add checked size, alignment, offset, and deterministic layout-identity
+   planning. Preserve the existing recursive-aggregate invariant behavior.
+4. Split general value C types from struct-body field C types. Emit forward
+   declarations, complete private bodies, and compile-time layout assertions.
+5. Emit deterministic layout and field descriptors from the same plan; do not
+   recalculate offsets in the renderer.
+6. Narrow `CapabilityValidator` so unused definitions pass while struct value
+   flow, aggregates, and projections retain their intended stage boundaries.
+7. Add direct backend and lowering coverage, update exact generated-C
+   assertions, and remove any duplicate dependency or offset calculations.
+
+### Tests and completion
+
+Direct Rust tests should verify:
+
+- every struct language value maps to `sao2_ref`, while only an inline struct
+  field maps to a private body type;
+- mixed primitive, string, tuple, union, inline-struct, and referenced-struct
+  fields receive the expected checked offsets, size, alignment, and `offsetof`
+  assertions;
+- nested inline bodies are emitted before their owners and referenced cycles do
+  not create body-definition cycles;
+- direct and indirect inline cycles in constructed IR fail before rendering,
+  while the existing frontend source diagnostic remains unchanged;
+- near-limit alignment and size arithmetic reports deterministic overflow or
+  packed-offset representability errors rather than wrapping;
+- layout identities are stable by `DefinitionId` and unchanged by source names
+  or dependency traversal order;
+- descriptor field order follows `FieldId`, including when constructor source
+  arguments appear in a different order;
+- a struct aggregate has exactly one `StructAllocation` failure site at the
+  constructor span, and malformed or mismatched sites fail IR validation;
+- unused struct declarations can pass capability validation and produce
+  deterministic C, while struct locals, signatures, construction, and
+  projections still produce their precise capability errors;
+- the Stage 1 header and allocator ABI are byte-for-byte unchanged apart from
+  the new generated descriptors and failure-operation table entry; and
+- no allocation call, member resolver, copy helper, escape fact, collector
+  operation, dependency, or source-level placement control is introduced.
+
+Native verification should compile generated C containing unused layouts whose
+fields exercise every supported representation. The generated static
+assertions must pass on both supported platform families. Existing executable
+programs must retain their output and exit behavior, and a struct constructor
+must still stop at the backend capability boundary rather than emit partial C.
+
+Contributor guidance prohibits compiling, running tests, or formatting during
+implementation. External verification should use Rust 1.90 or newer, report
+whether native C assertions were skipped, and leave generated artifacts under
+`build/` only.
+
+Stage 2 is complete when all validated struct definitions have deterministic,
+checked body layouts and descriptors; generated C independently asserts every
+planned carrier, aggregate, body, and field offset; constructor failure sites
+are present in IR; unused layouts compile without enabling struct execution;
+all executable struct operations remain at their named later-stage capability
+boundaries; and Stage 1 reference and arena behavior is unchanged.
 
 ## Stage 3: Conservative struct construction and value flow
 
