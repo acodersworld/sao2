@@ -282,7 +282,7 @@ pub(crate) enum NumericConversion { IntToFloat, FloatToInt }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Aggregate {
-    Struct { definition: DefinitionId, fields: Vec<(FieldId, Operand)> },
+    Struct { definition: DefinitionId, fields: Vec<(FieldId, Operand)>, failure: FailureSiteId },
     Tuple { definition: DefinitionId, elements: Vec<Operand> },
     List { ty: TypeId, elements: Vec<Operand> },
     Map { ty: TypeId, entries: Vec<(Operand, Operand)> },
@@ -305,7 +305,7 @@ pub(crate) enum FailureOperation {
     IntegerDivision, IntegerRemainder, ShiftLeft, ShiftRight,
     FloatAdd, FloatSubtract, FloatMultiply, FloatDivision, FloatToInt,
     ListIndex, MapIndex, StringIndex, ListAppend, ListRemoveIndex,
-    MapRemoveKey, Output, ExplicitPanic, UnhandledError,
+    MapRemoveKey, StructAllocation, Output, ExplicitPanic, UnhandledError,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -582,7 +582,7 @@ impl Renderer<'_, '_> {
 
     fn aggregate(&self, aggregate: &Aggregate) -> String {
         match aggregate {
-            Aggregate::Struct { definition, fields } => format!("struct {definition} {{{}}}", fields.iter().map(|(field, operand)| format!("{field}: {}", self.operand(operand))).collect::<Vec<_>>().join(", ")),
+            Aggregate::Struct { definition, fields, failure } => format!("struct {definition} {{{}}} ! {failure}", fields.iter().map(|(field, operand)| format!("{field}: {}", self.operand(operand))).collect::<Vec<_>>().join(", ")),
             Aggregate::Tuple { definition, elements } => format!("tuple {definition}({})", self.operands(elements)),
             Aggregate::List { ty, elements } => format!("list {ty}[{}]", self.operands(elements)),
             Aggregate::Map { ty, entries } => format!("map {ty} {{{}}}", entries.iter().map(|(key, value)| format!("{}: {}", self.operand(key), self.operand(value))).collect::<Vec<_>>().join(", ")),
@@ -687,7 +687,7 @@ fn escape_bytes(bytes: &[u8]) -> String {
     FailureOperation::FloatToInt => "float-to-int", FailureOperation::ListIndex => "list-index",
     FailureOperation::MapIndex => "map-index", FailureOperation::StringIndex => "string-index",
     FailureOperation::ListAppend => "list-append", FailureOperation::ListRemoveIndex => "list-remove-index",
-    FailureOperation::MapRemoveKey => "map-remove-key", FailureOperation::Output => "output",
+    FailureOperation::MapRemoveKey => "map-remove-key", FailureOperation::StructAllocation => "struct-allocation", FailureOperation::Output => "output",
     FailureOperation::ExplicitPanic => "explicit-panic", FailureOperation::UnhandledError => "unhandled-error",
 } }
 fn runtime_check_failure(check: &RuntimeCheck) -> FailureSiteId { match check {
@@ -823,6 +823,7 @@ mod tests {
         let list_index_failure = site(&mut program, FailureOperation::ListIndex);
         let map_index_failure = site(&mut program, FailureOperation::MapIndex);
         let string_index_failure = site(&mut program, FailureOperation::StringIndex);
+        let struct_allocation_failure = site(&mut program, FailureOperation::StructAllocation);
         let output_failure = site(&mut program, FailureOperation::Output);
         let append_failure = site(&mut program, FailureOperation::ListAppend);
         let remove_failure = site(&mut program, FailureOperation::MapRemoveKey);
@@ -853,7 +854,7 @@ mod tests {
         entry.push(OperationKind::Aggregate { destination: point_local, aggregate: Aggregate::Struct { definition: point_definition, fields: vec![
             (point_x, Operand::Copy(Place::local(input))),
             (point_name, constant(types.string, ConstantValue::String(b"p\n\0".to_vec()))),
-        ] } }, location);
+        ], failure: struct_allocation_failure } }, location);
         entry.push(OperationKind::Aggregate { destination: pair_local, aggregate: Aggregate::Tuple { definition: pair_definition, elements: vec![
             Operand::Copy(Place::local(input)), constant(types.float, ConstantValue::Float(0)),
         ] } }, location);
@@ -1515,7 +1516,8 @@ impl<'a> Validator<'a> {
 
     fn validate_aggregate(&self, function: &Function, aggregate: &Aggregate) -> Result<TypeId, ValidationError> {
         match aggregate {
-            Aggregate::Struct { definition, fields } => {
+            Aggregate::Struct { definition, fields, failure } => {
+                self.failure_site(*failure, FailureOperation::StructAllocation)?;
                 let DefinitionLayout::Struct(layout) = &self.definition(*definition)?.layout else { return Err(self.error("struct aggregate names a non-struct definition")); };
                 if fields.len() != layout.len() { return Err(self.error("struct aggregate is incomplete")); }
                 let mut seen = HashSet::new();

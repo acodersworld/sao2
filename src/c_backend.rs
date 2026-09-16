@@ -7,7 +7,7 @@ use std::fmt::{self, Write as _};
 
 use crate::ir::{
     self, AlternativeConstructor, BinaryOperator, ConstantValue, DefinitionId, DefinitionLayout, FailureOperation,
-    FailureSiteId, Function, FunctionId, IntegerOperation, Intrinsic, LocalId,
+    FailureSiteId, Function, FunctionId, IntegerOperation, Intrinsic, LocalId, MemberStorage,
     NumericConversion, OperationKind, OperationSite, Operand, Place, PrimitiveType, Projection,
     RuntimeCheck, TerminatorKind, Type, TypeId, UnaryOperator, ValidationError,
 };
@@ -15,8 +15,8 @@ use crate::ir::{
 pub(crate) fn emit(program: &ir::Program) -> Result<String, CEmissionError> {
     program.validate().map_err(CEmissionError::InvalidIr)?;
     CapabilityValidator::new(program).validate()?;
-    let definitions = LayoutPlanner::new(program).plan()?;
-    Ok(Renderer::new(program, definitions).render())
+    let layouts = LayoutPlanner::new(program).plan()?;
+    Ok(Renderer::new(program, layouts).render())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,7 +116,9 @@ impl<'a> CapabilityValidator<'a> {
             let id = DefinitionId::from_index(index);
             self.definition = Some(id);
             match &definition.layout {
-                DefinitionLayout::Struct(_) => return self.unsupported("struct definitions"),
+                DefinitionLayout::Struct(fields) => for field in fields {
+                    self.struct_field_type(field.ty, field.storage, "struct field")?;
+                },
                 DefinitionLayout::Tuple(fields) => for field in fields {
                     self.storage_type(*field, "tuple field")?;
                 },
@@ -236,6 +238,7 @@ impl<'a> CapabilityValidator<'a> {
                 self.executable_union_use(self.operand_type(function, value))
             }
             OperationKind::Aggregate { aggregate: ir::Aggregate::Tuple { .. }, .. } => Ok(()),
+            OperationKind::Aggregate { aggregate: ir::Aggregate::Struct { .. }, .. } => self.unsupported("struct aggregate construction"),
             OperationKind::Aggregate { .. } => self.unsupported("aggregate construction"),
             OperationKind::StringIndex { .. } => Ok(()),
             OperationKind::Intrinsic { intrinsic, arguments, .. } => match intrinsic {
@@ -287,6 +290,14 @@ impl<'a> CapabilityValidator<'a> {
             Type::Union(_) => Ok(()),
             Type::List(_) | Type::Map { .. } => self.unsupported(format!("{description} uses container storage")),
         }
+    }
+
+    fn struct_field_type(&self, ty: TypeId, storage: MemberStorage, description: &str) -> Result<(), CEmissionError> {
+        if matches!(&self.program.types[ty.index()], Type::Nominal(definition)
+            if matches!(self.program.definitions[definition.index()].layout, DefinitionLayout::Struct(_)))
+        { return Ok(()); }
+        let _ = storage;
+        self.storage_type(ty, description)
     }
 
     fn signature_type(&self, ty: TypeId, entry_args: bool, description: &str) -> Result<(), CEmissionError> {
@@ -470,10 +481,19 @@ impl<'a> CapabilityValidator<'a> {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum AggregateId { Definition(DefinitionId), AnonymousUnion(TypeId) }
 
+#[derive(Clone, Debug)]
+struct FieldLayout { id: ir::FieldId, ty: TypeId, storage: ir::MemberStorage, offset: u64, size: u64, align: u64, nested_layout: Option<u64> }
+#[derive(Clone, Debug)]
+struct StructLayout { definition: DefinitionId, identity: u64, size: u64, align: u64, fields: Vec<FieldLayout> }
+#[derive(Clone, Debug)]
+struct LayoutPlan { aggregates: Vec<AggregateId>, structs: Vec<StructLayout> }
+
 struct LayoutPlanner<'a> {
     program: &'a ir::Program,
     states: Vec<(AggregateId, VisitState)>,
     ordered: Vec<AggregateId>,
+    struct_states: Vec<(DefinitionId, VisitState)>,
+    structs: Vec<StructLayout>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -481,10 +501,10 @@ enum VisitState { Visiting, Complete }
 
 impl<'a> LayoutPlanner<'a> {
     fn new(program: &'a ir::Program) -> Self {
-        Self { program, states: Vec::new(), ordered: Vec::new() }
+        Self { program, states: Vec::new(), ordered: Vec::new(), struct_states: Vec::new(), structs: Vec::new() }
     }
 
-    fn plan(mut self) -> Result<Vec<AggregateId>, CEmissionError> {
+    fn plan(mut self) -> Result<LayoutPlan, CEmissionError> {
         let mut roots = self.program.definitions.iter().enumerate()
             .filter(|(_, definition)| !matches!(&definition.layout, DefinitionLayout::Struct(_)))
             .map(|(index, _)| AggregateId::Definition(DefinitionId::from_index(index)))
@@ -494,7 +514,12 @@ impl<'a> LayoutPlanner<'a> {
             .collect::<Vec<_>>();
         roots.sort();
         for root in roots { self.visit(root)?; }
-        Ok(self.ordered)
+        for index in 0..self.program.definitions.len() {
+            if matches!(self.program.definitions[index].layout, DefinitionLayout::Struct(_)) {
+                self.visit_struct(DefinitionId::from_index(index))?;
+            }
+        }
+        Ok(LayoutPlan { aggregates: self.ordered, structs: self.structs })
     }
 
     fn visit(&mut self, aggregate: AggregateId) -> Result<(), CEmissionError> {
@@ -529,7 +554,7 @@ impl<'a> LayoutPlanner<'a> {
             }
         };
         types.into_iter().filter_map(|ty| match &self.program.types[ty.index()] {
-            Type::Nominal(definition) => Some(AggregateId::Definition(*definition)),
+            Type::Nominal(definition) if !matches!(self.program.definitions[definition.index()].layout, DefinitionLayout::Struct(_)) => Some(AggregateId::Definition(*definition)),
             Type::Union(_) => Some(AggregateId::AnonymousUnion(ty)),
             _ => None,
         }).collect()
@@ -541,11 +566,81 @@ impl<'a> LayoutPlanner<'a> {
             AggregateId::AnonymousUnion(ty) => BackendInvariant { definition: None, ty: Some(ty), message: message.into() },
         }
     }
+
+    fn visit_struct(&mut self, definition: DefinitionId) -> Result<(), CEmissionError> {
+        if let Some((_, state)) = self.struct_states.iter().find(|(id, _)| *id == definition) {
+            return match state { VisitState::Complete => Ok(()), VisitState::Visiting => Err(CEmissionError::Invariant(self.invariant(AggregateId::Definition(definition), "cyclic inline struct body layout"))) };
+        }
+        self.struct_states.push((definition, VisitState::Visiting));
+        let DefinitionLayout::Struct(fields) = &self.program.definitions[definition.index()].layout else { unreachable!() };
+        let fields = fields.clone();
+        for field in &fields {
+            if field.storage == MemberStorage::Inline {
+                if let Type::Nominal(inner) = &self.program.types[field.ty.index()] {
+                    if matches!(self.program.definitions[inner.index()].layout, DefinitionLayout::Struct(_)) { self.visit_struct(*inner)?; }
+                }
+            }
+        }
+        let mut offset = 0_u64;
+        let mut alignment = 1_u64;
+        let mut planned = Vec::new();
+        for (index, field) in fields.iter().enumerate() {
+            let (size, align, nested_layout) = self.body_field_physical(field.ty, field.storage)?;
+            offset = align_up(offset, align, definition)?;
+            planned.push(FieldLayout { id: ir::FieldId::from_index(index), ty: field.ty, storage: field.storage, offset, size, align, nested_layout });
+            offset = offset.checked_add(size).ok_or_else(|| CEmissionError::Invariant(BackendInvariant { definition: Some(definition), ty: None, message: "struct body size overflow".into() }))?;
+            alignment = alignment.max(align);
+        }
+        let size = align_up(offset, alignment, definition)?;
+        if size > u64::from(u32::MAX) { return Err(CEmissionError::Invariant(BackendInvariant { definition: Some(definition), ty: None, message: "struct body does not fit packed arena offset ABI".into() })); }
+        let layout = StructLayout { definition, identity: definition.index() as u64, size, align: alignment, fields: planned };
+        self.struct_states.iter_mut().find(|(id, _)| *id == definition).expect("struct visit state").1 = VisitState::Complete;
+        self.structs.push(layout);
+        Ok(())
+    }
+
+    fn body_field_physical(&self, ty: TypeId, storage: ir::MemberStorage) -> Result<(u64, u64, Option<u64>), CEmissionError> {
+        if storage == MemberStorage::Inline && let Type::Nominal(definition) = self.program.types[ty.index()] {
+            if matches!(self.program.definitions[definition.index()].layout, DefinitionLayout::Struct(_)) {
+                let layout = self.structs.iter().find(|layout| layout.definition == definition).expect("inline dependency planned");
+                return Ok((layout.size, layout.align, Some(layout.identity)));
+            }
+        }
+        Ok(match &self.program.types[ty.index()] {
+            Type::Unit | Type::Primitive(PrimitiveType::Bool | PrimitiveType::Char) => (1, 1, None),
+            Type::Primitive(PrimitiveType::Int | PrimitiveType::Float) | Type::Primitive(PrimitiveType::Str) => (8, 8, None),
+            Type::Nominal(definition) if matches!(self.program.definitions[definition.index()].layout, DefinitionLayout::Struct(_)) => (8, 4, Some(definition.index() as u64)),
+            Type::Nominal(definition) => self.aggregate_physical(AggregateId::Definition(*definition))?,
+            Type::Union(_) => self.aggregate_physical(AggregateId::AnonymousUnion(ty))?,
+            Type::List(_) | Type::Map { .. } => return Err(CEmissionError::Invariant(BackendInvariant { definition: None, ty: Some(ty), message: "container has no Stage 2 physical carrier".into() })),
+        })
+    }
+
+    fn aggregate_physical(&self, aggregate: AggregateId) -> Result<(u64, u64, Option<u64>), CEmissionError> {
+        let values: Vec<TypeId> = match aggregate { AggregateId::Definition(definition) => match &self.program.definitions[definition.index()].layout { DefinitionLayout::Tuple(fields) => fields.clone(), DefinitionLayout::Union(items) => items.iter().map(|item| item.payload).collect(), DefinitionLayout::Struct(_) => unreachable!() }, AggregateId::AnonymousUnion(ty) => match &self.program.types[ty.index()] { Type::Union(items) => items.iter().map(|item| item.payload).collect(), _ => unreachable!() } };
+        let is_union = matches!(aggregate, AggregateId::AnonymousUnion(_)) || matches!(aggregate, AggregateId::Definition(definition) if matches!(self.program.definitions[definition.index()].layout, DefinitionLayout::Union(_)));
+        if is_union {
+            let mut payload_size = 0; let mut payload_align = 1;
+            for value in values { let (size, align, _) = self.body_field_physical(value, ir::MemberStorage::Referenced)?; payload_size = payload_size.max(size); payload_align = payload_align.max(align); }
+            let payload_offset = align_up(4, payload_align, match aggregate { AggregateId::Definition(id) => id, AggregateId::AnonymousUnion(_) => DefinitionId::from_index(0) })?;
+            let align = 4_u64.max(payload_align); return Ok((align_up(payload_offset.checked_add(payload_size).ok_or_else(|| CEmissionError::Invariant(BackendInvariant { definition: None, ty: None, message: "union size overflow".into() }))?, align, DefinitionId::from_index(0))?, align, None));
+        }
+        let mut size = 0; let mut align = 1;
+        for value in values { let (field_size, field_align, _) = self.body_field_physical(value, ir::MemberStorage::Referenced)?; size = align_up(size, field_align, DefinitionId::from_index(0))?.checked_add(field_size).ok_or_else(|| CEmissionError::Invariant(BackendInvariant { definition: None, ty: None, message: "tuple size overflow".into() }))?; align = align.max(field_align); }
+        Ok((align_up(size, align, DefinitionId::from_index(0))?, align, None))
+    }
+}
+
+fn align_up(value: u64, align: u64, definition: DefinitionId) -> Result<u64, CEmissionError> {
+    if align == 0 { return Err(CEmissionError::Invariant(BackendInvariant { definition: Some(definition), ty: None, message: "zero layout alignment".into() })); }
+    let remainder = value % align;
+    if remainder == 0 { Ok(value) } else { value.checked_add(align - remainder).ok_or_else(|| CEmissionError::Invariant(BackendInvariant { definition: Some(definition), ty: None, message: "layout alignment overflow".into() })) }
 }
 
 struct Renderer<'a> {
     program: &'a ir::Program,
     definitions: Vec<AggregateId>,
+    struct_layouts: Vec<StructLayout>,
     strings: Vec<StringLiteral>,
     labels: Vec<Vec<u8>>,
     output: String,
@@ -558,8 +653,8 @@ struct StringLiteral {
 }
 
 impl<'a> Renderer<'a> {
-    fn new(program: &'a ir::Program, definitions: Vec<AggregateId>) -> Self {
-        let mut renderer = Self { program, definitions, strings: collect_strings(program), labels: Vec::new(), output: String::new() };
+    fn new(program: &'a ir::Program, layouts: LayoutPlan) -> Self {
+        let mut renderer = Self { program, definitions: layouts.aggregates, struct_layouts: layouts.structs, strings: collect_strings(program), labels: Vec::new(), output: String::new() };
         renderer.plan_format_labels();
         renderer
     }
@@ -590,6 +685,14 @@ impl<'a> Renderer<'a> {
             "\n",
         ));
         self.output.push_str(concat!(
+            "_Static_assert(sizeof(sao2_unit) == 1 && _Alignof(sao2_unit) == 1, \"SAO2 unit carrier ABI\");\n",
+            "_Static_assert(sizeof(bool) == 1 && _Alignof(bool) == 1, \"SAO2 bool carrier ABI\");\n",
+            "_Static_assert(sizeof(uint8_t) == 1 && _Alignof(uint8_t) == 1, \"SAO2 char carrier ABI\");\n",
+            "_Static_assert(sizeof(int64_t) == 8 && _Alignof(int64_t) == 8, \"SAO2 int carrier ABI\");\n",
+            "_Static_assert(sizeof(double) == 8 && _Alignof(double) == 8, \"SAO2 float carrier ABI\");\n",
+            "_Static_assert(sizeof(sao2_ref) == 8 && _Alignof(sao2_ref) == _Alignof(uint32_t), \"SAO2 reference carrier ABI\");\n\n",
+        ));
+        self.output.push_str(concat!(
             "typedef struct sao2_interned_string {\n",
             "    const unsigned char *bytes;\n",
             "    size_t length;\n",
@@ -597,6 +700,7 @@ impl<'a> Renderer<'a> {
             "} sao2_interned_string;\n",
             "typedef const sao2_interned_string *sao2_string;\n",
         ));
+        self.output.push_str("_Static_assert(sizeof(sao2_string) == 8 && _Alignof(sao2_string) == 8, \"SAO2 string carrier ABI\");\n");
         self.output.push_str("typedef struct { int count; char **values; } sao2_args;\n");
 
         let aggregates = self.aggregate_roots();
@@ -613,6 +717,16 @@ impl<'a> Renderer<'a> {
                 self.render_definition(self.definitions[index]);
                 if index + 1 != self.definitions.len() { self.output.push('\n'); }
             }
+        }
+        if !self.struct_layouts.is_empty() {
+            self.output.push('\n');
+            for layout in &self.struct_layouts {
+                let _ = writeln!(self.output, "typedef struct sao2_body_def_{} sao2_body_def_{};", layout.definition.index(), layout.definition.index());
+            }
+            self.output.push('\n');
+            let layouts = self.struct_layouts.clone();
+            for layout in &layouts { self.render_struct_body(layout); self.output.push('\n'); }
+            self.render_struct_descriptors(&layouts);
         }
         self.render_runtime_metadata();
         self.render_writer_declarations();
@@ -1100,6 +1214,77 @@ impl<'a> Renderer<'a> {
             }
         }
         self.output.push_str("};\n");
+        let (size, align, _) = LayoutPlanner::new(self.program).aggregate_physical(aggregate)
+            .expect("validated aggregate has a physical layout");
+        let _ = writeln!(self.output, "_Static_assert(sizeof({name}) == UINT64_C({size}), \"SAO2 planned aggregate size\");");
+        let _ = writeln!(self.output, "_Static_assert(_Alignof({name}) == UINT64_C({align}), \"SAO2 planned aggregate alignment\");");
+        match aggregate {
+            AggregateId::Definition(definition) => match &self.program.definitions[definition.index()].layout {
+                DefinitionLayout::Tuple(fields) => {
+                    let mut offset = 0_u64;
+                    for (index, field) in fields.iter().enumerate() {
+                        let (_, field_align, _) = LayoutPlanner::new(self.program).body_field_physical(*field, MemberStorage::Referenced).expect("validated tuple field");
+                        offset = align_up(offset, field_align, definition).expect("validated tuple offset");
+                        let _ = writeln!(self.output, "_Static_assert(offsetof({name}, field_{index}) == UINT64_C({offset}), \"SAO2 planned tuple field offset\");");
+                        let (field_size, _, _) = LayoutPlanner::new(self.program).body_field_physical(*field, MemberStorage::Referenced).expect("validated tuple field");
+                        offset += field_size;
+                    }
+                }
+                DefinitionLayout::Union(_) => self.render_union_assertions(&name),
+                DefinitionLayout::Struct(_) => unreachable!(),
+            },
+            AggregateId::AnonymousUnion(_) => self.render_union_assertions(&name),
+        }
+    }
+
+    fn render_union_assertions(&mut self, name: &str) {
+        self.output.push_str("_Static_assert(offsetof(");
+        self.output.push_str(name);
+        self.output.push_str(", tag) == UINT64_C(0), \"SAO2 planned union tag offset\");\n");
+        self.output.push_str("_Static_assert(offsetof(");
+        self.output.push_str(name);
+        self.output.push_str(", payload) >= UINT64_C(4), \"SAO2 planned union payload offset\");\n");
+    }
+
+    fn render_struct_body(&mut self, layout: &StructLayout) {
+        let _ = writeln!(self.output, "struct sao2_body_def_{} {{", layout.definition.index());
+        for field in &layout.fields {
+            let c_ty = self.body_field_c_type(field);
+            let _ = writeln!(self.output, "    {c_ty} field_{};", field.id.index());
+        }
+        self.output.push_str("};\n");
+        let name = format!("sao2_body_def_{}", layout.definition.index());
+        let _ = writeln!(self.output, "_Static_assert(sizeof({name}) == UINT64_C({}), \"SAO2 planned struct body size\");", layout.size);
+        let _ = writeln!(self.output, "_Static_assert(_Alignof({name}) == UINT64_C({}), \"SAO2 planned struct body alignment\");", layout.align);
+        for field in &layout.fields {
+            let _ = writeln!(self.output, "_Static_assert(offsetof({name}, field_{}) == UINT64_C({}), \"SAO2 planned struct field offset\");", field.id.index(), field.offset);
+        }
+    }
+
+    fn body_field_c_type(&self, field: &FieldLayout) -> String {
+        if field.storage == MemberStorage::Inline && field.nested_layout.is_some()
+            && matches!(&self.program.types[field.ty.index()], Type::Nominal(definition) if matches!(self.program.definitions[definition.index()].layout, DefinitionLayout::Struct(_)))
+        { return format!("sao2_body_def_{}", match &self.program.types[field.ty.index()] { Type::Nominal(definition) => definition.index(), _ => unreachable!() }); }
+        self.c_type(field.ty)
+    }
+
+    fn render_struct_descriptors(&mut self, layouts: &[StructLayout]) {
+        self.output.push_str(concat!(
+            "typedef struct { uint64_t offset; uint64_t size; uint64_t alignment; uint64_t inline_layout; uint32_t storage; } sao2_layout_field_descriptor;\n",
+            "typedef struct { uint64_t identity; uint64_t size; uint64_t alignment; size_t field_count; const sao2_layout_field_descriptor *fields; } sao2_layout_descriptor;\n",
+            "#define SAO2_LAYOUT_FIELD_INLINE UINT32_C(0)\n#define SAO2_LAYOUT_FIELD_REFERENCED UINT32_C(1)\n\n",
+        ));
+        for layout in layouts {
+            let _ = writeln!(self.output, "static const sao2_layout_field_descriptor sao2_layout_fields_def_{}[] = {{", layout.definition.index());
+            if layout.fields.is_empty() { self.output.push_str("    { 0, 0, 0, 0, 0 },\n"); }
+            for field in &layout.fields {
+                let storage = match field.storage { MemberStorage::Inline => "SAO2_LAYOUT_FIELD_INLINE", MemberStorage::Referenced => "SAO2_LAYOUT_FIELD_REFERENCED" };
+                let nested = field.nested_layout.unwrap_or(u64::MAX);
+                let _ = writeln!(self.output, "    {{ UINT64_C({}), UINT64_C({}), UINT64_C({}), UINT64_C({}), {} }},", field.offset, field.size, field.align, nested, storage);
+            }
+            self.output.push_str("};\n");
+            let _ = writeln!(self.output, "static const sao2_layout_descriptor sao2_layout_def_{} = {{ UINT64_C({}), UINT64_C({}), UINT64_C({}), {}, sao2_layout_fields_def_{} }};", layout.definition.index(), layout.identity, layout.size, layout.align, layout.fields.len(), layout.definition.index());
+        }
     }
 
     fn render_union(&mut self, alternatives: &[ir::UnionAlternative]) {
@@ -1523,7 +1708,10 @@ impl<'a> Renderer<'a> {
             Type::Primitive(PrimitiveType::Str) => "sao2_string".to_owned(),
             Type::Primitive(PrimitiveType::Bool) => "bool".to_owned(),
             Type::Primitive(PrimitiveType::Char) => "uint8_t".to_owned(),
-            Type::Nominal(definition) => format!("sao2_def_{}", definition.index()),
+            Type::Nominal(definition) => match &self.program.definitions[definition.index()].layout {
+                DefinitionLayout::Struct(_) => "sao2_ref".to_owned(),
+                DefinitionLayout::Tuple(_) | DefinitionLayout::Union(_) => format!("sao2_def_{}", definition.index()),
+            },
             Type::Union(_) => format!("sao2_union_ty_{}", ty.index()),
             Type::List(_) | Type::Map { .. } => unreachable!("capability validation rejected container C type"),
         }
@@ -1542,6 +1730,7 @@ const ALL_FAILURE_OPERATIONS: &[FailureOperation] = &[
     FailureOperation::ListAppend, FailureOperation::ListRemoveIndex,
     FailureOperation::MapRemoveKey, FailureOperation::Output,
     FailureOperation::ExplicitPanic, FailureOperation::UnhandledError,
+    FailureOperation::StructAllocation,
 ];
 
 fn failure_operation_code(operation: FailureOperation) -> u32 {
@@ -1568,6 +1757,7 @@ fn failure_operation_code(operation: FailureOperation) -> u32 {
         FailureOperation::Output => 19,
         FailureOperation::ExplicitPanic => 20,
         FailureOperation::UnhandledError => 21,
+        FailureOperation::StructAllocation => 22,
     }
 }
 
@@ -1592,6 +1782,7 @@ fn failure_operation_macro(operation: FailureOperation) -> &'static str {
         FailureOperation::ListAppend => "SAO2_FAILURE_LIST_APPEND",
         FailureOperation::ListRemoveIndex => "SAO2_FAILURE_LIST_REMOVE_INDEX",
         FailureOperation::MapRemoveKey => "SAO2_FAILURE_MAP_REMOVE_KEY",
+        FailureOperation::StructAllocation => "SAO2_FAILURE_STRUCT_ALLOCATION",
         FailureOperation::Output => "SAO2_FAILURE_OUTPUT",
         FailureOperation::ExplicitPanic => "SAO2_FAILURE_EXPLICIT_PANIC",
         FailureOperation::UnhandledError => "SAO2_FAILURE_UNHANDLED_ERROR",
@@ -2519,6 +2710,31 @@ mod tests {
     }
 
     #[test]
+    fn emits_unused_struct_bodies_and_deterministic_descriptors() {
+        let (mut program, types, location) = program();
+        let inner = program.add_definition(NominalDefinition::structure("names must not leak"));
+        let inner_type = program.intern_type(Type::Nominal(inner));
+        program.definitions[inner.index()].add_struct_field("value", types.int, MemberStorage::Inline);
+
+        let outer = program.add_definition(NominalDefinition::structure("Outer"));
+        program.definitions[outer.index()].add_struct_field("flag", types.boolean, MemberStorage::Inline);
+        program.definitions[outer.index()].add_struct_field("child", inner_type, MemberStorage::Inline);
+        program.definitions[outer.index()].add_struct_field("shared", inner_type, MemberStorage::Referenced);
+        let _outer_type = program.intern_type(Type::Nominal(outer));
+        add_main(&mut program, types, location);
+
+        let emitted = emit(&program).unwrap();
+        assert!(emitted.contains("typedef struct sao2_body_def_0 sao2_body_def_0;"));
+        assert!(emitted.contains("struct sao2_body_def_0 {\n    int64_t field_0;\n};"));
+        assert!(emitted.contains("struct sao2_body_def_1 {\n    bool field_0;\n    sao2_body_def_0 field_1;\n    sao2_ref field_2;\n};"));
+        assert!(emitted.contains("offsetof(sao2_body_def_1, field_1) == UINT64_C(8)"));
+        assert!(emitted.contains("offsetof(sao2_body_def_1, field_2) == UINT64_C(16)"));
+        assert!(emitted.contains("sao2_layout_def_0 = { UINT64_C(0), UINT64_C(8), UINT64_C(8), 1"));
+        assert!(emitted.contains("sao2_layout_def_1 = { UINT64_C(1), UINT64_C(24), UINT64_C(8), 3"));
+        assert!(!emitted.contains("names must not leak"));
+    }
+
+    #[test]
     fn renders_tuple_value_helpers_only_for_eligible_definitions() {
         let (mut program, types, location) = program();
         let mut inner = NominalDefinition::tuple("Inner");
@@ -2818,7 +3034,8 @@ mod tests {
         let id = structure.add_definition(definition);
         structure.intern_type(Type::Nominal(id));
         add_main(&mut structure, types, location);
-        assert_unsupported(emit(&structure), "struct definitions", None);
+        let emitted = emit(&structure).unwrap();
+        assert!(emitted.contains("struct sao2_body_def_0"));
 
         let (mut container, types, location) = program();
         let list = container.intern_type(Type::List(types.int));

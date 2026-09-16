@@ -705,7 +705,8 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
                 }).collect::<Result<Vec<_>, _>>()?;
                 fields.sort_by_key(|(field, _)| field.index());
                 let definition = self.definition(*declaration)?;
-                Ok(Some(self.aggregate(expression, ir::Aggregate::Struct { definition, fields })?))
+                let failure = self.failure(expression.span, ir::FailureOperation::StructAllocation)?;
+                Ok(Some(self.aggregate(expression, ir::Aggregate::Struct { definition, fields, failure })?))
             }
             ConstructorKind::Tuple(declaration) => {
                 let definition = self.definition(*declaration)?;
