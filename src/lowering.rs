@@ -484,7 +484,8 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
             ExpressionKind::TypedEmptyList(_) => {
                 let raw = self.raw_type(expression)?;
                 let ty = self.ty(raw)?;
-                self.aggregate(expression, ir::Aggregate::List { ty, elements: Vec::new() })?
+                let failure = self.failure(expression.span, ir::FailureOperation::ListAllocation)?;
+                self.aggregate(expression, ir::Aggregate::List { ty, elements: Vec::new(), failure })?
             }
             ExpressionKind::TypedEmptyMap(_) => {
                 let raw = self.raw_type(expression)?;
@@ -633,7 +634,8 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         for element in elements { let Some(value) = self.expression(element)? else { return Ok(None); }; values.push(self.stabilize(value, element.span)?); }
         let raw = self.raw_type(expression)?;
         let ty = self.ty(raw)?;
-        Ok(Some(self.aggregate(expression, ir::Aggregate::List { ty, elements: values })?))
+        let failure = self.failure(expression.span, ir::FailureOperation::ListAllocation)?;
+        Ok(Some(self.aggregate(expression, ir::Aggregate::List { ty, elements: values, failure })?))
     }
     fn map(&mut self, expression: &'ast Expression, entries: &'ast [ast::MapEntry]) -> Result<Option<ir::Operand>, LoweringError> {
         let mut values = Vec::new();
@@ -783,7 +785,8 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
             }
             _ => return Err(invariant("index expression has a non-index projection")),
         }
-        Ok(Some(ir::Operand::Copy(place)))
+        let value = ir::Operand::Copy(place);
+        Ok(Some(self.materialize(value, expression.span)?))
     }
 
     fn statement_body(&mut self, body: &'ast StatementBody) -> Result<(), LoweringError> {

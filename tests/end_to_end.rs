@@ -280,6 +280,162 @@ fn reports_string_lengths_as_bytes_without_strlen() {
 }
 
 #[test]
+fn runs_complete_list_operations_and_aliasing() {
+    let directory = TestDirectory::new("list operations");
+    let source = br#"
+        fn main() {
+            var values := [] : [int];
+            values.append(1);
+            values.append(2);
+            values.append(3);
+            values.append(4);
+            values.append(5);
+            var alias := values;
+            alias[0] = 10;
+            alias.removeIndex(-2);
+            println(values.len());
+            println(values[0]);
+            println(values[-1]);
+            println(10 in values);
+            println(3 in values);
+            println(values == alias);
+        }
+    "#;
+    let output = run_source(&directory, source);
+    assert!(!compiler_is_missing(&output), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"4\n10\n5\ntrue\ntrue\ntrue\n");
+}
+
+#[test]
+fn runs_nested_lists_and_union_membership() {
+    let directory = TestDirectory::new("nested lists");
+    let source = br#"
+        type Choice(int | str);
+        fn main() {
+            var nested := [[1, 2]];
+            nested[0].append(3);
+            println(nested[0].len());
+            println(nested[0][-1]);
+            choices := [Choice(1), Choice("x"), Choice(1)];
+            println(Choice(1) in choices);
+            println(Choice("x") in choices);
+            println(Choice(2) in choices);
+            println(choices[0] == choices[2]);
+        }
+    "#;
+    let output = run_source(&directory, source);
+    assert!(!compiler_is_missing(&output), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"3\n3\ntrue\ntrue\nfalse\ntrue\n");
+}
+
+#[test]
+fn materializes_entry_arguments_as_canonical_strings() {
+    let directory = TestDirectory::new("entry list");
+    let source = br#"
+        fn main(args [str]) {
+            println(args.len());
+            println(args[0] == "same");
+            println(args[0] == args[1]);
+            println(args[-1]);
+        }
+    "#;
+    let source_path = directory.write_source("entry list.sao2", source);
+    let built = sao2(&directory.0, &[OsStr::new("build"), source_path.as_os_str()]);
+    assert!(!compiler_is_missing(&built), "{}", String::from_utf8_lossy(&built.stderr));
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    let output = Command::new(directory.0.join("build/program"))
+        .args(["same", "same", "last"])
+        .current_dir(&directory.0)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"3\ntrue\ntrue\nlast\n");
+
+    let dynamic = Command::new(directory.0.join("build/program"))
+        .args(["dynamic", "dynamic", "last"])
+        .current_dir(&directory.0)
+        .output()
+        .unwrap();
+    assert!(dynamic.status.success(), "{}", String::from_utf8_lossy(&dynamic.stderr));
+    assert_eq!(dynamic.stdout, b"3\nfalse\ntrue\nlast\n");
+}
+
+#[test]
+fn constructs_a_distinct_empty_entry_argument_list() {
+    let directory = TestDirectory::new("empty entry list");
+    let output = run_source(
+        &directory,
+        br#"
+            fn main(args [str]) {
+                if args.len() == 0 {
+                    println("empty");
+                } else {
+                    println("nonempty");
+                }
+            }
+        "#,
+    );
+    assert!(!compiler_is_missing(&output), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"empty\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_non_ascii_entry_arguments_before_entering_main() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let directory = TestDirectory::new("non ASCII entry list");
+    let source_path = directory.write_source(
+        "non ASCII entry list.sao2",
+        br#"fn main(args [str]) { println("entered"); }"#,
+    );
+    let built = sao2(&directory.0, &[OsStr::new("build"), source_path.as_os_str()]);
+    assert!(!compiler_is_missing(&built), "{}", String::from_utf8_lossy(&built.stderr));
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+
+    let output = Command::new(directory.0.join("build/program"))
+        .arg(OsString::from_vec(vec![0xc3, 0xa9]))
+        .current_dir(&directory.0)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, b"sao2: panic: command-line argument 0 is not ASCII\n");
+}
+
+#[test]
+fn stores_reference_and_inline_values_in_lists() {
+    let directory = TestDirectory::new("list value shapes");
+    let source = br#"
+        type Point(value int);
+        type Inner(value int);
+        type Outer(child Inner);
+        type Pair(int, Point);
+        fn main() {
+            var points := [Point(value = 1), Point(value = 2)];
+            println(points[0].value);
+            points[1] = Point(value = 9);
+            println(points[1].value);
+            var outers := [Outer(child = Inner(value = 1))];
+            outers[0].child = Inner(value = 7);
+            println(outers[0].child.value);
+            pairs := [Pair(3, points[0]), Pair(4, points[1])];
+            println(pairs[0].0);
+            println(pairs[1].1.value);
+            println(points[0] == pairs[0].1);
+        }
+    "#;
+    let output = run_source(&directory, source);
+    assert!(!compiler_is_missing(&output), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"1\n9\n7\n3\n9\ntrue\n");
+}
+
+#[test]
 fn compares_and_indexes_strings() {
     let directory = TestDirectory::new("string values");
     let source = br#"fn main() {

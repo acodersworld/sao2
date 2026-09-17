@@ -1,0 +1,13 @@
+fn main() int {
+    var values := [1, 2, 3];
+    println(values.len());
+    println(values[0]);
+    println(values[-1]);
+    values[1] = 9;
+    values.append(4);
+    values.removeIndex(-2);
+    println(values[1]);
+    println(values.len());
+    println(9 in values);
+    values.len()
+}

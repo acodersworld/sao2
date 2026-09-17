@@ -511,11 +511,22 @@ mod tests {
         let list = program.intern_type(Type::List(point));
         let list_local = program.functions[0].add_local(list, None, ir::LocalOrigin::Temporary);
         let location = program.intern_location(ir::ByteSpan::new(0, 0));
+        let failure = program.intern_failure_site(ir::FailureSite {
+            location,
+            function: FunctionId::from_index(0),
+            operation: ir::FailureOperation::ListAllocation,
+            line: 1,
+            column: 1,
+        });
         let point_local = ir::LocalId::from_index(0);
         let block = program.functions[0].entry.expect("test function entry");
         program.functions[0].blocks[block.index()].push(OperationKind::Aggregate {
             destination: list_local,
-            aggregate: Aggregate::List { ty: list, elements: vec![Operand::Copy(Place::local(point_local))] },
+            aggregate: Aggregate::List {
+                ty: list,
+                elements: vec![Operand::Copy(Place::local(point_local))],
+                failure,
+            },
         }, location);
 
         let plan = analyze(&program).unwrap();

@@ -3286,10 +3286,30 @@ impl<'analysis, 'source, 'ast> TypeInferrer<'analysis, 'source, 'ast> {
                         visiting.pop();
                         comparable
                     }
-                    TypeDefinitionKind::Union { .. } | TypeDefinitionKind::Invalid => false,
+                    TypeDefinitionKind::Union { alternatives, .. } => {
+                        visiting.push(*declaration);
+                        let comparable = alternatives.iter().all(|alternative| {
+                            let member = match alternative {
+                                UnionAlternative::Untagged(ty)
+                                | UnionAlternative::Tagged { payload: ty, .. }
+                                | UnionAlternative::Error(ty) => *ty,
+                            };
+                            self.supports_equality_inner(member, visiting)
+                        });
+                        visiting.pop();
+                        comparable
+                    }
+                    TypeDefinitionKind::Invalid => false,
                 }
             }
-            ResolvedType::Union(_) => false,
+            ResolvedType::Union(alternatives) => alternatives.iter().all(|alternative| {
+                let member = match alternative {
+                    UnionAlternative::Untagged(ty)
+                    | UnionAlternative::Tagged { payload: ty, .. }
+                    | UnionAlternative::Error(ty) => *ty,
+                };
+                self.supports_equality_inner(member, visiting)
+            }),
         }
     }
 
@@ -4885,10 +4905,30 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
                         visiting.pop();
                         comparable
                     }
-                    TypeDefinitionKind::Union { .. } | TypeDefinitionKind::Invalid => false,
+                    TypeDefinitionKind::Union { alternatives, .. } => {
+                        visiting.push(*declaration);
+                        let comparable = alternatives.iter().all(|alternative| {
+                            let member = match alternative {
+                                UnionAlternative::Untagged(ty)
+                                | UnionAlternative::Tagged { payload: ty, .. }
+                                | UnionAlternative::Error(ty) => *ty,
+                            };
+                            self.supports_equality_inner(member, visiting)
+                        });
+                        visiting.pop();
+                        comparable
+                    }
+                    TypeDefinitionKind::Invalid => false,
                 }
             }
-            ResolvedType::Union(_) => false,
+            ResolvedType::Union(alternatives) => alternatives.iter().all(|alternative| {
+                let member = match alternative {
+                    UnionAlternative::Untagged(ty)
+                    | UnionAlternative::Tagged { payload: ty, .. }
+                    | UnionAlternative::Error(ty) => *ty,
+                };
+                self.supports_equality_inner(member, visiting)
+            }),
         }
     }
 

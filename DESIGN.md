@@ -448,7 +448,10 @@ Comparisons use `==`, `!=`, `<`, `<=`, `>`, and `>=` and always produce a
 for `str`. Primitive equality compares values. Immutable tuples compare
 structurally by their members. Structs, lists, and maps compare reference
 identity. Because strings are interned, identity and value equality are
-equivalent for strings.
+equivalent for strings. Union equality first compares the active discriminant;
+values with different active alternatives are unequal, while values with the
+same active alternative compare their payloads using that payload type's
+equality rule. An inactive union payload is never observed by equality.
 
 Boolean operations use `!`, `&&`, and `||` and require `bool` operands. `&&`
 and `||` short-circuit. Bitwise operations use `~`, `&`, `|`, `^`, `<<`, and

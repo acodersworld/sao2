@@ -1,0 +1,9 @@
+fn main(args [str]) int {
+    println(args.len());
+    if args.len() > 0 {
+        println(args[0]);
+        println(args[-1]);
+        println(args[0] == args[-1]);
+    }
+    args.len()
+}

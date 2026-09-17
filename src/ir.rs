@@ -284,7 +284,7 @@ pub(crate) enum NumericConversion { IntToFloat, FloatToInt }
 pub(crate) enum Aggregate {
     Struct { definition: DefinitionId, fields: Vec<(FieldId, Operand)>, failure: FailureSiteId },
     Tuple { definition: DefinitionId, elements: Vec<Operand> },
-    List { ty: TypeId, elements: Vec<Operand> },
+    List { ty: TypeId, elements: Vec<Operand>, failure: FailureSiteId },
     Map { ty: TypeId, entries: Vec<(Operand, Operand)> },
 }
 
@@ -306,6 +306,7 @@ pub(crate) enum FailureOperation {
     FloatAdd, FloatSubtract, FloatMultiply, FloatDivision, FloatToInt,
     ListIndex, MapIndex, StringIndex, ListAppend, ListRemoveIndex,
     MapRemoveKey, StructAllocation, Output, ExplicitPanic, UnhandledError,
+    ListAllocation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -584,7 +585,7 @@ impl Renderer<'_, '_> {
         match aggregate {
             Aggregate::Struct { definition, fields, failure } => format!("struct {definition} {{{}}} ! {failure}", fields.iter().map(|(field, operand)| format!("{field}: {}", self.operand(operand))).collect::<Vec<_>>().join(", ")),
             Aggregate::Tuple { definition, elements } => format!("tuple {definition}({})", self.operands(elements)),
-            Aggregate::List { ty, elements } => format!("list {ty}[{}]", self.operands(elements)),
+            Aggregate::List { ty, elements, failure } => format!("list {ty}[{}] ! {failure}", self.operands(elements)),
             Aggregate::Map { ty, entries } => format!("map {ty} {{{}}}", entries.iter().map(|(key, value)| format!("{}: {}", self.operand(key), self.operand(value))).collect::<Vec<_>>().join(", ")),
         }
     }
@@ -689,6 +690,7 @@ fn escape_bytes(bytes: &[u8]) -> String {
     FailureOperation::ListAppend => "list-append", FailureOperation::ListRemoveIndex => "list-remove-index",
     FailureOperation::MapRemoveKey => "map-remove-key", FailureOperation::StructAllocation => "struct-allocation", FailureOperation::Output => "output",
     FailureOperation::ExplicitPanic => "explicit-panic", FailureOperation::UnhandledError => "unhandled-error",
+    FailureOperation::ListAllocation => "list-allocation",
 } }
 fn runtime_check_failure(check: &RuntimeCheck) -> FailureSiteId { match check {
     RuntimeCheck::IntegerOverflow { failure, .. } | RuntimeCheck::IntegerNegation { failure, .. }
@@ -826,6 +828,7 @@ mod tests {
         let struct_allocation_failure = site(&mut program, FailureOperation::StructAllocation);
         let output_failure = site(&mut program, FailureOperation::Output);
         let append_failure = site(&mut program, FailureOperation::ListAppend);
+        let list_allocation_failure = site(&mut program, FailureOperation::ListAllocation);
         let remove_failure = site(&mut program, FailureOperation::MapRemoveKey);
         let panic_failure = site(&mut program, FailureOperation::ExplicitPanic);
         let error_failure = site(&mut program, FailureOperation::UnhandledError);
@@ -858,7 +861,7 @@ mod tests {
         entry.push(OperationKind::Aggregate { destination: pair_local, aggregate: Aggregate::Tuple { definition: pair_definition, elements: vec![
             Operand::Copy(Place::local(input)), constant(types.float, ConstantValue::Float(0)),
         ] } }, location);
-        entry.push(OperationKind::Aggregate { destination: list_local, aggregate: Aggregate::List { ty: list_type, elements: vec![integer(&types, 1)] } }, location);
+        entry.push(OperationKind::Aggregate { destination: list_local, aggregate: Aggregate::List { ty: list_type, elements: vec![integer(&types, 1)], failure: list_allocation_failure } }, location);
         entry.push(OperationKind::Aggregate { destination: map_local, aggregate: Aggregate::Map { ty: map_type, entries: vec![(integer(&types, 1), constant(types.string, ConstantValue::String(b"one".to_vec())))] } }, location);
         entry.push(OperationKind::UnionInject { destination: choice_local, union_type: choice_type, alternative: choice_a, payload: Operand::Copy(Place::local(input)) }, location);
         entry.push(OperationKind::UnionTest { destination: bool_temp, union: Operand::Copy(Place::local(choice_local)), alternative: choice_a }, location);
@@ -1429,9 +1432,14 @@ impl<'a> Validator<'a> {
             }
             Aggregate { destination, aggregate } => {
                 let result = self.validate_aggregate(function, aggregate)?;
-                if let crate::ir::Aggregate::Struct { failure, .. } = aggregate
+                let failure = match aggregate {
+                    crate::ir::Aggregate::Struct { failure, .. } => Some((failure, "struct allocation")),
+                    crate::ir::Aggregate::List { failure, .. } => Some((failure, "list allocation")),
+                    crate::ir::Aggregate::Tuple { .. } | crate::ir::Aggregate::Map { .. } => None,
+                };
+                if let Some((failure, description)) = failure
                     && self.program.failure_sites[failure.index()].location != operation.location
-                { return Err(self.error("struct allocation failure site has the wrong source location")); }
+                { return Err(self.error(format!("{description} failure site has the wrong source location"))); }
                 self.destination(function, *destination, result, "aggregate")
             }
             UnionInject { destination, union_type, alternative, payload } => {
@@ -1537,7 +1545,8 @@ impl<'a> Validator<'a> {
                 for (operand, expected) in elements.iter().zip(layout) { self.expect_operand(function, operand, *expected, "tuple field")?; }
                 self.nominal_type(*definition)
             }
-            Aggregate::List { ty, elements } => {
+            Aggregate::List { ty, elements, failure } => {
+                self.failure_site(*failure, FailureOperation::ListAllocation)?;
                 let Type::List(element) = self.ty(*ty)? else { return Err(self.error("list aggregate has a non-list type")); };
                 for operand in elements { self.expect_operand(function, operand, *element, "list element")?; }
                 Ok(*ty)
@@ -1750,9 +1759,15 @@ impl<'a> Validator<'a> {
                         let result = fields.iter().all(|field| self.supports_equality(*field, visiting));
                         visiting.pop(); result
                     }
-                    _ => false,
+                    Some(DefinitionLayout::Union(alternatives)) => {
+                        visiting.push(*definition);
+                        let result = alternatives.iter().all(|alternative| self.supports_equality(alternative.payload, visiting));
+                        visiting.pop(); result
+                    }
+                    None => false,
                 }
             }
+            Some(Type::Union(alternatives)) => alternatives.iter().all(|alternative| self.supports_equality(alternative.payload, visiting)),
             _ => false,
         }
     }
