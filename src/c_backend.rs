@@ -1967,17 +1967,21 @@ fn failure_operation_macro(operation: FailureOperation) -> &'static str {
 const ARENA_RUNTIME: &str = r#"
 
 /*
- * Milestone 9 arena runtime. Heap allocation is deliberately monotonic until
- * milestone 10 replaces this policy behind sao2_heap_allocate. Scoped
- * allocation is independently managed and restored by function marks.
+ * Milestone 10 block-heap foundation. Heap blocks can be walked, reclaimed,
+ * coalesced, and reused; automatic tracing and collection are still pending.
+ * Scoped allocation remains an independent, restorable bump arena.
  */
+#ifndef SAO2_ARENA_CAPACITY
 #define SAO2_ARENA_CAPACITY UINT64_C(4294967296)
+#endif
 #define SAO2_ARENA_INITIAL_CURSOR UINT64_C(8)
 #define SAO2_REF_OWNER_TAG_MASK UINT32_C(7)
 #define SAO2_REF_HEAP_TAG UINT32_C(0)
 #define SAO2_REF_SCOPED_TAG UINT32_C(1)
 #define SAO2_REF_ALIGNMENT UINT64_C(8)
 #define SAO2_HEAP_LIFETIME UINT32_C(0)
+#define SAO2_HEAP_BLOCK_ALLOCATED UINT32_C(1)
+#define SAO2_HEAP_BLOCK_FREE UINT32_C(2)
 
 typedef enum {
     SAO2_ARENA_OK,
@@ -1993,16 +1997,23 @@ typedef struct {
     uint64_t capacity;
     uint64_t page_size;
     uint64_t committed;
-    uint64_t cursor;
+    uint64_t frontier;
+    uint64_t free_head;
 } sao2_arena;
 
 typedef struct {
+    uint64_t span_size;
     uint64_t body_size;
     uint64_t layout_identity;
+    uint64_t next_free;
     uint32_t lifetime;
-    uint32_t collector_state;
+    uint32_t block_state;
+    uint32_t mark_epoch;
+    uint32_t reserved;
 } sao2_heap_header;
 
+_Static_assert(sizeof(sao2_heap_header) != 0, "SAO2 heap header must not be empty");
+_Static_assert(sizeof(sao2_heap_header) == 48, "SAO2 heap header ABI");
 _Static_assert(sizeof(sao2_heap_header) % 8 == 0, "SAO2 heap header must preserve body alignment");
 
 static sao2_arena sao2_heap_arena;
@@ -2048,6 +2059,9 @@ static unsigned char *sao2_platform_reserve(uint64_t size) {
 
 static bool sao2_platform_commit(unsigned char *base, uint64_t offset, uint64_t size) {
     if (base == NULL || offset > (uint64_t)SIZE_MAX || size > (uint64_t)SIZE_MAX) return false;
+#ifdef SAO2_RUNTIME_PROBE
+    if (sao2_probe_fail_next_commit) { sao2_probe_fail_next_commit = false; return false; }
+#endif
 #ifdef _WIN32
     return VirtualAlloc(base + (size_t)offset, (SIZE_T)size, MEM_COMMIT, PAGE_READWRITE) != NULL;
 #else
@@ -2070,7 +2084,8 @@ static void sao2_arena_clear(sao2_arena *arena) {
     arena->capacity = 0;
     arena->page_size = 0;
     arena->committed = 0;
-    arena->cursor = 0;
+    arena->frontier = 0;
+    arena->free_head = 0;
 }
 
 static void sao2_arena_release(sao2_arena *arena) {
@@ -2087,7 +2102,7 @@ static bool sao2_arena_runtime_init(void) {
     if (sao2_heap_arena.base == NULL) return false;
     sao2_heap_arena.capacity = SAO2_ARENA_CAPACITY;
     sao2_heap_arena.page_size = page_size;
-    sao2_heap_arena.cursor = SAO2_ARENA_INITIAL_CURSOR;
+    sao2_heap_arena.frontier = SAO2_ARENA_INITIAL_CURSOR;
     sao2_scoped_arena.base = sao2_platform_reserve(SAO2_ARENA_CAPACITY);
     if (sao2_scoped_arena.base == NULL) {
         sao2_arena_release(&sao2_heap_arena);
@@ -2095,7 +2110,7 @@ static bool sao2_arena_runtime_init(void) {
     }
     sao2_scoped_arena.capacity = SAO2_ARENA_CAPACITY;
     sao2_scoped_arena.page_size = page_size;
-    sao2_scoped_arena.cursor = SAO2_ARENA_INITIAL_CURSOR;
+    sao2_scoped_arena.frontier = SAO2_ARENA_INITIAL_CURSOR;
     sao2_arenas_initialized = true;
     return true;
 }
@@ -2118,29 +2133,40 @@ static bool sao2_align_eight(uint64_t value, uint64_t *result) {
     return true;
 }
 
-static sao2_arena_result sao2_arena_allocate(sao2_arena *arena, uint64_t size, uint64_t alignment, uint64_t *offset) {
-    uint64_t start, body_size, end, rounded_end, committed_end, remainder;
+static sao2_arena_result sao2_arena_commit_through(sao2_arena *arena, uint64_t end) {
+    uint64_t committed_end, remainder;
+    if (arena->base == NULL || arena->page_size == 0 || end > arena->capacity)
+        return SAO2_ARENA_INVALID;
+    remainder = end % arena->page_size;
+    if (remainder == 0) committed_end = end;
+    else {
+        if (end > UINT64_MAX - (arena->page_size - remainder)) return SAO2_ARENA_EXHAUSTED;
+        committed_end = end + (arena->page_size - remainder);
+    }
+    if (committed_end > arena->capacity) return SAO2_ARENA_EXHAUSTED;
+    if (committed_end > arena->committed) {
+        if (!sao2_platform_commit(arena->base, arena->committed, committed_end - arena->committed))
+            return SAO2_ARENA_COMMIT_FAILED;
+        arena->committed = committed_end;
+    }
+    return SAO2_ARENA_OK;
+}
+
+static sao2_arena_result sao2_scoped_bump_allocate(sao2_arena *arena, uint64_t size,
+    uint64_t alignment, uint64_t *offset) {
+    uint64_t start, body_size, end, rounded_end;
+    sao2_arena_result status;
     if (arena->base == NULL || alignment != SAO2_REF_ALIGNMENT) return SAO2_ARENA_INVALID;
-    if (!sao2_align_eight(arena->cursor, &start)) return SAO2_ARENA_EXHAUSTED;
+    if (!sao2_align_eight(arena->frontier, &start)) return SAO2_ARENA_EXHAUSTED;
     if (start > arena->capacity) return SAO2_ARENA_EXHAUSTED;
     body_size = size == 0 ? SAO2_REF_ALIGNMENT : size;
     if (body_size > arena->capacity - start) return SAO2_ARENA_EXHAUSTED;
     end = start + body_size;
     if (!sao2_align_eight(end, &rounded_end) || rounded_end > arena->capacity)
         return SAO2_ARENA_EXHAUSTED;
-    remainder = rounded_end % arena->page_size;
-    if (remainder == 0) committed_end = rounded_end;
-    else {
-        if (rounded_end > UINT64_MAX - (arena->page_size - remainder)) return SAO2_ARENA_EXHAUSTED;
-        committed_end = rounded_end + (arena->page_size - remainder);
-    }
-    if (committed_end > arena->capacity) return SAO2_ARENA_EXHAUSTED;
-    if (committed_end > arena->committed) {
-        if (!sao2_platform_commit(arena->base, arena->committed, committed_end - arena->committed))
-            return SAO2_ARENA_COMMIT_FAILED;
-    }
-    arena->committed = committed_end;
-    arena->cursor = rounded_end;
+    status = sao2_arena_commit_through(arena, rounded_end);
+    if (status != SAO2_ARENA_OK) return status;
+    arena->frontier = rounded_end;
     *offset = start;
     return SAO2_ARENA_OK;
 }
@@ -2174,68 +2200,265 @@ static bool sao2_ref_kind(sao2_ref reference, sao2_arena_kind *kind) {
     return true;
 }
 
-static bool sao2_ref_resolve_offset(sao2_ref reference, bool member, unsigned char **result) {
-    sao2_arena_kind kind;
-    sao2_arena *arena;
-    uint64_t offset;
-    if (!sao2_ref_kind(reference, &kind)) return false;
-    arena = sao2_arena_for_kind(kind);
-    offset = member ? (uint64_t)reference.member_ptr
-        : (uint64_t)(reference.owner_ptr & ~SAO2_REF_OWNER_TAG_MASK);
-    if (arena->base == NULL || offset == 0 || offset >= arena->capacity) return false;
-    *result = arena->base + (size_t)offset;
+static bool sao2_heap_span(uint64_t body_size, uint64_t *result) {
+    uint64_t payload = body_size < SAO2_REF_ALIGNMENT ? SAO2_REF_ALIGNMENT : body_size;
+    uint64_t rounded_payload;
+    if (!sao2_align_eight(payload, &rounded_payload)
+        || rounded_payload > UINT64_MAX - (uint64_t)sizeof(sao2_heap_header)) return false;
+    *result = (uint64_t)sizeof(sao2_heap_header) + rounded_payload;
     return true;
 }
 
-static bool sao2_ref_owner(sao2_ref reference, unsigned char **result) {
-    return sao2_ref_resolve_offset(reference, false, result);
+static sao2_heap_header *sao2_heap_header_at(uint64_t offset) {
+    return (sao2_heap_header *)(sao2_heap_arena.base + (size_t)offset);
 }
 
-static bool sao2_ref_member(sao2_ref reference, unsigned char **result) {
-    return sao2_ref_resolve_offset(reference, true, result);
-}
-
-static sao2_arena_result sao2_heap_allocate(uint64_t body_size, uint64_t alignment, uint64_t layout_identity, sao2_ref *result) {
-    uint64_t total, allocation_body, predicted_start, header_offset, body_offset;
+static bool sao2_heap_block_valid(uint64_t offset, uint64_t frontier, uint64_t *next) {
     sao2_heap_header *header;
-    if (body_size > UINT64_MAX - (uint64_t)sizeof(sao2_heap_header)) return SAO2_ARENA_EXHAUSTED;
-    allocation_body = body_size == 0 ? SAO2_REF_ALIGNMENT : body_size;
-    if (allocation_body > UINT64_MAX - (uint64_t)sizeof(sao2_heap_header)) return SAO2_ARENA_EXHAUSTED;
-    total = (uint64_t)sizeof(sao2_heap_header) + allocation_body;
-    if (!sao2_align_eight(sao2_heap_arena.cursor, &predicted_start)
-        || predicted_start > UINT32_MAX - (uint64_t)sizeof(sao2_heap_header)) return SAO2_ARENA_EXHAUSTED;
-    sao2_arena_result status = sao2_arena_allocate(&sao2_heap_arena, total, alignment, &header_offset);
-    if (status != SAO2_ARENA_OK) return status;
-    if (header_offset > UINT64_MAX - (uint64_t)sizeof(sao2_heap_header)) return SAO2_ARENA_INVALID;
-    body_offset = header_offset + (uint64_t)sizeof(sao2_heap_header);
-    if (!sao2_ref_root(SAO2_ARENA_HEAP, body_offset, result)) return SAO2_ARENA_INVALID;
-    header = (sao2_heap_header *)(sao2_heap_arena.base + (size_t)header_offset);
+    uint64_t minimum_span, end, payload_capacity;
+    if (!sao2_heap_span(0, &minimum_span) || sao2_heap_arena.base == NULL
+        || offset < SAO2_ARENA_INITIAL_CURSOR || offset % SAO2_REF_ALIGNMENT != 0
+        || offset > frontier || (uint64_t)sizeof(sao2_heap_header) > frontier - offset)
+        return false;
+    header = sao2_heap_header_at(offset);
+    if (header->span_size < minimum_span || header->span_size % SAO2_REF_ALIGNMENT != 0
+        || header->span_size > frontier - offset) return false;
+    end = offset + header->span_size;
+    payload_capacity = header->span_size - (uint64_t)sizeof(sao2_heap_header);
+    if (header->block_state == SAO2_HEAP_BLOCK_ALLOCATED) {
+        if (header->body_size > payload_capacity || header->next_free != 0
+            || header->lifetime != SAO2_HEAP_LIFETIME || header->mark_epoch != 0
+            || header->reserved != 0) return false;
+    } else if (header->block_state == SAO2_HEAP_BLOCK_FREE) {
+        if (header->body_size != 0 || header->layout_identity != 0 || header->lifetime != 0
+            || header->mark_epoch != 0 || header->reserved != 0
+            || (header->next_free != 0 && (header->next_free <= offset
+                || header->next_free >= frontier || header->next_free % SAO2_REF_ALIGNMENT != 0)))
+            return false;
+    } else return false;
+    *next = end;
+    return true;
+}
+
+static bool sao2_heap_find_block(uint64_t wanted, sao2_heap_header **result) {
+    uint64_t offset = SAO2_ARENA_INITIAL_CURSOR, next;
+    while (offset < sao2_heap_arena.frontier) {
+        if (!sao2_heap_block_valid(offset, sao2_heap_arena.frontier, &next)) return false;
+        if (offset == wanted) { *result = sao2_heap_header_at(offset); return true; }
+        if (offset > wanted) return false;
+        offset = next;
+    }
+    return false;
+}
+
+static bool sao2_heap_validate(void) {
+    uint64_t offset, next, prior_free = 0, free_offset, free_count = 0, listed_count = 0;
+    bool previous_free = false;
+    if (sao2_heap_arena.base == NULL || sao2_heap_arena.frontier < SAO2_ARENA_INITIAL_CURSOR
+        || sao2_heap_arena.frontier > sao2_heap_arena.capacity
+        || (sao2_heap_arena.frontier > SAO2_ARENA_INITIAL_CURSOR
+            && sao2_heap_arena.frontier > sao2_heap_arena.committed)
+        || sao2_heap_arena.frontier % SAO2_REF_ALIGNMENT != 0) return false;
+    offset = SAO2_ARENA_INITIAL_CURSOR;
+    while (offset < sao2_heap_arena.frontier) {
+        sao2_heap_header *header;
+        if (!sao2_heap_block_valid(offset, sao2_heap_arena.frontier, &next)) return false;
+        header = sao2_heap_header_at(offset);
+        if (header->block_state == SAO2_HEAP_BLOCK_FREE) {
+            if (previous_free) return false;
+            previous_free = true;
+            free_count++;
+        } else previous_free = false;
+        offset = next;
+    }
+    if (offset != sao2_heap_arena.frontier) return false;
+    free_offset = sao2_heap_arena.free_head;
+    while (free_offset != 0) {
+        sao2_heap_header *header;
+        if (free_offset <= prior_free || !sao2_heap_find_block(free_offset, &header)
+            || header->block_state != SAO2_HEAP_BLOCK_FREE) return false;
+        prior_free = free_offset;
+        free_offset = header->next_free;
+        listed_count++;
+        if (listed_count > free_count) return false;
+    }
+    if (listed_count != free_count) return false;
+    offset = SAO2_ARENA_INITIAL_CURSOR;
+    while (offset < sao2_heap_arena.frontier) {
+        sao2_heap_header *header = sao2_heap_header_at(offset);
+        uint64_t scan = sao2_heap_arena.free_head, appearances = 0;
+        while (scan != 0) {
+            if (scan == offset) appearances++;
+            scan = sao2_heap_header_at(scan)->next_free;
+        }
+        if ((header->block_state == SAO2_HEAP_BLOCK_FREE && appearances != 1)
+            || (header->block_state == SAO2_HEAP_BLOCK_ALLOCATED && appearances != 0)) return false;
+        offset += header->span_size;
+    }
+    return true;
+}
+
+static void sao2_heap_initialize_allocated(sao2_heap_header *header, uint64_t span,
+    uint64_t body_size, uint64_t layout_identity) {
+    header->span_size = span;
     header->body_size = body_size;
     header->layout_identity = layout_identity;
+    header->next_free = 0;
     header->lifetime = SAO2_HEAP_LIFETIME;
-    header->collector_state = 0;
-    if (body_size != 0) memset(sao2_heap_arena.base + (size_t)body_offset, 0, (size_t)body_size);
+    header->block_state = SAO2_HEAP_BLOCK_ALLOCATED;
+    header->mark_epoch = 0;
+    header->reserved = 0;
+}
+
+static void sao2_heap_initialize_free(sao2_heap_header *header, uint64_t span, uint64_t next_free) {
+    header->span_size = span;
+    header->body_size = 0;
+    header->layout_identity = 0;
+    header->next_free = next_free;
+    header->lifetime = 0;
+    header->block_state = SAO2_HEAP_BLOCK_FREE;
+    header->mark_epoch = 0;
+    header->reserved = 0;
+}
+
+static sao2_arena_result sao2_heap_allocate(uint64_t body_size, uint64_t alignment,
+    uint64_t layout_identity, sao2_ref *result) {
+    uint64_t required_span, minimum_span, previous = 0, selected, body_offset;
+    sao2_ref published;
+    if (result == NULL || alignment != SAO2_REF_ALIGNMENT) return SAO2_ARENA_INVALID;
+    if (!sao2_heap_span(body_size, &required_span) || !sao2_heap_span(0, &minimum_span))
+        return SAO2_ARENA_EXHAUSTED;
+    if (!sao2_heap_validate()) return SAO2_ARENA_INVALID;
+    selected = sao2_heap_arena.free_head;
+    while (selected != 0) {
+        sao2_heap_header *header = sao2_heap_header_at(selected);
+        if (header->span_size >= required_span) break;
+        previous = selected;
+        selected = header->next_free;
+    }
+    if (selected != 0) {
+        sao2_heap_header *header = sao2_heap_header_at(selected);
+        uint64_t selected_span = header->span_size, successor = header->next_free;
+        uint64_t allocation_span = selected_span, remainder_span = selected_span - required_span;
+        uint64_t remainder_offset = 0;
+        body_offset = selected + (uint64_t)sizeof(sao2_heap_header);
+        if (!sao2_ref_root(SAO2_ARENA_HEAP, body_offset, &published)) return SAO2_ARENA_INVALID;
+        if (remainder_span >= minimum_span) {
+            allocation_span = required_span;
+            remainder_offset = selected + required_span;
+            sao2_heap_initialize_free(sao2_heap_header_at(remainder_offset), remainder_span, successor);
+            if (previous == 0) sao2_heap_arena.free_head = remainder_offset;
+            else sao2_heap_header_at(previous)->next_free = remainder_offset;
+        } else {
+            if (previous == 0) sao2_heap_arena.free_head = successor;
+            else sao2_heap_header_at(previous)->next_free = successor;
+        }
+        sao2_heap_initialize_allocated(header, allocation_span, body_size, layout_identity);
+        memset(sao2_heap_arena.base + (size_t)body_offset, 0,
+            (size_t)(allocation_span - (uint64_t)sizeof(sao2_heap_header)));
+        *result = published;
+        return SAO2_ARENA_OK;
+    } else {
+        sao2_arena_result status;
+        uint64_t header_offset = sao2_heap_arena.frontier, end;
+        sao2_heap_header *header;
+        if (header_offset > sao2_heap_arena.capacity || required_span > sao2_heap_arena.capacity - header_offset)
+            return SAO2_ARENA_EXHAUSTED;
+        end = header_offset + required_span;
+        body_offset = header_offset + (uint64_t)sizeof(sao2_heap_header);
+        if (end > UINT64_C(4294967296) || !sao2_ref_root(SAO2_ARENA_HEAP, body_offset, &published))
+            return SAO2_ARENA_EXHAUSTED;
+        status = sao2_arena_commit_through(&sao2_heap_arena, end);
+        if (status != SAO2_ARENA_OK) return status;
+        header = sao2_heap_header_at(header_offset);
+        sao2_heap_initialize_allocated(header, required_span, body_size, layout_identity);
+        memset(sao2_heap_arena.base + (size_t)body_offset, 0,
+            (size_t)(required_span - (uint64_t)sizeof(sao2_heap_header)));
+        sao2_heap_arena.frontier = end;
+        *result = published;
+    }
     return SAO2_ARENA_OK;
 }
 
 static bool sao2_heap_header_for(sao2_ref reference, sao2_heap_header **result) {
-    unsigned char *body;
     sao2_arena_kind kind;
-    if (!sao2_ref_kind(reference, &kind) || kind != SAO2_ARENA_HEAP || !sao2_ref_owner(reference, &body)) return false;
-    if ((uint64_t)(body - sao2_heap_arena.base) < (uint64_t)sizeof(sao2_heap_header)) return false;
-    *result = (sao2_heap_header *)(body - sizeof(sao2_heap_header));
+    uint64_t owner, header_offset;
+    sao2_heap_header *header;
+    if (result == NULL || !sao2_ref_kind(reference, &kind)
+        || kind != SAO2_ARENA_HEAP || !sao2_heap_validate()) return false;
+    owner = (uint64_t)(reference.owner_ptr & ~SAO2_REF_OWNER_TAG_MASK);
+    if (owner == 0 || owner < (uint64_t)sizeof(sao2_heap_header) + SAO2_ARENA_INITIAL_CURSOR)
+        return false;
+    header_offset = owner - (uint64_t)sizeof(sao2_heap_header);
+    if (!sao2_heap_find_block(header_offset, &header)
+        || header->block_state != SAO2_HEAP_BLOCK_ALLOCATED
+        || header_offset + (uint64_t)sizeof(sao2_heap_header) != owner
+        || header->lifetime != SAO2_HEAP_LIFETIME
+        || header->body_size > header->span_size - (uint64_t)sizeof(sao2_heap_header)) return false;
+    *result = header;
     return true;
+}
+
+static bool sao2_heap_reclaim(uint64_t owner_offset) {
+    uint64_t header_offset, previous = 0, next_free, merged_offset;
+    sao2_heap_header *header, *merged;
+    if (!sao2_heap_validate() || owner_offset < (uint64_t)sizeof(sao2_heap_header) + SAO2_ARENA_INITIAL_CURSOR)
+        return false;
+    header_offset = owner_offset - (uint64_t)sizeof(sao2_heap_header);
+    if (!sao2_heap_find_block(header_offset, &header)
+        || header->block_state != SAO2_HEAP_BLOCK_ALLOCATED
+        || header_offset + (uint64_t)sizeof(sao2_heap_header) != owner_offset) return false;
+    next_free = sao2_heap_arena.free_head;
+    while (next_free != 0 && next_free < header_offset) {
+        previous = next_free;
+        next_free = sao2_heap_header_at(next_free)->next_free;
+    }
+    sao2_heap_initialize_free(header, header->span_size, next_free);
+    if (previous == 0) sao2_heap_arena.free_head = header_offset;
+    else sao2_heap_header_at(previous)->next_free = header_offset;
+    merged_offset = header_offset;
+    merged = header;
+    if (previous != 0) {
+        sao2_heap_header *predecessor = sao2_heap_header_at(previous);
+        if (previous + predecessor->span_size == header_offset) {
+            predecessor->span_size += merged->span_size;
+            predecessor->next_free = merged->next_free;
+            merged_offset = previous;
+            merged = predecessor;
+        }
+    }
+    if (merged->next_free != 0 && merged_offset + merged->span_size == merged->next_free) {
+        sao2_heap_header *successor = sao2_heap_header_at(merged->next_free);
+        merged->span_size += successor->span_size;
+        merged->next_free = successor->next_free;
+    }
+    while (true) {
+        uint64_t scan = sao2_heap_arena.free_head, scan_previous = 0;
+        sao2_heap_header *tail = NULL;
+        while (scan != 0) {
+            sao2_heap_header *candidate = sao2_heap_header_at(scan);
+            if (scan + candidate->span_size == sao2_heap_arena.frontier) { tail = candidate; break; }
+            scan_previous = scan;
+            scan = candidate->next_free;
+        }
+        if (tail == NULL) break;
+        if (scan_previous == 0) sao2_heap_arena.free_head = tail->next_free;
+        else sao2_heap_header_at(scan_previous)->next_free = tail->next_free;
+        memset(sao2_heap_arena.base + (size_t)scan, 0, (size_t)tail->span_size);
+        sao2_heap_arena.frontier = scan;
+    }
+    return sao2_heap_validate();
 }
 
 typedef uint64_t sao2_scoped_mark;
 
-static sao2_scoped_mark sao2_scoped_mark_current(void) { return sao2_scoped_arena.cursor; }
+static sao2_scoped_mark sao2_scoped_mark_current(void) { return sao2_scoped_arena.frontier; }
 
 static sao2_arena_result sao2_scoped_allocate(uint64_t body_size, sao2_ref *result) {
     uint64_t offset, predicted_start;
-    if (!sao2_align_eight(sao2_scoped_arena.cursor, &predicted_start) || predicted_start > UINT32_MAX)
+    if (!sao2_align_eight(sao2_scoped_arena.frontier, &predicted_start) || predicted_start > UINT32_MAX)
         return SAO2_ARENA_EXHAUSTED;
-    sao2_arena_result status = sao2_arena_allocate(&sao2_scoped_arena, body_size, SAO2_REF_ALIGNMENT, &offset);
+    sao2_arena_result status = sao2_scoped_bump_allocate(&sao2_scoped_arena, body_size, SAO2_REF_ALIGNMENT, &offset);
     if (status != SAO2_ARENA_OK) return status;
     if (!sao2_ref_root(SAO2_ARENA_SCOPED, offset, result)) return SAO2_ARENA_INVALID;
     memset(sao2_scoped_arena.base + (size_t)offset, 0, (size_t)(body_size == 0 ? SAO2_REF_ALIGNMENT : body_size));
@@ -2243,9 +2466,9 @@ static sao2_arena_result sao2_scoped_allocate(uint64_t body_size, sao2_ref *resu
 }
 
 static bool sao2_scoped_restore(sao2_scoped_mark mark) {
-    if (sao2_scoped_arena.base == NULL || mark < SAO2_ARENA_INITIAL_CURSOR || mark > sao2_scoped_arena.cursor)
+    if (sao2_scoped_arena.base == NULL || mark < SAO2_ARENA_INITIAL_CURSOR || mark > sao2_scoped_arena.frontier)
         return false;
-    sao2_scoped_arena.cursor = mark;
+    sao2_scoped_arena.frontier = mark;
     return true;
 }
 "#;
@@ -2277,7 +2500,7 @@ static unsigned char *sao2_resolve_body(sao2_ref reference, const sao2_layout_de
             sao2_compiler_invariant();
         owner_end = owner + header->body_size;
         if (end > owner_end) sao2_compiler_invariant();
-    } else if (end > arena->cursor) {
+    } else if (end > arena->frontier) {
         sao2_compiler_invariant();
     }
     return arena->base + (size_t)member;
@@ -2921,6 +3144,29 @@ mod tests {
         Aggregate, ByteSpan, Constant, ConstantValue, FailureOperation, FailureSite,
         LocalOrigin, NominalDefinition, Operation, UnionAlternative,
     };
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct NativeProbeDirectory(PathBuf);
+
+    impl NativeProbeDirectory {
+        fn new() -> Self {
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "sao2 heap probe {} {nonce}", std::process::id(),
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for NativeProbeDirectory {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
 
     #[derive(Clone, Copy)]
     struct CoreTypes {
@@ -2969,23 +3215,280 @@ mod tests {
         let emitted = emit(&program).unwrap();
         let reference = emitted.find("typedef struct {\n    uint32_t owner_ptr;\n    uint32_t member_ptr;\n} sao2_ref;").unwrap();
         let aggregate = emitted.find("typedef struct sao2_interned_string {").unwrap();
-        let runtime = emitted.find("/*\n * Milestone 9 arena runtime.").unwrap();
+        let runtime = emitted.find("/*\n * Milestone 10 block-heap foundation.").unwrap();
         let prototype = emitted.find("sao2_unit sao2_fn_0(void);").unwrap();
         assert!(reference < aggregate && aggregate < runtime && runtime < prototype);
         assert!(emitted.contains("_Static_assert(sizeof(sao2_ref) == 8"));
         assert!(emitted.contains("#define SAO2_REF_OWNER_TAG_MASK UINT32_C(7)"));
         assert!(emitted.contains("#define SAO2_REF_HEAP_TAG UINT32_C(0)"));
         assert!(emitted.contains("#define SAO2_REF_SCOPED_TAG UINT32_C(1)"));
-        assert!(emitted.contains("(uint64_t)reference.member_ptr"));
+        assert!(emitted.contains("result->member_ptr = (uint32_t)member_offset;"));
         assert!(!emitted.contains("reference.member_ptr & ~SAO2_REF_OWNER_TAG_MASK"));
         assert!(emitted.contains("#ifdef _WIN32\n    SYSTEM_INFO information;"));
         assert!(emitted.contains("#else\n    long value = sysconf(_SC_PAGESIZE);"));
         assert!(emitted.contains("if (!sao2_arena_runtime_init())"));
         assert!(emitted.contains("sao2_arena_runtime_release();\n    return EXIT_SUCCESS;"));
-        assert!(emitted.contains("milestone 10 replaces this policy behind sao2_heap_allocate"));
         assert!(emitted.contains("static sao2_arena_result sao2_heap_allocate("));
-        assert!(emitted.contains("header->collector_state = 0;"));
-        assert!(!emitted.contains("sao2_heap_arena.cursor = 0"));
+        assert!(emitted.contains("uint64_t span_size;\n    uint64_t body_size;\n    uint64_t layout_identity;\n    uint64_t next_free;"));
+        assert!(emitted.contains("uint32_t lifetime;\n    uint32_t block_state;\n    uint32_t mark_epoch;\n    uint32_t reserved;"));
+        assert!(emitted.contains("#define SAO2_HEAP_BLOCK_ALLOCATED UINT32_C(1)"));
+        assert!(emitted.contains("#define SAO2_HEAP_BLOCK_FREE UINT32_C(2)"));
+        assert!(emitted.contains("_Static_assert(sizeof(sao2_heap_header) != 0"));
+        assert!(emitted.contains("_Static_assert(sizeof(sao2_heap_header) == 48"));
+        assert!(emitted.contains("static bool sao2_heap_validate(void)"));
+        assert!(emitted.contains("static bool sao2_heap_reclaim(uint64_t owner_offset)"));
+        assert!(emitted.contains("selected = sao2_heap_arena.free_head;"));
+        assert!(emitted.contains("if (remainder_span >= minimum_span)"));
+        assert!(emitted.contains("*result = published;"));
+        assert!(emitted.contains("sao2_scoped_bump_allocate(&sao2_scoped_arena"));
+        assert!(!emitted.contains("sao2_heap_arena.cursor"));
+        assert!(!emitted.contains("sao2_collect"));
+        assert!(!emitted.contains("shadow_frame"));
+        assert!(!emitted.contains("trace_callback"));
+    }
+
+    #[test]
+    fn native_block_heap_probe_uses_the_production_runtime() {
+        let directory = NativeProbeDirectory::new();
+        let source_path = directory.0.join("block heap probe.c");
+        let mut source = String::from(concat!(
+            "#ifndef _WIN32\n",
+            "#ifndef _POSIX_C_SOURCE\n#define _POSIX_C_SOURCE 200809L\n#endif\n",
+            "#ifndef _DEFAULT_SOURCE\n#define _DEFAULT_SOURCE\n#endif\n",
+            "#endif\n",
+            "#include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n",
+            "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n",
+            "#ifdef _WIN32\n#include <windows.h>\n#else\n#include <sys/mman.h>\n#include <unistd.h>\n#endif\n",
+            "typedef struct { uint32_t owner_ptr; uint32_t member_ptr; } sao2_ref;\n",
+            "#define SAO2_ARENA_CAPACITY UINT64_C(65536)\n",
+            "#define SAO2_RUNTIME_PROBE\n",
+            "static bool sao2_probe_fail_next_commit;\n",
+        ));
+        source.push_str(ARENA_RUNTIME);
+        source.push_str(r#"
+#define CHECK(condition) do { if (!(condition)) { fprintf(stderr, "probe check failed at line %d\n", __LINE__); return 1; } } while (0)
+#define OWNER(reference) ((uint64_t)((reference).owner_ptr & ~SAO2_REF_OWNER_TAG_MASK))
+
+static bool probe_reset(void) {
+    if (sao2_arenas_initialized) sao2_arena_runtime_release();
+    return sao2_arena_runtime_init();
+}
+
+int main(void) {
+    sao2_ref first, second, third, fourth, replacement, interior, unchanged;
+    sao2_heap_header *header;
+    uint64_t minimum_span, padded_span, committed, first_header;
+    size_t index;
+
+    CHECK(sao2_heap_span(0, &minimum_span));
+    CHECK(minimum_span == (uint64_t)sizeof(sao2_heap_header) + SAO2_REF_ALIGNMENT);
+    CHECK(sao2_heap_span(9, &padded_span));
+    CHECK(padded_span == (uint64_t)sizeof(sao2_heap_header) + UINT64_C(16));
+    CHECK(!sao2_heap_span(UINT64_MAX, &padded_span));
+
+    CHECK(probe_reset());
+    CHECK(sao2_heap_arena.frontier == SAO2_ARENA_INITIAL_CURSOR);
+    CHECK(sao2_heap_arena.free_head == 0 && sao2_heap_validate());
+    CHECK(sao2_heap_allocate(0, SAO2_REF_ALIGNMENT, UINT64_C(0), &first) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(0, SAO2_REF_ALIGNMENT, UINT64_C(91), &second) == SAO2_ARENA_OK);
+    CHECK(OWNER(first) != OWNER(second) && OWNER(first) % SAO2_REF_ALIGNMENT == 0);
+    CHECK(sao2_heap_header_for(first, &header));
+    CHECK(header->body_size == 0 && header->layout_identity == 0);
+    CHECK(header->block_state == SAO2_HEAP_BLOCK_ALLOCATED && header->span_size == minimum_span);
+    interior = first;
+    interior.member_ptr += UINT32_C(1);
+    CHECK(sao2_heap_header_for(interior, &header) && header->layout_identity == 0);
+
+    CHECK(probe_reset());
+    CHECK(sao2_heap_allocate(16, SAO2_REF_ALIGNMENT, UINT64_C(1), &first) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(2), &second) == SAO2_ARENA_OK);
+    memset(sao2_heap_arena.base + (size_t)OWNER(first), 0xa5, 16);
+    committed = sao2_heap_arena.committed;
+    CHECK(sao2_heap_reclaim(OWNER(first)));
+    CHECK(!sao2_heap_header_for(first, &header));
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(3), &replacement) == SAO2_ARENA_OK);
+    CHECK(OWNER(replacement) == OWNER(first) && sao2_heap_arena.committed == committed);
+    CHECK(sao2_heap_header_for(replacement, &header));
+    CHECK(header->span_size == (uint64_t)sizeof(sao2_heap_header) + UINT64_C(16));
+    for (index = 0; index < 16; index++)
+        CHECK(sao2_heap_arena.base[(size_t)OWNER(replacement) + index] == 0);
+    CHECK(OWNER(second) != OWNER(replacement));
+
+    CHECK(probe_reset());
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(10), &first) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(11), &second) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(80, SAO2_REF_ALIGNMENT, UINT64_C(12), &third) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(13), &fourth) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_reclaim(OWNER(first)) && sao2_heap_reclaim(OWNER(third)));
+    CHECK(sao2_heap_allocate(16, SAO2_REF_ALIGNMENT, UINT64_C(14), &replacement) == SAO2_ARENA_OK);
+    CHECK(OWNER(replacement) == OWNER(third));
+    CHECK(OWNER(second) != OWNER(replacement) && OWNER(fourth) != OWNER(replacement));
+
+    CHECK(probe_reset());
+    CHECK(sao2_heap_allocate(64, SAO2_REF_ALIGNMENT, UINT64_C(20), &first) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(21), &second) == SAO2_ARENA_OK);
+    first_header = OWNER(first) - (uint64_t)sizeof(sao2_heap_header);
+    CHECK(sao2_heap_reclaim(OWNER(first)));
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(22), &replacement) == SAO2_ARENA_OK);
+    CHECK(OWNER(replacement) == OWNER(first));
+    CHECK(sao2_heap_arena.free_head == first_header + minimum_span);
+    CHECK(sao2_heap_header_at(sao2_heap_arena.free_head)->span_size == minimum_span);
+
+    CHECK(probe_reset());
+    CHECK(sao2_heap_allocate(56, SAO2_REF_ALIGNMENT, UINT64_C(30), &first) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(31), &second) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_reclaim(OWNER(first)));
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(32), &replacement) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_arena.free_head == 0);
+    CHECK(sao2_heap_header_for(replacement, &header));
+    CHECK(header->span_size == (uint64_t)sizeof(sao2_heap_header) + UINT64_C(56));
+
+    CHECK(probe_reset());
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(40), &first) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(41), &second) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(42), &third) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(43), &fourth) == SAO2_ARENA_OK);
+    first_header = OWNER(first) - (uint64_t)sizeof(sao2_heap_header);
+    CHECK(sao2_heap_reclaim(OWNER(second)));
+    CHECK(sao2_heap_reclaim(OWNER(third)));
+    CHECK(sao2_heap_header_at(OWNER(second) - sizeof(sao2_heap_header))->span_size == minimum_span * 2);
+    CHECK(sao2_heap_reclaim(OWNER(first)));
+    CHECK(sao2_heap_arena.free_head == first_header);
+    CHECK(sao2_heap_header_at(first_header)->span_size == minimum_span * 3);
+    committed = sao2_heap_arena.committed;
+    CHECK(sao2_heap_reclaim(OWNER(fourth)));
+    CHECK(sao2_heap_arena.frontier == SAO2_ARENA_INITIAL_CURSOR);
+    CHECK(sao2_heap_arena.free_head == 0 && sao2_heap_arena.committed == committed);
+
+    CHECK(probe_reset());
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(44), &first) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(45), &second) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(46), &third) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(47), &fourth) == SAO2_ARENA_OK);
+    first_header = OWNER(first) - (uint64_t)sizeof(sao2_heap_header);
+    CHECK(sao2_heap_reclaim(OWNER(first)) && sao2_heap_reclaim(OWNER(third)));
+    CHECK(sao2_heap_reclaim(OWNER(second)));
+    CHECK(sao2_heap_arena.free_head == first_header);
+    CHECK(sao2_heap_header_at(first_header)->span_size == minimum_span * 3);
+    CHECK(sao2_heap_validate() && sao2_heap_header_for(fourth, &header));
+
+    CHECK(probe_reset());
+    unchanged.owner_ptr = UINT32_C(0x11223344);
+    unchanged.member_ptr = UINT32_C(0x55667788);
+    {
+        sao2_arena before = sao2_heap_arena;
+        sao2_probe_fail_next_commit = true;
+        CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(50), &unchanged)
+            == SAO2_ARENA_COMMIT_FAILED);
+        CHECK(memcmp(&before, &sao2_heap_arena, sizeof before) == 0);
+        CHECK(unchanged.owner_ptr == UINT32_C(0x11223344)
+            && unchanged.member_ptr == UINT32_C(0x55667788));
+    }
+
+    CHECK(probe_reset());
+    {
+        sao2_scoped_mark mark = sao2_scoped_mark_current();
+        CHECK(sao2_scoped_allocate(13, &first) == SAO2_ARENA_OK);
+        CHECK((first.owner_ptr & SAO2_REF_OWNER_TAG_MASK) == SAO2_REF_SCOPED_TAG);
+        memset(sao2_scoped_arena.base + (size_t)OWNER(first), 0x7f, 13);
+        CHECK(sao2_scoped_restore(mark));
+        CHECK(sao2_scoped_allocate(13, &second) == SAO2_ARENA_OK);
+        CHECK(OWNER(first) == OWNER(second));
+        for (index = 0; index < 13; index++)
+            CHECK(sao2_scoped_arena.base[(size_t)OWNER(second) + index] == 0);
+    }
+
+    CHECK(probe_reset());
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(60), &first) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(61), &second) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_header_for(first, &header));
+    header->reserved = UINT32_C(1);
+    CHECK(!sao2_heap_validate());
+    header->reserved = 0;
+    header->lifetime = UINT32_C(1);
+    CHECK(!sao2_heap_validate());
+    header->lifetime = SAO2_HEAP_LIFETIME;
+    header->span_size = 0;
+    CHECK(!sao2_heap_validate());
+    header->span_size = minimum_span - SAO2_REF_ALIGNMENT;
+    CHECK(!sao2_heap_validate());
+    header->span_size = minimum_span + UINT64_C(1);
+    CHECK(!sao2_heap_validate());
+    header->span_size = UINT64_MAX;
+    CHECK(!sao2_heap_validate());
+    header->span_size = minimum_span;
+    header->block_state = UINT32_C(99);
+    CHECK(!sao2_heap_validate());
+    header->block_state = SAO2_HEAP_BLOCK_ALLOCATED;
+    CHECK(sao2_heap_validate());
+    sao2_heap_arena.frontier += SAO2_REF_ALIGNMENT;
+    CHECK(!sao2_heap_validate());
+    sao2_heap_arena.frontier -= SAO2_REF_ALIGNMENT;
+    CHECK(sao2_heap_reclaim(OWNER(first)));
+    header = sao2_heap_header_at(SAO2_ARENA_INITIAL_CURSOR);
+    sao2_heap_arena.free_head = 0;
+    CHECK(!sao2_heap_validate());
+    sao2_heap_arena.free_head = SAO2_ARENA_INITIAL_CURSOR;
+    header->next_free = SAO2_ARENA_INITIAL_CURSOR;
+    CHECK(!sao2_heap_validate());
+
+    CHECK(probe_reset());
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(62), &first) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(63), &second) == SAO2_ARENA_OK);
+    sao2_heap_arena.free_head = SAO2_ARENA_INITIAL_CURSOR;
+    CHECK(!sao2_heap_validate());
+
+    CHECK(probe_reset());
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(64), &first) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(65), &second) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(66), &third) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_reclaim(OWNER(first)));
+    header = sao2_heap_header_at(OWNER(second) - (uint64_t)sizeof(sao2_heap_header));
+    sao2_heap_initialize_free(header, minimum_span, 0);
+    sao2_heap_header_at(SAO2_ARENA_INITIAL_CURSOR)->next_free =
+        OWNER(second) - (uint64_t)sizeof(sao2_heap_header);
+    CHECK(!sao2_heap_validate());
+
+    CHECK(probe_reset());
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(67), &first) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(68), &second) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(69), &third) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(8, SAO2_REF_ALIGNMENT, UINT64_C(70), &fourth) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_reclaim(OWNER(first)) && sao2_heap_reclaim(OWNER(third)));
+    sao2_heap_header_at(OWNER(third) - (uint64_t)sizeof(sao2_heap_header))->next_free =
+        OWNER(first) - (uint64_t)sizeof(sao2_heap_header);
+    CHECK(!sao2_heap_validate());
+
+    CHECK(probe_reset());
+    unchanged.owner_ptr = UINT32_C(0x01020304);
+    unchanged.member_ptr = UINT32_C(0x05060708);
+    while (sao2_heap_allocate(512, SAO2_REF_ALIGNMENT, UINT64_C(70), &first) == SAO2_ARENA_OK) {}
+    CHECK(sao2_heap_allocate(512, SAO2_REF_ALIGNMENT, UINT64_C(70), &unchanged) == SAO2_ARENA_EXHAUSTED);
+    CHECK(unchanged.owner_ptr == UINT32_C(0x01020304)
+        && unchanged.member_ptr == UINT32_C(0x05060708));
+    CHECK(sao2_heap_validate());
+
+    sao2_arena_runtime_release();
+    CHECK(!sao2_arenas_initialized && sao2_heap_arena.base == NULL
+        && sao2_heap_arena.frontier == 0 && sao2_heap_arena.free_head == 0);
+    return 0;
+}
+"#);
+        fs::write(&source_path, source).unwrap();
+
+        let executable = match crate::host_compiler::compile(&source_path) {
+            Ok(executable) => executable,
+            Err(error) if error.to_string().contains("no supported C compiler found") => return,
+            Err(error) => panic!("native block-heap probe did not compile: {error}"),
+        };
+        let output = Command::new(executable).output().unwrap();
+        assert!(
+            output.status.success(),
+            "native block-heap probe failed with {}: {}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     #[test]
@@ -3019,6 +3522,7 @@ mod tests {
         assert!(emitted.contains("sao2_layout_def_0 = { UINT64_C(0), UINT64_C(8), UINT64_C(8), 1"));
         assert!(emitted.contains("sao2_layout_def_1 = { UINT64_C(1), UINT64_C(24), UINT64_C(8), 3"));
         assert!(emitted.contains("static void sao2_allocate_struct(const sao2_layout_descriptor *layout, size_t site,"));
+        assert!(emitted.contains("owner_end = owner + header->body_size;\n        if (end > owner_end)"));
         assert!(!emitted.contains("names must not leak"));
     }
 
