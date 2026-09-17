@@ -616,7 +616,7 @@ impl<'a> LayoutPlanner<'a> {
         }
         let size = align_up(offset, alignment, definition)?;
         if size > u64::from(u32::MAX) { return Err(CEmissionError::Invariant(BackendInvariant { definition: Some(definition), ty: None, message: "struct body does not fit packed arena offset ABI".into() })); }
-        let layout = StructLayout { definition, identity: definition.index() as u64, size, align: alignment, fields: planned };
+        let layout = StructLayout { definition, identity: layout_identity(definition)?, size, align: alignment, fields: planned };
         self.struct_states.iter_mut().find(|(id, _)| *id == definition).expect("struct visit state").1 = VisitState::Complete;
         self.structs.push(layout);
         Ok(())
@@ -632,7 +632,7 @@ impl<'a> LayoutPlanner<'a> {
         Ok(match &self.program.types[ty.index()] {
             Type::Unit | Type::Primitive(PrimitiveType::Bool | PrimitiveType::Char) => (1, 1, None),
             Type::Primitive(PrimitiveType::Int | PrimitiveType::Float) | Type::Primitive(PrimitiveType::Str) => (8, 8, None),
-            Type::Nominal(definition) if matches!(self.program.definitions[definition.index()].layout, DefinitionLayout::Struct(_)) => (8, 4, Some(definition.index() as u64)),
+            Type::Nominal(definition) if matches!(self.program.definitions[definition.index()].layout, DefinitionLayout::Struct(_)) => (8, 4, Some(layout_identity(*definition)?)),
             Type::Nominal(definition) => self.aggregate_physical(AggregateId::Definition(*definition))?,
             Type::Union(_) => self.aggregate_physical(AggregateId::AnonymousUnion(ty))?,
             Type::List(_) | Type::Map { .. } => return Err(CEmissionError::Invariant(BackendInvariant { definition: None, ty: Some(ty), message: "container has no Stage 2 physical carrier".into() })),
@@ -658,6 +658,13 @@ fn align_up(value: u64, align: u64, definition: DefinitionId) -> Result<u64, CEm
     if align == 0 { return Err(CEmissionError::Invariant(BackendInvariant { definition: Some(definition), ty: None, message: "zero layout alignment".into() })); }
     let remainder = value % align;
     if remainder == 0 { Ok(value) } else { value.checked_add(align - remainder).ok_or_else(|| CEmissionError::Invariant(BackendInvariant { definition: Some(definition), ty: None, message: "layout alignment overflow".into() })) }
+}
+
+fn layout_identity(definition: DefinitionId) -> Result<u64, CEmissionError> {
+    u64::try_from(definition.index()).map_err(|_| CEmissionError::Invariant(BackendInvariant {
+        definition: Some(definition), ty: None,
+        message: "struct layout identity cannot be represented as uint64_t".into(),
+    }))
 }
 
 struct Renderer<'a> {
@@ -1959,7 +1966,11 @@ fn failure_operation_macro(operation: FailureOperation) -> &'static str {
 
 const ARENA_RUNTIME: &str = r#"
 
-/* Stage 4 arena runtime. Struct construction and projections use the monotonic heap only. */
+/*
+ * Milestone 9 arena runtime. Heap allocation is deliberately monotonic until
+ * milestone 10 replaces this policy behind sao2_heap_allocate. Scoped
+ * allocation is independently managed and restored by function marks.
+ */
 #define SAO2_ARENA_CAPACITY UINT64_C(4294967296)
 #define SAO2_ARENA_INITIAL_CURSOR UINT64_C(8)
 #define SAO2_REF_OWNER_TAG_MASK UINT32_C(7)
@@ -2958,7 +2969,7 @@ mod tests {
         let emitted = emit(&program).unwrap();
         let reference = emitted.find("typedef struct {\n    uint32_t owner_ptr;\n    uint32_t member_ptr;\n} sao2_ref;").unwrap();
         let aggregate = emitted.find("typedef struct sao2_interned_string {").unwrap();
-        let runtime = emitted.find("/* Stage 4 arena runtime.").unwrap();
+        let runtime = emitted.find("/*\n * Milestone 9 arena runtime.").unwrap();
         let prototype = emitted.find("sao2_unit sao2_fn_0(void);").unwrap();
         assert!(reference < aggregate && aggregate < runtime && runtime < prototype);
         assert!(emitted.contains("_Static_assert(sizeof(sao2_ref) == 8"));
@@ -2971,6 +2982,10 @@ mod tests {
         assert!(emitted.contains("#else\n    long value = sysconf(_SC_PAGESIZE);"));
         assert!(emitted.contains("if (!sao2_arena_runtime_init())"));
         assert!(emitted.contains("sao2_arena_runtime_release();\n    return EXIT_SUCCESS;"));
+        assert!(emitted.contains("milestone 10 replaces this policy behind sao2_heap_allocate"));
+        assert!(emitted.contains("static sao2_arena_result sao2_heap_allocate("));
+        assert!(emitted.contains("header->collector_state = 0;"));
+        assert!(!emitted.contains("sao2_heap_arena.cursor = 0"));
     }
 
     #[test]
@@ -2987,6 +3002,14 @@ mod tests {
         let _outer_type = program.intern_type(Type::Nominal(outer));
         add_main(&mut program, types, location);
 
+        let layouts = LayoutPlanner::new(&program).plan().unwrap();
+        let outer_layout = layouts.structs.iter().find(|layout| layout.definition == outer).unwrap();
+        assert_eq!(outer_layout.identity, layout_identity(outer).unwrap());
+        assert_eq!(outer_layout.fields.iter().map(|field| field.ty).collect::<Vec<_>>(),
+            vec![types.boolean, inner_type, inner_type]);
+        assert_eq!(outer_layout.fields.iter().map(|field| field.storage).collect::<Vec<_>>(),
+            vec![MemberStorage::Inline, MemberStorage::Inline, MemberStorage::Referenced]);
+
         let emitted = emit(&program).unwrap();
         assert!(emitted.contains("typedef struct sao2_body_def_0 sao2_body_def_0;"));
         assert!(emitted.contains("struct sao2_body_def_0 {\n    int64_t field_0;\n};"));
@@ -2995,6 +3018,7 @@ mod tests {
         assert!(emitted.contains("offsetof(sao2_body_def_1, field_2) == UINT64_C(16)"));
         assert!(emitted.contains("sao2_layout_def_0 = { UINT64_C(0), UINT64_C(8), UINT64_C(8), 1"));
         assert!(emitted.contains("sao2_layout_def_1 = { UINT64_C(1), UINT64_C(24), UINT64_C(8), 3"));
+        assert!(emitted.contains("static void sao2_allocate_struct(const sao2_layout_descriptor *layout, size_t site,"));
         assert!(!emitted.contains("names must not leak"));
     }
 

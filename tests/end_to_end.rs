@@ -305,6 +305,119 @@ fn constructs_compares_projects_and_narrows_tuples() {
 }
 
 #[test]
+fn runs_inline_and_referenced_struct_graphs() {
+    let directory = TestDirectory::new("struct graph");
+    let source = br#"
+        type Leaf(value int);
+        type Pair(left Leaf, right Leaf, shared &Leaf);
+        type Byte(value char);
+        type Packed(prefix char, first Byte, second Byte);
+        type Wrapper(packed Packed);
+        type Numbers(int, int);
+        type Choice(int | bool);
+        type Carrier(numbers Numbers, choice Choice);
+        fn inspect(leaf Leaf) int { leaf.value }
+        fn main() {
+            old := Leaf(value = 1);
+            var pair := Pair(
+                left = Leaf(value = 2),
+                right = Leaf(value = 3),
+                shared = old
+            );
+            left_alias := pair.left;
+            right_alias := pair.right;
+            println(left_alias == pair.left);
+            println(left_alias == right_alias);
+            pair.left = Leaf(value = 9);
+            println(left_alias.value);
+            pair.shared = Leaf(value = 4);
+            println(old.value);
+            println(pair.shared.value);
+            println(inspect(left_alias));
+            wrapper := Wrapper(packed = Packed(
+                prefix = 'x',
+                first = Byte(value = 'a'),
+                second = Byte(value = 'b')
+            ));
+            first_byte := wrapper.packed.first;
+            second_byte := wrapper.packed.second;
+            println(first_byte == wrapper.packed.first);
+            println(first_byte == second_byte);
+            println(first_byte.value);
+            carrier := Carrier(numbers = Numbers(5, 6), choice = Choice(7));
+            println(carrier.numbers.1);
+            choice := carrier.choice;
+            if choice is int: println(choice);
+        }
+    "#;
+    let output = run_source(&directory, source);
+    assert!(
+        !compiler_is_missing(&output),
+        "native end-to-end tests require a supported C compiler: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"true\nfalse\n9\n1\n4\n9\ntrue\nfalse\na\n6\n7\n");
+}
+
+#[test]
+fn runs_struct_returns_and_control_flow() {
+    let directory = TestDirectory::new("struct returns");
+    let source = br#"
+        type Node(value int);
+        fn make(value int) Node { Node(value = value) }
+        fn main() {
+            var total := 0;
+            var index := 0;
+            while index < 3 {
+                node := make(index + 10);
+                total += node.value;
+                index += 1;
+            }
+            println(total);
+        }
+    "#;
+    let output = run_source(&directory, source);
+    assert!(
+        !compiler_is_missing(&output),
+        "native end-to-end tests require a supported C compiler: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"33\n");
+}
+
+#[test]
+fn rejects_invalid_struct_programs_before_c_emission() {
+    let cases: &[(&str, &[u8], &str)] = &[
+        (
+            "immutable member",
+            b"type Point(value int); fn main() { point := Point(value = 1); point.value = 2; }",
+            "must be declared 'var'",
+        ),
+        (
+            "incompatible field",
+            b"type Point(value int); fn main() { Point(value = true); }",
+            "expression type does not match expected type",
+        ),
+        (
+            "inline cycle",
+            b"type Loop(child Loop); fn main() {}",
+            "infinite",
+        ),
+    ];
+    for (label, source, expected) in cases {
+        let directory = TestDirectory::new(label);
+        let source_path = directory.write_source("invalid struct.sao2", source);
+        let output = sao2(&directory.0, &[OsStr::new("build"), source_path.as_os_str()]);
+        assert_eq!(output.status.code(), Some(1), "{label}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{label}: {stderr}");
+        assert!(!directory.0.join("build/program.c").exists(), "{label}");
+    }
+}
+
+#[test]
 fn reports_string_index_failures() {
     let directory = TestDirectory::new("string index failure");
     let output = run_source(&directory, b"fn main() { \"x\"[1]; }");
