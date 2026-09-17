@@ -38,6 +38,20 @@ impl fmt::Display for EscapeError { fn fmt(&self, f: &mut fmt::Formatter<'_>) ->
 impl std::error::Error for EscapeError {}
 
 impl AllocationPlan {
+    /// Returns the lifetime class recorded for one exact struct-construction
+    /// operation. The entries are maintained in `AllocationId` order, so the
+    /// backend need not reconstruct a renderer-local lookup table.
+    pub(crate) fn allocation_class(&self, id: AllocationId) -> Option<AllocationClass> {
+        self.allocations.binary_search_by_key(&id, |(entry, _)| *entry)
+            .ok()
+            .map(|index| self.allocations[index].1)
+    }
+
+    /// Whether this function owns an invocation-wide scoped-arena mark.
+    pub(crate) fn function_has_scoped(&self, id: FunctionId) -> bool {
+        self.has_scoped.get(id.index()).copied().unwrap_or(false)
+    }
+
     #[allow(dead_code)] // Stable test/debug rendering for this compiler-owned artifact.
     pub(crate) fn render(&self) -> String {
         let mut output = String::new();
@@ -291,9 +305,16 @@ mod tests {
     fn local_struct_allocation_is_scoped_but_returning_it_is_heap() {
         let local = analyze(&program(false)).unwrap();
         assert_eq!(local.allocations[0].1, AllocationClass::Scoped);
+        let allocation = local.allocations[0].0;
+        assert_eq!(local.allocation_class(allocation), Some(AllocationClass::Scoped));
+        assert!(local.function_has_scoped(FunctionId::from_index(0)));
+        assert_eq!(local.allocation_class(AllocationId {
+            function: FunctionId::from_index(0), block: BlockId::from_index(0), operation: 1,
+        }), None);
         assert!(!local.summaries[0].conservative);
         let returned = analyze(&program(true)).unwrap();
         assert_eq!(returned.allocations[0].1, AllocationClass::Heap);
+        assert!(!returned.function_has_scoped(FunctionId::from_index(0)));
         assert_eq!(local.render(), analyze(&program(false)).unwrap().render());
     }
 }

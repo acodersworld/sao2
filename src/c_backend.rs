@@ -11,7 +11,7 @@ use crate::ir::{
     NumericConversion, OperationKind, OperationSite, Operand, Place, PrimitiveType, Projection,
     RuntimeCheck, TerminatorKind, Type, TypeId, UnaryOperator, ValidationError,
 };
-use crate::escape::{self, AllocationPlan};
+use crate::escape::{self, AllocationClass, AllocationId, AllocationPlan};
 
 #[allow(dead_code)] // Retained as the validated-program convenience boundary for direct backend tests.
 pub(crate) fn emit(program: &ir::Program) -> Result<String, CEmissionError> {
@@ -24,8 +24,8 @@ pub(crate) fn emit(program: &ir::Program) -> Result<String, CEmissionError> {
     emit_with_plan(program, &plan)
 }
 
-/// Stage 5's explicit backend boundary.  The plan is deliberately validated
-/// here even though Stage 5 still renders both classes through the heap.
+/// The validated escape plan is the backend's sole authority for choosing a
+/// struct allocation arena.
 pub(crate) fn emit_with_plan(program: &ir::Program, plan: &AllocationPlan) -> Result<String, CEmissionError> {
     program.validate().map_err(CEmissionError::InvalidIr)?;
     plan.validate(program).map_err(|error| CEmissionError::Invariant(BackendInvariant {
@@ -33,7 +33,7 @@ pub(crate) fn emit_with_plan(program: &ir::Program, plan: &AllocationPlan) -> Re
     }))?;
     CapabilityValidator::new(program).validate()?;
     let layouts = LayoutPlanner::new(program).plan()?;
-    Ok(Renderer::new(program, layouts).render())
+    Ok(Renderer::new(program, plan, layouts).render())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -662,6 +662,7 @@ fn align_up(value: u64, align: u64, definition: DefinitionId) -> Result<u64, CEm
 
 struct Renderer<'a> {
     program: &'a ir::Program,
+    allocation_plan: &'a AllocationPlan,
     definitions: Vec<AggregateId>,
     struct_layouts: Vec<StructLayout>,
     strings: Vec<StringLiteral>,
@@ -676,8 +677,8 @@ struct StringLiteral {
 }
 
 impl<'a> Renderer<'a> {
-    fn new(program: &'a ir::Program, layouts: LayoutPlan) -> Self {
-        let mut renderer = Self { program, definitions: layouts.aggregates, struct_layouts: layouts.structs, strings: collect_strings(program), labels: Vec::new(), output: String::new() };
+    fn new(program: &'a ir::Program, allocation_plan: &'a AllocationPlan, layouts: LayoutPlan) -> Self {
+        let mut renderer = Self { program, allocation_plan, definitions: layouts.aggregates, struct_layouts: layouts.structs, strings: collect_strings(program), labels: Vec::new(), output: String::new() };
         renderer.plan_format_labels();
         renderer
     }
@@ -1384,17 +1385,24 @@ impl<'a> Renderer<'a> {
         for (position, local) in function.parameters.iter().enumerate() {
             let _ = writeln!(self.output, "    sao2_local_{} = sao2_arg_{position};", local.index());
         }
+        let has_scoped = self.allocation_plan.function_has_scoped(id);
+        if has_scoped {
+            self.output.push_str("    sao2_scoped_mark sao2_function_mark = sao2_scoped_mark_current();\n");
+        }
         let entry = function.entry.expect("validated function entry");
         let _ = writeln!(self.output, "    goto sao2_block_{};", entry.index());
         for (block_index, block) in function.blocks.iter().enumerate() {
             let _ = writeln!(self.output, "sao2_block_{block_index}:");
-            for operation in &block.operations { self.render_operation(function, &operation.kind); }
-            self.render_terminator(function, &block.terminator.as_ref().expect("validated block").kind);
+            for (operation_index, operation) in block.operations.iter().enumerate() {
+                self.render_operation(id, ir::BlockId::from_index(block_index), operation_index, function, &operation.kind);
+            }
+            self.render_terminator(function, has_scoped, &block.terminator.as_ref().expect("validated block").kind);
         }
         self.output.push_str("}\n");
     }
 
-    fn render_operation(&mut self, function: &Function, operation: &OperationKind) {
+    fn render_operation(&mut self, function_id: FunctionId, block_id: ir::BlockId,
+        operation_index: usize, function: &Function, operation: &OperationKind) {
         match operation {
             OperationKind::Copy { destination, operand } => {
                 let value = self.operand(operand);
@@ -1479,7 +1487,10 @@ impl<'a> Renderer<'a> {
                 }
             }
             OperationKind::Aggregate { destination, aggregate: ir::Aggregate::Struct { definition, fields, failure } } => {
-                self.render_struct_aggregate(*destination, *definition, fields, *failure);
+                let allocation = AllocationId { function: function_id, block: block_id, operation: operation_index };
+                let class = self.allocation_plan.allocation_class(allocation)
+                    .expect("validated allocation plan covers every struct aggregate");
+                self.render_struct_aggregate(*destination, *definition, fields, *failure, class);
             }
             OperationKind::Check(check) => self.render_check(function, check),
             OperationKind::Aggregate { .. } | OperationKind::Builtin { .. }
@@ -1489,7 +1500,7 @@ impl<'a> Renderer<'a> {
     }
 
     fn render_struct_aggregate(&mut self, destination: LocalId, definition: DefinitionId,
-        operands: &[(ir::FieldId, Operand)], failure: FailureSiteId) {
+        operands: &[(ir::FieldId, Operand)], failure: FailureSiteId, class: AllocationClass) {
         let layout = self.struct_layouts.iter().find(|item| item.definition == definition)
             .expect("validated struct layout").clone();
         let id = destination.index();
@@ -1497,7 +1508,11 @@ impl<'a> Renderer<'a> {
         let _ = writeln!(self.output, "    sao2_ref sao2_struct_ref_{id};");
         let _ = writeln!(self.output, "    unsigned char *sao2_struct_bytes_{id};");
         let _ = writeln!(self.output, "    sao2_body_def_{} *sao2_struct_body_{id};", definition.index());
-        let _ = writeln!(self.output, "    sao2_allocate_struct(&sao2_layout_def_{}, {}, &sao2_struct_ref_{id}, &sao2_struct_bytes_{id});", definition.index(), failure.index());
+        let allocation_helper = match class {
+            AllocationClass::Scoped => "sao2_allocate_scoped_struct",
+            AllocationClass::Heap => "sao2_allocate_struct",
+        };
+        let _ = writeln!(self.output, "    {allocation_helper}(&sao2_layout_def_{}, {}, &sao2_struct_ref_{id}, &sao2_struct_bytes_{id});", definition.index(), failure.index());
         let _ = writeln!(self.output, "    sao2_struct_body_{id} = (sao2_body_def_{0} *)sao2_struct_bytes_{id};", definition.index());
         for field in &layout.fields {
             let (_, operand) = operands.iter().find(|(field_id, _)| *field_id == field.id)
@@ -1515,7 +1530,7 @@ impl<'a> Renderer<'a> {
         self.output.push_str("    }\n");
     }
 
-    fn render_terminator(&mut self, function: &Function, terminator: &TerminatorKind) {
+    fn render_terminator(&mut self, function: &Function, has_scoped: bool, terminator: &TerminatorKind) {
         match terminator {
             TerminatorKind::Jump(target) => {
                 let _ = writeln!(self.output, "    goto sao2_block_{};", target.index());
@@ -1530,7 +1545,15 @@ impl<'a> Renderer<'a> {
             }
             TerminatorKind::Return(value) => {
                 let value = self.operand(value);
-                let _ = writeln!(self.output, "    return {value};");
+                if has_scoped {
+                    let result = self.c_type(function.result);
+                    self.output.push_str("    {\n");
+                    let _ = writeln!(self.output, "        {result} sao2_return_value = {value};");
+                    self.output.push_str("        if (!sao2_scoped_restore(sao2_function_mark)) sao2_compiler_invariant();\n");
+                    self.output.push_str("        return sao2_return_value;\n    }\n");
+                } else {
+                    let _ = writeln!(self.output, "    return {value};");
+                }
             }
             TerminatorKind::Panic { message, failure } => {
                 let message = self.operand(message);
@@ -2289,6 +2312,26 @@ static void sao2_allocate_struct(const sao2_layout_descriptor *layout, size_t si
         ) sao2_compiler_invariant();
     *body = sao2_resolve_body(*reference, layout);
 }
+
+static void sao2_allocate_scoped_struct(const sao2_layout_descriptor *layout, size_t site,
+    sao2_ref *reference, unsigned char **body) {
+    sao2_arena_result status = sao2_scoped_allocate(layout->size, reference);
+    uint32_t owner_offset;
+    if (status == SAO2_ARENA_EXHAUSTED) {
+        static const unsigned char reason[] = "scoped arena exhausted";
+        sao2_fail(site, SAO2_FAILURE_STRUCT_ALLOCATION, reason, sizeof reason - 1);
+    }
+    if (status == SAO2_ARENA_COMMIT_FAILED) {
+        static const unsigned char reason[] = "unable to commit scoped storage";
+        sao2_fail(site, SAO2_FAILURE_STRUCT_ALLOCATION, reason, sizeof reason - 1);
+    }
+    if (status != SAO2_ARENA_OK) sao2_compiler_invariant();
+    owner_offset = reference->owner_ptr & ~SAO2_REF_OWNER_TAG_MASK;
+    if ((reference->owner_ptr & SAO2_REF_OWNER_TAG_MASK) != SAO2_REF_SCOPED_TAG
+        || owner_offset == 0 || owner_offset % SAO2_REF_ALIGNMENT != 0
+        || reference->member_ptr != owner_offset) sao2_compiler_invariant();
+    *body = sao2_resolve_body(*reference, layout);
+}
 "#;
 
 const SCALAR_RUNTIME: &str = r#"
@@ -2956,7 +2999,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_heap_struct_construction_and_reference_equality() {
+    fn renders_scoped_struct_construction_and_reference_equality() {
         let (mut program, types, location) = program();
         let definition = program.add_definition(NominalDefinition::structure("Point"));
         let point = program.intern_type(Type::Nominal(definition));
@@ -2991,13 +3034,55 @@ mod tests {
 
         let emitted = emit(&program).unwrap();
         assert!(emitted.contains("static inline bool sao2_ref_equal(sao2_ref left, sao2_ref right)"));
-        assert!(emitted.contains("sao2_allocate_struct(&sao2_layout_def_0, 0, &sao2_struct_ref_0, &sao2_struct_bytes_0);"));
+        assert!(emitted.contains("sao2_allocate_scoped_struct(&sao2_layout_def_0, 0, &sao2_struct_ref_0, &sao2_struct_bytes_0);"));
+        assert!(emitted.contains("sao2_scoped_mark sao2_function_mark = sao2_scoped_mark_current();"));
+        assert!(emitted.contains("int64_t sao2_return_value = INT64_C(0);"));
+        assert!(emitted.contains("if (!sao2_scoped_restore(sao2_function_mark)) sao2_compiler_invariant();"));
         assert!(emitted.contains("sao2_struct_body_0->field_0 = INT64_C(7);"));
         assert!(emitted.contains("sao2_local_0 = sao2_struct_ref_0;"));
         assert!(emitted.contains("sao2_local_1 = sao2_ref_equal(sao2_local_0, sao2_local_0);"));
         assert!(emitted.contains("sao2_local_2 = ((sao2_body_def_0 *)sao2_resolve_body(sao2_local_0, &sao2_layout_def_0))->field_0;"));
         assert!(emitted.contains("static unsigned char *sao2_resolve_body"));
         assert!(emitted.contains("sao2_fail(site, SAO2_FAILURE_STRUCT_ALLOCATION"));
+    }
+
+    #[test]
+    fn renders_mixed_struct_lifetimes_by_operation_coordinate() {
+        let (mut program, types, location) = program();
+        let definition = program.add_definition(NominalDefinition::structure("Point"));
+        let point = program.intern_type(Type::Nominal(definition));
+        program.definitions[definition.index()].add_struct_field("x", types.int, MemberStorage::Inline);
+        let failure = program.intern_failure_site(ir::FailureSite {
+            location, function: FunctionId::from_index(0), operation: FailureOperation::StructAllocation,
+            line: 1, column: 1,
+        });
+        let mut main = Function::new("main", types.int);
+        let value = main.add_local(point, None, LocalOrigin::Temporary);
+        let block = main.add_block();
+        main.entry = Some(block);
+        for integer in [1, 2] {
+            main.blocks[block.index()].push(OperationKind::Aggregate {
+                destination: value,
+                aggregate: Aggregate::Struct { definition, fields: vec![(ir::FieldId::from_index(0), constant(types.int, ConstantValue::Integer(integer)))], failure },
+            }, location);
+        }
+        main.blocks[block.index()].terminate(TerminatorKind::Return(constant(types.int, ConstantValue::Integer(0))), location);
+        let main_id = program.add_function(main);
+        program.entry = Some(main_id);
+        let plan = AllocationPlan {
+            summaries: vec![escape::FunctionSummary { parameter_escapes: Vec::new(), conservative: false }],
+            allocations: vec![
+                (AllocationId { function: main_id, block, operation: 0 }, AllocationClass::Scoped),
+                (AllocationId { function: main_id, block, operation: 1 }, AllocationClass::Heap),
+            ],
+            has_scoped: vec![true],
+        };
+
+        let emitted = emit_with_plan(&program, &plan).unwrap();
+        assert_eq!(emitted.matches("sao2_allocate_scoped_struct(&sao2_layout_def_0").count(), 1);
+        assert_eq!(emitted.matches("sao2_allocate_struct(&sao2_layout_def_0").count(), 1);
+        assert_eq!(emitted.matches("sao2_scoped_mark sao2_function_mark").count(), 1);
+        assert_eq!(emitted.matches("sao2_scoped_restore(sao2_function_mark)").count(), 1);
     }
 
     #[test]
