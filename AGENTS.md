@@ -9,7 +9,8 @@ replacing temporary stages with permanent compiler components.
 - `DESIGN.md` defines the language semantics.
 - `GRAMMAR.ebnf` defines the formal syntax.
 - `ROADMAP.md` defines the implementation milestones.
-- `CURRENT_WORK.md` defines the active milestone and its phase boundaries.
+- `CURRENT_MILESTONE.md` defines the active milestone and its stage boundaries.
+- `CURRENT_STAGE.md` defines the detailed plan for the active stage.
 
 If implementation and documentation disagree, do not silently invent new
 language behavior. Follow the design documents or update them as part of an

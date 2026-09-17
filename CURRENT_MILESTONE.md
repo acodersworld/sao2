@@ -1,4 +1,4 @@
-# Current Work: Garbage Collector
+# Current Milestone: Garbage Collector
 
 Status: current.
 
@@ -68,6 +68,9 @@ identifier spelling.
 ## Stage 1: Reclaimable heap foundation
 
 Status: current.
+
+The detailed implementation plan is in
+[Current Stage: Reclaimable Heap Foundation](CURRENT_STAGE.md).
 
 Replace the monotonic heap's private representation with a block model which
 can later sweep and reuse storage, without enabling automatic collection yet.

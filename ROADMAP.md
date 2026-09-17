@@ -92,9 +92,6 @@ runs through generated C immediately after name and type resolution.
 
 Status: complete.
 
-The phase breakdown for this milestone is in
-[Current Work: Semantic Analysis](CURRENT_WORK.md).
-
 - Type-check expressions, calls, assignments, and returns.
 - Enforce constant, `var`, transitive mutability, and tuple immutability rules.
 - Validate control flow and value-producing blocks and `if` expressions.
@@ -166,6 +163,11 @@ that pass references to inline structs without letting them escape.
 ## 10. Garbage collector
 
 Status: current.
+
+The milestone breakdown is in
+[Current Milestone: Garbage Collector](CURRENT_MILESTONE.md). The active
+implementation plan is in
+[Current Stage: Reclaimable Heap Foundation](CURRENT_STAGE.md).
 
 - Implement a non-moving, stop-the-world mark-and-sweep heap.
 - Register generated type and allocation-layout descriptors.
