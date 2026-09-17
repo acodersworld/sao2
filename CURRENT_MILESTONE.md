@@ -181,10 +181,7 @@ reachable graph remains valid and stationary.
 
 ## Stage 5: Collection policy and rollover safety
 
-Status: current.
-
-The detailed implementation plan is in
-[Current Stage: Collection Policy and Rollover Safety](CURRENT_STAGE.md).
+Status: complete.
 
 Turn the correct collector into a bounded, repeatable runtime policy. Add a
 deterministic collection threshold so reclamation is not attempted only after
@@ -212,7 +209,10 @@ correctness property depends on an epoch never wrapping.
 
 ## Stage 6: Integration and milestone closure
 
-Status: pending.
+Status: current.
+
+The detailed implementation plan is in
+[Current Stage: GC Integration and Milestone Closure](CURRENT_STAGE.md).
 
 Exercise the full public pipeline with readable source programs combining
 heap and scoped allocations, root and interior aliases, inline and referenced

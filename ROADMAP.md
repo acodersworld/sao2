@@ -167,7 +167,7 @@ Status: current.
 The milestone breakdown is in
 [Current Milestone: Garbage Collector](CURRENT_MILESTONE.md). The active
 implementation plan is in
-[Current Stage: Collection Policy and Rollover Safety](CURRENT_STAGE.md).
+[Current Stage: GC Integration and Milestone Closure](CURRENT_STAGE.md).
 
 - Implement a non-moving, stop-the-world mark-and-sweep heap.
 - Register generated type and allocation-layout descriptors.
