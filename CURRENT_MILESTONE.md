@@ -116,10 +116,7 @@ unchanged.
 
 ## Stage 2: Complete lists and entry arguments
 
-Status: current.
-
-The detailed implementation plan is in
-[Current Stage: Complete Lists and Entry Arguments](CURRENT_STAGE.md).
+Status: complete.
 
 Implement list literals, explicitly typed empty lists, length, positive and
 negative indexing, indexed replacement, append, removal by index, membership,
@@ -147,7 +144,10 @@ elements—and can consume command-line arguments.
 
 ## Stage 3: Ordered maps
 
-Status: pending.
+Status: current.
+
+The detailed implementation plan is in
+[Current Stage: Ordered Maps](CURRENT_STAGE.md).
 
 Resolve and document the outstanding map edge semantics, then implement map
 literals, explicitly typed empty maps, lookup, indexed insertion/replacement,

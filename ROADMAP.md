@@ -193,7 +193,7 @@ Status: current.
 The milestone breakdown is in
 [Current Milestone: Containers](CURRENT_MILESTONE.md). The active
 implementation plan is in
-[Current Stage: Complete Lists and Entry Arguments](CURRENT_STAGE.md).
+[Current Stage: Ordered Maps](CURRENT_STAGE.md).
 
 - Implement lists, maps, indexing, membership, iteration, and mutation.
 - Preserve insertion order in maps.
