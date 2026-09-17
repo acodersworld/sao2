@@ -33,7 +33,8 @@ pub(crate) fn emit_with_plan(program: &ir::Program, plan: &AllocationPlan) -> Re
     }))?;
     CapabilityValidator::new(program).validate()?;
     let layouts = LayoutPlanner::new(program).plan()?;
-    Ok(Renderer::new(program, plan, layouts).render())
+    let traces = TracePlanner::new(program, &layouts).plan()?;
+    Ok(Renderer::new(program, plan, layouts, traces).render())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -511,6 +512,173 @@ struct StructLayout { definition: DefinitionId, identity: u64, size: u64, align:
 #[derive(Clone, Debug)]
 struct LayoutPlan { aggregates: Vec<AggregateId>, structs: Vec<StructLayout> }
 
+#[derive(Clone, Debug)]
+struct TracePlan {
+    type_contains_reference: Vec<bool>,
+    struct_callbacks: Vec<DefinitionId>,
+    aggregate_callbacks: Vec<AggregateId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TraceVisitState { Visiting, Complete(bool) }
+
+struct TracePlanner<'a> {
+    program: &'a ir::Program,
+    layouts: &'a LayoutPlan,
+    states: Vec<Option<TraceVisitState>>,
+}
+
+impl<'a> TracePlanner<'a> {
+    fn new(program: &'a ir::Program, layouts: &'a LayoutPlan) -> Self {
+        Self { program, layouts, states: vec![None; program.types.len()] }
+    }
+
+    fn plan(mut self) -> Result<TracePlan, CEmissionError> {
+        for index in 0..self.program.types.len() {
+            self.type_contains_reference(TypeId::from_index(index))?;
+        }
+        let type_contains_reference = self.states.iter().map(|state| match state {
+            Some(TraceVisitState::Complete(value)) => *value,
+            _ => false,
+        }).collect::<Vec<_>>();
+
+        let mut aggregate_callbacks = Vec::new();
+        for aggregate in &self.layouts.aggregates {
+            let values = self.aggregate_values(*aggregate);
+            if values.into_iter().any(|ty| type_contains_reference[ty.index()]) {
+                aggregate_callbacks.push(*aggregate);
+            }
+        }
+        aggregate_callbacks.sort();
+        aggregate_callbacks.dedup();
+
+        let mut struct_callbacks = Vec::new();
+        for layout in &self.layouts.structs {
+            let carries = self.struct_contains_reference(layout.definition, &type_contains_reference, &mut Vec::new())?;
+            if carries { struct_callbacks.push(layout.definition); }
+        }
+        struct_callbacks.sort();
+        struct_callbacks.dedup();
+
+        let plan = TracePlan { type_contains_reference, struct_callbacks, aggregate_callbacks };
+        self.validate(&plan)?;
+        Ok(plan)
+    }
+
+    fn type_contains_reference(&mut self, ty: TypeId) -> Result<bool, CEmissionError> {
+        match self.states[ty.index()] {
+            Some(TraceVisitState::Complete(value)) => return Ok(value),
+            Some(TraceVisitState::Visiting) => return Err(CEmissionError::Invariant(BackendInvariant {
+                definition: None, ty: Some(ty), message: "cyclic by-value trace shape".into(),
+            })),
+            None => {}
+        }
+        self.states[ty.index()] = Some(TraceVisitState::Visiting);
+        let value = match self.program.types[ty.index()].clone() {
+            Type::Unit | Type::Primitive(_) => false,
+            Type::Nominal(definition) => match self.program.definitions[definition.index()].layout.clone() {
+                DefinitionLayout::Struct(_) => true,
+                DefinitionLayout::Tuple(fields) => {
+                    let mut found = false;
+                    for field in fields { found |= self.type_contains_reference(field)?; }
+                    found
+                }
+                DefinitionLayout::Union(alternatives) => {
+                    let mut found = false;
+                    for alternative in alternatives { found |= self.type_contains_reference(alternative.payload)?; }
+                    found
+                }
+            },
+            Type::Union(alternatives) => {
+                let mut found = false;
+                for alternative in alternatives { found |= self.type_contains_reference(alternative.payload)?; }
+                found
+            }
+            Type::List(element) => {
+                if self.type_contains_reference(element)? {
+                    return Err(CEmissionError::Invariant(BackendInvariant {
+                        definition: None, ty: Some(ty),
+                        message: "reference-bearing list traversal is unavailable before milestone 11".into(),
+                    }));
+                }
+                false
+            }
+            Type::Map { key, value } => {
+                if self.type_contains_reference(key)? || self.type_contains_reference(value)? {
+                    return Err(CEmissionError::Invariant(BackendInvariant {
+                        definition: None, ty: Some(ty),
+                        message: "reference-bearing map traversal is unavailable before milestone 11".into(),
+                    }));
+                }
+                false
+            }
+        };
+        self.states[ty.index()] = Some(TraceVisitState::Complete(value));
+        Ok(value)
+    }
+
+    fn aggregate_values(&self, aggregate: AggregateId) -> Vec<TypeId> {
+        match aggregate {
+            AggregateId::Definition(definition) => match &self.program.definitions[definition.index()].layout {
+                DefinitionLayout::Tuple(fields) => fields.clone(),
+                DefinitionLayout::Union(alternatives) => alternatives.iter().map(|item| item.payload).collect(),
+                DefinitionLayout::Struct(_) => unreachable!(),
+            },
+            AggregateId::AnonymousUnion(ty) => match &self.program.types[ty.index()] {
+                Type::Union(alternatives) => alternatives.iter().map(|item| item.payload).collect(),
+                _ => unreachable!(),
+            },
+        }
+    }
+
+    fn struct_contains_reference(&self, definition: DefinitionId, types: &[bool], visiting: &mut Vec<DefinitionId>) -> Result<bool, CEmissionError> {
+        if visiting.contains(&definition) {
+            return Err(CEmissionError::Invariant(BackendInvariant {
+                definition: Some(definition), ty: None, message: "cyclic inline struct trace shape".into(),
+            }));
+        }
+        let layout = self.layouts.structs.iter().find(|layout| layout.definition == definition)
+            .ok_or_else(|| CEmissionError::Invariant(BackendInvariant {
+                definition: Some(definition), ty: None, message: "struct trace layout is missing".into(),
+            }))?;
+        visiting.push(definition);
+        for field in &layout.fields {
+            let carries = if field.storage == MemberStorage::Inline {
+                if let Type::Nominal(child) = &self.program.types[field.ty.index()]
+                    && matches!(&self.program.definitions[child.index()].layout, DefinitionLayout::Struct(_))
+                {
+                    self.struct_contains_reference(*child, types, visiting)?
+                } else {
+                    types[field.ty.index()]
+                }
+            } else {
+                types[field.ty.index()]
+            };
+            if carries { visiting.pop(); return Ok(true); }
+        }
+        visiting.pop();
+        Ok(false)
+    }
+
+    fn validate(&self, plan: &TracePlan) -> Result<(), CEmissionError> {
+        for definition in &plan.struct_callbacks {
+            if !self.layouts.structs.iter().any(|layout| layout.definition == *definition) {
+                return Err(CEmissionError::Invariant(BackendInvariant {
+                    definition: Some(*definition), ty: None, message: "trace callback has no struct layout".into(),
+                }));
+            }
+        }
+        for window in plan.struct_callbacks.windows(2) {
+            if window[0] >= window[1] {
+                return Err(CEmissionError::Invariant(BackendInvariant {
+                    definition: Some(window[1]), ty: None, message: "duplicate or unordered struct trace callback".into(),
+                }));
+            }
+        }
+        Ok(())
+    }
+}
+
 struct LayoutPlanner<'a> {
     program: &'a ir::Program,
     states: Vec<(AggregateId, VisitState)>,
@@ -672,6 +840,7 @@ struct Renderer<'a> {
     allocation_plan: &'a AllocationPlan,
     definitions: Vec<AggregateId>,
     struct_layouts: Vec<StructLayout>,
+    trace_plan: TracePlan,
     strings: Vec<StringLiteral>,
     labels: Vec<Vec<u8>>,
     output: String,
@@ -684,8 +853,8 @@ struct StringLiteral {
 }
 
 impl<'a> Renderer<'a> {
-    fn new(program: &'a ir::Program, allocation_plan: &'a AllocationPlan, layouts: LayoutPlan) -> Self {
-        let mut renderer = Self { program, allocation_plan, definitions: layouts.aggregates, struct_layouts: layouts.structs, strings: collect_strings(program), labels: Vec::new(), output: String::new() };
+    fn new(program: &'a ir::Program, allocation_plan: &'a AllocationPlan, layouts: LayoutPlan, trace_plan: TracePlan) -> Self {
+        let mut renderer = Self { program, allocation_plan, definitions: layouts.aggregates, struct_layouts: layouts.structs, trace_plan, strings: collect_strings(program), labels: Vec::new(), output: String::new() };
         renderer.plan_format_labels();
         renderer
     }
@@ -757,12 +926,17 @@ impl<'a> Renderer<'a> {
             self.output.push('\n');
             let layouts = self.struct_layouts.clone();
             for layout in &layouts { self.render_struct_body(layout); self.output.push('\n'); }
+            self.render_trace_declarations();
             self.render_struct_descriptors(&layouts);
         }
         self.render_runtime_metadata();
         self.render_writer_declarations();
         self.render_scalar_helpers();
         self.render_arena_runtime();
+        if !self.struct_layouts.is_empty() {
+            self.render_trace_runtime();
+            self.render_trace_callbacks();
+        }
         self.render_struct_allocation_helpers();
         self.render_struct_copy_helpers();
         self.render_primitive_formatters();
@@ -865,6 +1039,10 @@ impl<'a> Renderer<'a> {
 
     fn render_arena_runtime(&mut self) {
         self.output.push_str(ARENA_RUNTIME);
+    }
+
+    fn render_trace_runtime(&mut self) {
+        self.output.push_str(TRACE_RUNTIME);
     }
 
     fn render_struct_allocation_helpers(&mut self) {
@@ -1333,10 +1511,12 @@ impl<'a> Renderer<'a> {
     fn render_struct_descriptors(&mut self, layouts: &[StructLayout]) {
         self.output.push_str(concat!(
             "typedef struct { uint64_t offset; uint64_t size; uint64_t alignment; uint64_t inline_layout; uint32_t storage; } sao2_layout_field_descriptor;\n",
-            "typedef struct { uint64_t identity; uint64_t size; uint64_t alignment; size_t field_count; const sao2_layout_field_descriptor *fields; } sao2_layout_descriptor;\n",
+            "typedef struct sao2_layout_descriptor { uint64_t identity; uint64_t size; uint64_t alignment; size_t field_count; const sao2_layout_field_descriptor *fields; sao2_trace_body_fn trace_body; } sao2_layout_descriptor;\n",
             "#define SAO2_LAYOUT_FIELD_INLINE UINT32_C(0)\n#define SAO2_LAYOUT_FIELD_REFERENCED UINT32_C(1)\n\n",
         ));
-        for layout in layouts {
+        let mut ordered = layouts.to_vec();
+        ordered.sort_by_key(|layout| layout.identity);
+        for layout in &ordered {
             let _ = writeln!(self.output, "static const sao2_layout_field_descriptor sao2_layout_fields_def_{}[] = {{", layout.definition.index());
             if layout.fields.is_empty() { self.output.push_str("    { 0, 0, 0, 0, 0 },\n"); }
             for field in &layout.fields {
@@ -1345,7 +1525,125 @@ impl<'a> Renderer<'a> {
                 let _ = writeln!(self.output, "    {{ UINT64_C({}), UINT64_C({}), UINT64_C({}), UINT64_C({}), {} }},", field.offset, field.size, field.align, nested, storage);
             }
             self.output.push_str("};\n");
-            let _ = writeln!(self.output, "static const sao2_layout_descriptor sao2_layout_def_{} = {{ UINT64_C({}), UINT64_C({}), UINT64_C({}), {}, sao2_layout_fields_def_{} }};", layout.definition.index(), layout.identity, layout.size, layout.align, layout.fields.len(), layout.definition.index());
+            let callback = if self.trace_plan.struct_callbacks.contains(&layout.definition) {
+                format!("sao2_trace_body_def_{}", layout.definition.index())
+            } else { "NULL".into() };
+            let _ = writeln!(self.output, "static const sao2_layout_descriptor sao2_layout_def_{} = {{ UINT64_C({}), UINT64_C({}), UINT64_C({}), {}, sao2_layout_fields_def_{}, {} }};", layout.definition.index(), layout.identity, layout.size, layout.align, layout.fields.len(), layout.definition.index(), callback);
+        }
+        self.output.push_str("\nstatic const sao2_layout_descriptor *const sao2_layout_registry[] = {\n");
+        for layout in &ordered {
+            let _ = writeln!(self.output, "    &sao2_layout_def_{},", layout.definition.index());
+        }
+        self.output.push_str("};\n");
+        let _ = writeln!(self.output, "static const size_t sao2_layout_registry_count = {};", ordered.len());
+        self.output.push_str(concat!(
+            "static const sao2_layout_descriptor *sao2_layout_find(uint64_t identity) {\n",
+            "    size_t low = 0, high = sao2_layout_registry_count;\n",
+            "    while (low < high) {\n",
+            "        size_t middle = low + (high - low) / 2;\n",
+            "        const sao2_layout_descriptor *layout = sao2_layout_registry[middle];\n",
+            "        if (layout->identity < identity) low = middle + 1;\n",
+            "        else if (layout->identity > identity) high = middle;\n",
+            "        else return layout;\n",
+            "    }\n",
+            "    return NULL;\n",
+            "}\n",
+            "static bool sao2_layout_registered(const sao2_layout_descriptor *layout) {\n",
+            "    return layout != NULL && sao2_layout_find(layout->identity) == layout;\n",
+            "}\n",
+        ));
+    }
+
+    fn render_trace_declarations(&mut self) {
+        self.output.push_str(concat!(
+            "typedef struct sao2_trace_context sao2_trace_context;\n",
+            "typedef void (*sao2_trace_body_fn)(sao2_trace_context *context, const unsigned char *body);\n",
+            "struct sao2_layout_descriptor;\n",
+            "static void sao2_trace_enqueue(sao2_trace_context *context, sao2_ref reference, const struct sao2_layout_descriptor *layout);\n",
+        ));
+        for definition in &self.trace_plan.struct_callbacks {
+            let _ = writeln!(self.output, "static void sao2_trace_body_def_{}(sao2_trace_context *context, const unsigned char *body);", definition.index());
+        }
+        for aggregate in &self.trace_plan.aggregate_callbacks {
+            let name = aggregate_name(*aggregate);
+            let suffix = trace_aggregate_suffix(*aggregate);
+            let _ = writeln!(self.output, "static void sao2_trace_value_{suffix}(sao2_trace_context *context, const {name} *value);");
+        }
+        self.output.push('\n');
+    }
+
+    fn render_trace_callbacks(&mut self) {
+        self.output.push('\n');
+        let aggregates = self.trace_plan.aggregate_callbacks.clone();
+        for aggregate in aggregates { self.render_trace_aggregate_callback(aggregate); }
+        let definitions = self.trace_plan.struct_callbacks.clone();
+        for definition in definitions { self.render_trace_struct_callback(definition); }
+    }
+
+    fn render_trace_struct_callback(&mut self, definition: DefinitionId) {
+        let layout = self.struct_layouts.iter().find(|layout| layout.definition == definition).expect("planned trace layout").clone();
+        let _ = writeln!(self.output, "static void sao2_trace_body_def_{}(sao2_trace_context *context, const unsigned char *body) {{", definition.index());
+        let _ = writeln!(self.output, "    const sao2_body_def_{} *value = (const sao2_body_def_{} *)body;", definition.index(), definition.index());
+        self.output.push_str("    if (context->result != SAO2_TRACE_OK) return;\n");
+        for field in &layout.fields {
+            let expression = format!("value->field_{}", field.id.index());
+            self.render_trace_value(field.ty, field.storage, &expression, 1);
+        }
+        self.output.push_str("}\n\n");
+    }
+
+    fn render_trace_aggregate_callback(&mut self, aggregate: AggregateId) {
+        let name = aggregate_name(aggregate);
+        let suffix = trace_aggregate_suffix(aggregate);
+        let _ = writeln!(self.output, "static void sao2_trace_value_{suffix}(sao2_trace_context *context, const {name} *value) {{");
+        self.output.push_str("    if (context->result != SAO2_TRACE_OK) return;\n");
+        match aggregate {
+            AggregateId::Definition(definition) => match self.program.definitions[definition.index()].layout.clone() {
+                DefinitionLayout::Tuple(fields) => for (index, ty) in fields.into_iter().enumerate() {
+                    self.render_trace_value(ty, MemberStorage::Referenced, &format!("value->field_{index}"), 1);
+                },
+                DefinitionLayout::Union(alternatives) => self.render_trace_union_cases(&alternatives),
+                DefinitionLayout::Struct(_) => unreachable!(),
+            },
+            AggregateId::AnonymousUnion(ty) => {
+                let Type::Union(alternatives) = self.program.types[ty.index()].clone() else { unreachable!() };
+                self.render_trace_union_cases(&alternatives);
+            }
+        }
+        self.output.push_str("}\n\n");
+    }
+
+    fn render_trace_union_cases(&mut self, alternatives: &[ir::UnionAlternative]) {
+        self.output.push_str("    switch (value->tag) {\n    case 0: break;\n");
+        for (index, alternative) in alternatives.iter().enumerate() {
+            let _ = writeln!(self.output, "    case {}:", index + 1);
+            self.render_trace_value(alternative.payload, MemberStorage::Referenced, &format!("value->payload.alternative_{index}"), 2);
+            self.output.push_str("        break;\n");
+        }
+        self.output.push_str("    default: context->result = SAO2_TRACE_INVALID; break;\n    }\n");
+    }
+
+    fn render_trace_value(&mut self, ty: TypeId, storage: MemberStorage, expression: &str, indent: usize) {
+        if !self.trace_plan.type_contains_reference[ty.index()] { return; }
+        let padding = "    ".repeat(indent);
+        match self.program.types[ty.index()].clone() {
+            Type::Nominal(definition) => match &self.program.definitions[definition.index()].layout {
+                DefinitionLayout::Struct(_) if storage == MemberStorage::Inline => {
+                    if self.trace_plan.struct_callbacks.contains(&definition) {
+                        let _ = writeln!(self.output, "{padding}sao2_trace_body_def_{}(context, (const unsigned char *)&({expression}));", definition.index());
+                    }
+                }
+                DefinitionLayout::Struct(_) => {
+                    let _ = writeln!(self.output, "{padding}sao2_trace_enqueue(context, {expression}, &sao2_layout_def_{});", definition.index());
+                }
+                DefinitionLayout::Tuple(_) | DefinitionLayout::Union(_) => {
+                    let _ = writeln!(self.output, "{padding}sao2_trace_value_def_{}(context, &({expression}));", definition.index());
+                }
+            },
+            Type::Union(_) => {
+                let _ = writeln!(self.output, "{padding}sao2_trace_value_ty_{}(context, &({expression}));", ty.index());
+            }
+            Type::Unit | Type::Primitive(_) | Type::List(_) | Type::Map { .. } => {}
         }
     }
 
@@ -1968,7 +2266,8 @@ const ARENA_RUNTIME: &str = r#"
 
 /*
  * Milestone 10 block-heap foundation. Heap blocks can be walked, reclaimed,
- * coalesced, and reused; automatic tracing and collection are still pending.
+ * coalesced, and reused. Stage 2 tracing may update allocated mark epochs;
+ * automatic root discovery, sweeping, and collection are still pending.
  * Scoped allocation remains an independent, restorable bump arena.
  */
 #ifndef SAO2_ARENA_CAPACITY
@@ -2227,8 +2526,7 @@ static bool sao2_heap_block_valid(uint64_t offset, uint64_t frontier, uint64_t *
     payload_capacity = header->span_size - (uint64_t)sizeof(sao2_heap_header);
     if (header->block_state == SAO2_HEAP_BLOCK_ALLOCATED) {
         if (header->body_size > payload_capacity || header->next_free != 0
-            || header->lifetime != SAO2_HEAP_LIFETIME || header->mark_epoch != 0
-            || header->reserved != 0) return false;
+            || header->lifetime != SAO2_HEAP_LIFETIME || header->reserved != 0) return false;
     } else if (header->block_state == SAO2_HEAP_BLOCK_FREE) {
         if (header->body_size != 0 || header->layout_identity != 0 || header->lifetime != 0
             || header->mark_epoch != 0 || header->reserved != 0
@@ -2470,6 +2768,228 @@ static bool sao2_scoped_restore(sao2_scoped_mark mark) {
         return false;
     sao2_scoped_arena.frontier = mark;
     return true;
+}
+"#;
+
+const TRACE_RUNTIME: &str = r#"
+
+typedef enum {
+    SAO2_TRACE_OK,
+    SAO2_TRACE_SCRATCH_EXHAUSTED,
+    SAO2_TRACE_INVALID
+} sao2_trace_result;
+
+typedef struct {
+    sao2_ref reference;
+    const sao2_layout_descriptor *layout;
+} sao2_trace_item;
+
+struct sao2_trace_context {
+    uint32_t epoch;
+    sao2_trace_result result;
+    sao2_trace_item *items;
+    size_t item_count;
+    size_t item_capacity;
+    size_t next_item;
+    size_t *slots;
+    size_t slot_count;
+    size_t slot_capacity;
+};
+
+static void *sao2_trace_realloc(void *pointer, size_t size) {
+#ifdef SAO2_TRACE_PROBE
+    if (sao2_probe_fail_next_trace_allocation) {
+        sao2_probe_fail_next_trace_allocation = false;
+        return NULL;
+    }
+#endif
+    return realloc(pointer, size);
+}
+
+static void *sao2_trace_calloc(size_t count, size_t size) {
+#ifdef SAO2_TRACE_PROBE
+    if (sao2_probe_fail_next_trace_allocation) {
+        sao2_probe_fail_next_trace_allocation = false;
+        return NULL;
+    }
+#endif
+    return calloc(count, size);
+}
+
+static void sao2_trace_context_init(sao2_trace_context *context, uint32_t epoch) {
+    if (context == NULL) return;
+    memset(context, 0, sizeof *context);
+    context->epoch = epoch;
+    context->result = epoch == 0 ? SAO2_TRACE_INVALID : SAO2_TRACE_OK;
+}
+
+static void sao2_trace_context_dispose(sao2_trace_context *context) {
+    if (context == NULL) return;
+    free(context->slots);
+    free(context->items);
+    memset(context, 0, sizeof *context);
+}
+
+static uint64_t sao2_trace_hash(sao2_ref reference, uint64_t identity) {
+    uint64_t value = ((uint64_t)reference.owner_ptr << 32) | (uint64_t)reference.member_ptr;
+    value ^= identity + UINT64_C(0x9e3779b97f4a7c15) + (value << 6) + (value >> 2);
+    value ^= value >> 30;
+    value *= UINT64_C(0xbf58476d1ce4e5b9);
+    value ^= value >> 27;
+    value *= UINT64_C(0x94d049bb133111eb);
+    return value ^ (value >> 31);
+}
+
+static bool sao2_trace_key_equal(const sao2_trace_item *item, sao2_ref reference,
+    const sao2_layout_descriptor *layout) {
+    return item->reference.owner_ptr == reference.owner_ptr
+        && item->reference.member_ptr == reference.member_ptr
+        && item->layout->identity == layout->identity;
+}
+
+static size_t sao2_trace_slot_for(const sao2_trace_context *context, sao2_ref reference,
+    const sao2_layout_descriptor *layout, bool *found) {
+    size_t mask = context->slot_capacity - 1;
+    size_t slot = (size_t)sao2_trace_hash(reference, layout->identity) & mask;
+    while (context->slots[slot] != 0) {
+        size_t index = context->slots[slot] - 1;
+        if (sao2_trace_key_equal(&context->items[index], reference, layout)) {
+            *found = true;
+            return slot;
+        }
+        slot = (slot + 1) & mask;
+    }
+    *found = false;
+    return slot;
+}
+
+static bool sao2_trace_grow_items(sao2_trace_context *context) {
+    size_t capacity = context->item_capacity == 0 ? 8 : context->item_capacity * 2;
+    sao2_trace_item *items;
+    if (capacity < context->item_capacity || capacity > SIZE_MAX / sizeof *items) return false;
+    items = (sao2_trace_item *)sao2_trace_realloc(context->items, capacity * sizeof *items);
+    if (items == NULL) return false;
+    context->items = items;
+    context->item_capacity = capacity;
+    return true;
+}
+
+static bool sao2_trace_rebuild_slots(sao2_trace_context *context, size_t capacity) {
+    size_t *slots;
+    size_t index;
+    if (capacity < 16 || (capacity & (capacity - 1)) != 0
+        || capacity > SIZE_MAX / sizeof *slots) return false;
+    slots = (size_t *)sao2_trace_calloc(capacity, sizeof *slots);
+    if (slots == NULL) return false;
+    free(context->slots);
+    context->slots = slots;
+    context->slot_capacity = capacity;
+    context->slot_count = 0;
+    for (index = 0; index < context->item_count; index++) {
+        bool found;
+        size_t slot = sao2_trace_slot_for(context, context->items[index].reference,
+            context->items[index].layout, &found);
+        if (found) { free(slots); context->slots = NULL; context->slot_capacity = 0; return false; }
+        context->slots[slot] = index + 1;
+        context->slot_count++;
+    }
+    return true;
+}
+
+static void sao2_trace_enqueue(sao2_trace_context *context, sao2_ref reference,
+    const sao2_layout_descriptor *layout) {
+    sao2_arena_kind kind;
+    bool found;
+    size_t slot;
+    if (context == NULL || context->result != SAO2_TRACE_OK) return;
+    if (reference.owner_ptr == 0 && reference.member_ptr == 0) return;
+    if (!sao2_ref_kind(reference, &kind) || !sao2_layout_registered(layout)) {
+        context->result = SAO2_TRACE_INVALID;
+        return;
+    }
+    (void)kind;
+    if (context->slot_capacity == 0) {
+        if (!sao2_trace_rebuild_slots(context, 16)) {
+            context->result = SAO2_TRACE_SCRATCH_EXHAUSTED;
+            return;
+        }
+    }
+    slot = sao2_trace_slot_for(context, reference, layout, &found);
+    if (found) return;
+    if (context->item_count == context->item_capacity && !sao2_trace_grow_items(context)) {
+        context->result = SAO2_TRACE_SCRATCH_EXHAUSTED;
+        return;
+    }
+    if (context->slot_count + 1 > context->slot_capacity / 2) {
+        size_t capacity = context->slot_capacity * 2;
+        if (capacity < context->slot_capacity || !sao2_trace_rebuild_slots(context, capacity)) {
+            context->result = SAO2_TRACE_SCRATCH_EXHAUSTED;
+            return;
+        }
+        slot = sao2_trace_slot_for(context, reference, layout, &found);
+        if (found) return;
+    }
+    context->items[context->item_count].reference = reference;
+    context->items[context->item_count].layout = layout;
+    context->slots[slot] = context->item_count + 1;
+    context->item_count++;
+    context->slot_count++;
+}
+
+static bool sao2_trace_resolve(sao2_trace_context *context, const sao2_trace_item *item,
+    sao2_arena_kind *kind_result, sao2_heap_header **header_result,
+    const unsigned char **body_result) {
+    sao2_arena_kind kind;
+    sao2_arena *arena;
+    sao2_heap_header *header = NULL;
+    const sao2_layout_descriptor *root;
+    uint64_t owner, member, end, owner_end;
+    if (!sao2_layout_registered(item->layout) || item->layout->alignment == 0
+        || !sao2_ref_kind(item->reference, &kind)) return false;
+    arena = sao2_arena_for_kind(kind);
+    owner = (uint64_t)(item->reference.owner_ptr & ~SAO2_REF_OWNER_TAG_MASK);
+    member = (uint64_t)item->reference.member_ptr;
+    if (arena->base == NULL || owner == 0 || member == 0 || owner > member
+        || owner >= arena->capacity || member >= arena->capacity
+        || member > UINT64_MAX - item->layout->size) return false;
+    end = member + item->layout->size;
+    if (end > arena->capacity
+        || (uintptr_t)(arena->base + (size_t)member) % item->layout->alignment != 0) return false;
+    if (kind == SAO2_ARENA_HEAP) {
+        if (!sao2_heap_header_for(item->reference, &header)) return false;
+        root = sao2_layout_find(header->layout_identity);
+        if (root == NULL || root->alignment == 0 || root->size != header->body_size
+            || (uintptr_t)(arena->base + (size_t)owner) % root->alignment != 0
+            || header->body_size > UINT64_MAX - owner) return false;
+        owner_end = owner + header->body_size;
+        if (end > owner_end || (member == owner && item->layout != root)) return false;
+    } else {
+        if (owner % SAO2_REF_ALIGNMENT != 0 || end > arena->frontier) return false;
+    }
+    *kind_result = kind;
+    *header_result = header;
+    *body_result = arena->base + (size_t)member;
+    (void)context;
+    return true;
+}
+
+static sao2_trace_result sao2_trace_drain(sao2_trace_context *context) {
+    if (context == NULL) return SAO2_TRACE_INVALID;
+    if (context->epoch == 0 && context->result == SAO2_TRACE_OK)
+        context->result = SAO2_TRACE_INVALID;
+    while (context->result == SAO2_TRACE_OK && context->next_item < context->item_count) {
+        sao2_trace_item item = context->items[context->next_item++];
+        sao2_arena_kind kind;
+        sao2_heap_header *header;
+        const unsigned char *body;
+        if (!sao2_trace_resolve(context, &item, &kind, &header, &body)) {
+            context->result = SAO2_TRACE_INVALID;
+            break;
+        }
+        if (kind == SAO2_ARENA_HEAP) header->mark_epoch = context->epoch;
+        if (item.layout->trace_body != NULL) item.layout->trace_body(context, body);
+    }
+    return context->result;
 }
 "#;
 
@@ -3064,6 +3584,13 @@ fn aggregate_name(aggregate: AggregateId) -> String {
     }
 }
 
+fn trace_aggregate_suffix(aggregate: AggregateId) -> String {
+    match aggregate {
+        AggregateId::Definition(id) => format!("def_{}", id.index()),
+        AggregateId::AnonymousUnion(id) => format!("ty_{}", id.index()),
+    }
+}
+
 fn visit_operand_places(operand: &Operand, visitor: &mut impl FnMut(&Place)) {
     if let Operand::Copy(place) = operand { visitor(place); }
 }
@@ -3421,6 +3948,9 @@ int main(void) {
     CHECK(!sao2_heap_validate());
     header->block_state = SAO2_HEAP_BLOCK_ALLOCATED;
     CHECK(sao2_heap_validate());
+    header->mark_epoch = UINT32_C(9);
+    CHECK(sao2_heap_validate());
+    header->mark_epoch = 0;
     sao2_heap_arena.frontier += SAO2_REF_ALIGNMENT;
     CHECK(!sao2_heap_validate());
     sao2_heap_arena.frontier -= SAO2_REF_ALIGNMENT;
@@ -3524,6 +4054,197 @@ int main(void) {
         assert!(emitted.contains("static void sao2_allocate_struct(const sao2_layout_descriptor *layout, size_t site,"));
         assert!(emitted.contains("owner_end = owner + header->body_size;\n        if (end > owner_end)"));
         assert!(!emitted.contains("names must not leak"));
+    }
+
+    #[test]
+    fn plans_exact_struct_tuple_and_union_trace_callbacks() {
+        let (mut program, types, location) = program();
+        let node = program.add_definition(NominalDefinition::structure("Node"));
+        let node_type = program.intern_type(Type::Nominal(node));
+        program.definitions[node.index()].add_struct_field("next", node_type, MemberStorage::Referenced);
+
+        let tuple = program.add_definition(NominalDefinition::tuple("Pair"));
+        program.definitions[tuple.index()].add_tuple_field(types.int);
+        program.definitions[tuple.index()].add_tuple_field(node_type);
+        let tuple_type = program.intern_type(Type::Nominal(tuple));
+
+        let named_union = program.add_definition(NominalDefinition::union("Choice"));
+        program.definitions[named_union.index()].add_alternative(UnionAlternative::untagged(types.int));
+        program.definitions[named_union.index()].add_alternative(UnionAlternative::untagged(node_type));
+        let named_union_type = program.intern_type(Type::Nominal(named_union));
+        let anonymous_union = program.intern_type(Type::Union(vec![
+            UnionAlternative::untagged(types.boolean),
+            UnionAlternative::untagged(node_type),
+        ]));
+
+        let holder = program.add_definition(NominalDefinition::structure("Holder"));
+        program.definitions[holder.index()].add_struct_field("tuple", tuple_type, MemberStorage::Inline);
+        program.definitions[holder.index()].add_struct_field("named", named_union_type, MemberStorage::Inline);
+        program.definitions[holder.index()].add_struct_field("anonymous", anonymous_union, MemberStorage::Inline);
+        let _holder_type = program.intern_type(Type::Nominal(holder));
+        add_main(&mut program, types, location);
+
+        let layouts = LayoutPlanner::new(&program).plan().unwrap();
+        let traces = TracePlanner::new(&program, &layouts).plan().unwrap();
+        assert!(traces.type_contains_reference[node_type.index()]);
+        assert!(traces.type_contains_reference[tuple_type.index()]);
+        assert!(traces.type_contains_reference[named_union_type.index()]);
+        assert!(traces.type_contains_reference[anonymous_union.index()]);
+        assert_eq!(traces.struct_callbacks, vec![node, holder]);
+        assert!(traces.aggregate_callbacks.contains(&AggregateId::Definition(tuple)));
+        assert!(traces.aggregate_callbacks.contains(&AggregateId::Definition(named_union)));
+        assert!(traces.aggregate_callbacks.contains(&AggregateId::AnonymousUnion(anonymous_union)));
+
+        let emitted = emit(&program).unwrap();
+        assert!(emitted.contains("static void sao2_trace_body_def_0(sao2_trace_context *context"));
+        assert!(emitted.contains("sao2_layout_fields_def_0, sao2_trace_body_def_0"));
+        assert!(emitted.contains("sao2_trace_value_def_1(context"));
+        assert!(emitted.contains("sao2_trace_value_def_2(context"));
+        assert!(emitted.contains(&format!("sao2_trace_value_ty_{}(context", anonymous_union.index())));
+        assert!(emitted.contains("case 0: break;"));
+        assert!(emitted.contains("default: context->result = SAO2_TRACE_INVALID;"));
+        assert!(emitted.contains("static const sao2_layout_descriptor *const sao2_layout_registry[]"));
+        assert!(emitted.contains("sao2_trace_item item = context->items[context->next_item++]"));
+        assert!(!emitted.contains("shadow_frame"));
+        assert!(!emitted.contains("sao2_collect"));
+    }
+
+    #[test]
+    fn rejects_reference_bearing_container_trace_shapes() {
+        let (mut program, _types, _location) = program();
+        let node = program.add_definition(NominalDefinition::structure("Node"));
+        let node_type = program.intern_type(Type::Nominal(node));
+        let _nodes = program.intern_type(Type::List(node_type));
+        let layouts = LayoutPlanner::new(&program).plan().unwrap();
+        let error = TracePlanner::new(&program, &layouts).plan().unwrap_err();
+        assert!(error.to_string().contains("reference-bearing list traversal"));
+    }
+
+    #[test]
+    fn native_exact_trace_probe_uses_generated_plans_and_runtime() {
+        let directory = NativeProbeDirectory::new();
+        let source_path = directory.0.join("exact trace probe.c");
+        let (mut program, types, location) = program();
+        let node = program.add_definition(NominalDefinition::structure("Node"));
+        let node_type = program.intern_type(Type::Nominal(node));
+        program.definitions[node.index()].add_struct_field("next", node_type, MemberStorage::Referenced);
+        let pair = program.add_definition(NominalDefinition::structure("InteriorPair"));
+        program.definitions[pair.index()].add_struct_field("prefix", types.character, MemberStorage::Inline);
+        program.definitions[pair.index()].add_struct_field("left", node_type, MemberStorage::Inline);
+        program.definitions[pair.index()].add_struct_field("right", node_type, MemberStorage::Inline);
+        let _pair_type = program.intern_type(Type::Nominal(pair));
+        add_main(&mut program, types, location);
+
+        let mut source = emit(&program).unwrap();
+        source = source.replacen(
+            "typedef struct { uint8_t value; } sao2_unit;",
+            concat!(
+                "#define main sao2_generated_main\n",
+                "#define SAO2_ARENA_CAPACITY UINT64_C(65536)\n",
+                "#define SAO2_TRACE_PROBE\n",
+                "static bool sao2_probe_fail_next_trace_allocation;\n",
+                "typedef struct { uint8_t value; } sao2_unit;",
+            ),
+            1,
+        );
+        source.push_str(r#"
+#undef main
+#define CHECK(condition) do { if (!(condition)) { fprintf(stderr, "trace probe check failed at line %d\n", __LINE__); return 1; } } while (0)
+#define OWNER(reference) ((uint64_t)((reference).owner_ptr & ~SAO2_REF_OWNER_TAG_MASK))
+
+static uint32_t probe_epoch(sao2_ref reference) {
+    sao2_heap_header *header = NULL;
+    return sao2_heap_header_for(reference, &header) ? header->mark_epoch : UINT32_MAX;
+}
+
+int main(void) {
+    sao2_ref cycle_a, cycle_b, child_a, child_b, pair_owner, left, right, scoped;
+    sao2_ref empty = {0}, partial = {0};
+    sao2_body_def_0 *node_body;
+    sao2_body_def_1 *pair_body;
+    sao2_trace_context context;
+
+    CHECK(sao2_arena_runtime_init());
+    CHECK(sao2_heap_allocate(sao2_layout_def_0.size, SAO2_REF_ALIGNMENT,
+        sao2_layout_def_0.identity, &cycle_a) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(sao2_layout_def_0.size, SAO2_REF_ALIGNMENT,
+        sao2_layout_def_0.identity, &cycle_b) == SAO2_ARENA_OK);
+    node_body = (sao2_body_def_0 *)sao2_resolve_body(cycle_a, &sao2_layout_def_0);
+    node_body->field_0 = cycle_b;
+    node_body = (sao2_body_def_0 *)sao2_resolve_body(cycle_b, &sao2_layout_def_0);
+    node_body->field_0 = cycle_a;
+    sao2_trace_context_init(&context, UINT32_C(3));
+    sao2_trace_enqueue(&context, cycle_a, &sao2_layout_def_0);
+    CHECK(sao2_trace_drain(&context) == SAO2_TRACE_OK);
+    CHECK(context.item_count == 2 && probe_epoch(cycle_a) == 3 && probe_epoch(cycle_b) == 3);
+    sao2_trace_context_dispose(&context);
+
+    CHECK(sao2_heap_allocate(sao2_layout_def_0.size, SAO2_REF_ALIGNMENT,
+        sao2_layout_def_0.identity, &child_a) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(sao2_layout_def_0.size, SAO2_REF_ALIGNMENT,
+        sao2_layout_def_0.identity, &child_b) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_allocate(sao2_layout_def_1.size, SAO2_REF_ALIGNMENT,
+        sao2_layout_def_1.identity, &pair_owner) == SAO2_ARENA_OK);
+    pair_body = (sao2_body_def_1 *)sao2_resolve_body(pair_owner, &sao2_layout_def_1);
+    pair_body->field_1.field_0 = child_a;
+    pair_body->field_2.field_0 = child_b;
+    CHECK(sao2_ref_interior(pair_owner, OWNER(pair_owner) + offsetof(sao2_body_def_1, field_1), &left));
+    CHECK(sao2_ref_interior(pair_owner, OWNER(pair_owner) + offsetof(sao2_body_def_1, field_2), &right));
+    sao2_trace_context_init(&context, UINT32_C(7));
+    sao2_trace_enqueue(&context, left, &sao2_layout_def_0);
+    CHECK(sao2_trace_drain(&context) == SAO2_TRACE_OK);
+    CHECK(probe_epoch(pair_owner) == 7 && probe_epoch(child_a) == 7 && probe_epoch(child_b) == 0);
+    sao2_trace_context_dispose(&context);
+    sao2_trace_context_init(&context, UINT32_C(8));
+    sao2_trace_enqueue(&context, right, &sao2_layout_def_0);
+    CHECK(sao2_trace_drain(&context) == SAO2_TRACE_OK);
+    CHECK(probe_epoch(pair_owner) == 8 && probe_epoch(child_a) == 7 && probe_epoch(child_b) == 8);
+    sao2_trace_context_dispose(&context);
+
+    CHECK(sao2_scoped_allocate(sao2_layout_def_0.size, &scoped) == SAO2_ARENA_OK);
+    node_body = (sao2_body_def_0 *)sao2_resolve_body(scoped, &sao2_layout_def_0);
+    node_body->field_0 = child_a;
+    sao2_trace_context_init(&context, UINT32_C(11));
+    sao2_trace_enqueue(&context, scoped, &sao2_layout_def_0);
+    CHECK(sao2_trace_drain(&context) == SAO2_TRACE_OK && probe_epoch(child_a) == 11);
+    sao2_trace_context_dispose(&context);
+
+    sao2_trace_context_init(&context, UINT32_C(12));
+    sao2_trace_enqueue(&context, empty, &sao2_layout_def_0);
+    CHECK(context.item_count == 0 && sao2_trace_drain(&context) == SAO2_TRACE_OK);
+    sao2_trace_context_dispose(&context);
+    sao2_trace_context_init(&context, UINT32_C(13));
+    sao2_probe_fail_next_trace_allocation = true;
+    sao2_trace_enqueue(&context, cycle_a, &sao2_layout_def_0);
+    CHECK(context.result == SAO2_TRACE_SCRATCH_EXHAUSTED);
+    sao2_trace_context_dispose(&context);
+    CHECK(context.items == NULL && context.slots == NULL && context.epoch == 0);
+
+    sao2_trace_context_init(&context, UINT32_C(14));
+    partial.owner_ptr = cycle_a.owner_ptr;
+    sao2_trace_enqueue(&context, partial, &sao2_layout_def_0);
+    CHECK(context.result == SAO2_TRACE_INVALID);
+    sao2_trace_context_dispose(&context);
+    CHECK(sao2_heap_validate());
+    sao2_arena_runtime_release();
+    return 0;
+}
+"#);
+        fs::write(&source_path, source).unwrap();
+
+        let executable = match crate::host_compiler::compile(&source_path) {
+            Ok(executable) => executable,
+            Err(error) if error.to_string().contains("no supported C compiler found") => return,
+            Err(error) => panic!("native exact-trace probe did not compile: {error}"),
+        };
+        let output = Command::new(executable).output().unwrap();
+        assert!(
+            output.status.success(),
+            "native exact-trace probe failed with {}: {}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     #[test]
