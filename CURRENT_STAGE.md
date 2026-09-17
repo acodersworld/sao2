@@ -1,447 +1,446 @@
-# Current Stage: Exact Trace Plans and Callbacks
+# Current Stage: Precise Shadow Frames
 
 Status: current.
 
-This document expands Stage 2 of
-[Current Milestone: Garbage Collector](CURRENT_MILESTONE.md). It adds the
-compiler plan and generated runtime machinery needed to trace a supplied typed
-root precisely. It does not discover program roots, sweep unreachable blocks,
-reuse mark results for allocation policy, or trigger collection.
+This document expands Stage 3 of
+[Current Milestone: Garbage Collector](CURRENT_MILESTONE.md). It generates a
+typed shadow frame for every function which can hold a garbage-collected
+reference, makes those frame fields the canonical storage for the selected IR
+locals, and exposes the active frame chain to the Stage 2 trace engine.
 
-Stage 1 provides the handoff: a non-moving heap of validated allocated and free
-blocks, stable packed owner offsets, deterministic struct layout descriptors,
-an address-ordered free list, a reserved `mark_epoch` field, and a private
-reclamation path. Stage 2 may mark allocated headers but must not reclaim them.
+Stage 3 does not collect automatically. A native probe may explicitly trace
+the active chain, but ordinary allocation does not enumerate roots, advance
+epochs, sweep blocks, or retry after reclamation.
 
 ## Outcome
 
-The stage establishes this isolated tracing path:
+An active call chain has a parallel generated root chain:
 
 ```text
-typed synthetic root
-        |
-        v
-enqueue (owner_ptr, member_ptr, exact struct layout)
-        |
-        v
-deduplicate exact trace item
-        |
-        +------ heap reference ------> mark complete owner allocation
-        |                                  |
-        +------ scoped reference ----------+
+native calls                         precise root chain
+
+sao2_fn_0                            sao2_shadow_top
+  sao2_fn_1                                 |
+    sao2_fn_2                               v
+                                  +-------------------+
+                                  | frame for fn 2    |
+                                  | exact typed roots |
+                                  +-------------------+
                                            |
                                            v
-                              traverse exact member body
+                                  +-------------------+
+                                  | frame for fn 1    |
+                                  | exact typed roots |
+                                  +-------------------+
                                            |
-                          +----------------+----------------+
-                          |                                 |
-                 inline/by-value fields             referenced fields
-                 traverse synchronously                 enqueue
+                                           v
+                                  +-------------------+
+                                  | frame for fn 0    |
+                                  | exact typed roots |
+                                  +-------------------+
 ```
 
-Reference edges enter a work queue and therefore cannot recurse through the C
-stack. Inline structs, tuples, and active union payloads may be traversed
-synchronously because validated physical layouts prohibit recursive by-value
-containment. Cyclic object graphs necessarily cross queued reference edges and
-terminate through exact-item deduplication.
-
-A completed trace pass identifies the precise set of reachable heap owners by
-their `mark_epoch` values. The same pass traverses live scoped values so they
-can lead to heap owners, but it never marks or reclaims scoped storage.
+The native C stack remains responsible for calls, primitive locals, and return
+channels. The shadow chain contains only statically known reference-bearing IR
+locals and materialized temporaries. Each frame callback visits its fields
+through the exact Stage 2 type traversal helpers; it never scans padding,
+untyped bytes, or the native stack.
 
 ## Preserved contracts
 
-Stage 2 must preserve:
+Stage 3 must preserve:
 
-- the two-word packed reference ABI and both arena tags;
-- stable owner and member offsets for all live values;
-- Stage 1 block spans, free-list ordering, allocation, splitting, coalescing,
-  frontier trimming, and failure atomicity;
-- the heap header's 48-byte private ABI and all fields other than the permitted
-  allocated-block `mark_epoch` update;
-- heap body bounds based on requested body size rather than payload capacity;
-- the independent scoped bump arena and function-owned scoped marks;
-- the existing struct construction, projection, copying, equality, calls, and
-  return behavior;
-- deterministic layout identities derived from `DefinitionId`;
-- source failure attribution and the existing allocation result categories;
-  and
-- byte-for-byte deterministic C generation for identical compiler input.
+- the packed reference ABI, stable owner/member offsets, and arena tags;
+- the Stage 1 block heap, free-list order, allocation policy, and private
+  reclamation boundary;
+- the Stage 2 trace plan, layout registry, exact-item key, queue, callbacks,
+  scratch failure behavior, and heap/scoped traversal distinction;
+- the 48-byte heap header and caller-supplied nonzero trace epoch;
+- ordinary C function calls and the existing source-level calling convention;
+- the escape plan's heap-versus-scoped allocation decision at every site;
+- source evaluation order and initialize-before-publication construction;
+- one function-owned scoped mark and restoration on every normal return where
+  scoped allocations occur;
+- entry-point signatures, host adapter behavior, diagnostics, and source
+  failure locations; and
+- deterministic generated names and byte-for-byte output.
 
-The physical layout plan remains the authority for C carriers, field offsets,
-inline-versus-referenced storage, sizes, and alignments. Trace planning consumes
-that plan; it must not recalculate a competing physical layout.
+The typed IR remains the authority for every local's type and identity. Stage
+3 derives roots from that information without adding GC operations, storage
+classes, or physical frame layout to IR.
 
 ## Stage boundaries
 
 This stage does not add:
 
-- shadow frames, local-root rewriting, global-root discovery, or stack scans;
-- a mark-epoch counter, rollover handling, automatic collection, or sweeping;
-- a call to private heap reclamation from the tracer;
-- allocation retry, collection thresholds, or GC-driven failure messages;
-- a source-visible root, free, trace, or forced-collection operation;
-- list, map, or dynamically allocated string traversal;
-- a write barrier, moving, compaction, finalization, or weak references; or
-- frontend, typed-IR, escape-analysis, or language-semantic changes.
+- automatic collection, allocation retry, sweeping, or calls to heap reclaim;
+- ownership of a global mark epoch or rollover handling;
+- liveness-based root-slot clearing or safe-point-specific live sets;
+- native-stack scanning or conservative word interpretation;
+- a write barrier, moving, compaction, weak references, or finalization;
+- list, map, dynamic string, or iterator roots;
+- source-visible root registration or forced collection; or
+- frontend, escape-analysis, lowering, or language-semantic changes.
 
-Generated trace machinery is inert in ordinary programs during this stage. A
-native probe supplies synthetic roots and a nonzero epoch explicitly. Stage 3
-will generate shadow frames; Stage 4 will own collection epochs and connect
-root discovery, marking, and sweeping.
+All reference-bearing IR locals are rooted for their complete function
+invocation. A slot is zero before its first assignment and may retain its last
+value until overwritten or the function returns. This is type-precise and
+safe, though it can conservatively retain a dead local until return. The
+current IR has no storage-dead operation, and this stage does not invent one.
 
-## Compiler-owned trace plan
+## Compiler-owned root plan
 
 ### Plan boundary
 
-Build a `TracePlan` after IR validation and physical layout planning and
-before rendering begins. The plan is immutable renderer input alongside
-`LayoutPlan` and `AllocationPlan`. Failure to construct or validate it must
-return no partial C text.
+Build an immutable `RootPlan` after `TracePlan` validation and before
+rendering. It is backend-owned input alongside `LayoutPlan`,
+`AllocationPlan`, and `TracePlan`.
 
-The plan records:
+The plan contains one entry per function:
 
-- whether each `TypeId` contains a reachable struct reference;
-- whether each struct body contains outgoing struct references;
-- every reference-bearing nominal tuple;
-- every reference-bearing nominal or anonymous union;
-- each struct layout's optional body traversal callback; and
-- deterministic callback dependencies and emission order.
+- the `FunctionId`;
+- selected root `LocalId` values in ascending local order;
+- each selected local's exact `TypeId`; and
+- whether the function requires a frame.
 
-Use compiler identities only: `DefinitionId`, `TypeId`, `FieldId`, and
-`AggregateId`. Source names, spans, native addresses, allocation sites, and
-hash iteration order are not trace identities.
+A local is selected exactly when the Stage 2
+`type_contains_reference[local.ty]` fact is true. This includes source
+bindings, parameters, and compiler-materialized temporaries. A function with
+no selected local receives no typed frame, frame callback, link, or unlink.
 
-Keep trace planning backend-owned for this milestone. Typed IR already retains
-the type of every local and field, and no GC operation belongs in language IR.
+Backend-only native temporaries are not automatically roots. Each such
+temporary must instead satisfy the safe-point audit below. In particular, the
+temporary packed reference and decoded body pointer used during struct
+construction are created only after allocation returns, and no allocation can
+occur before the reference is published to its destination frame field.
 
-### Reference-bearing rules
+### Validation
 
-Centralize one memoized query for whether a value of a type can carry a struct
-reference:
+Validate the complete plan before rendering:
 
-- unit and every primitive, including interned strings, do not carry one;
-- a nominal struct value always carries one because its C carrier is
-  `sao2_ref`;
-- a tuple carries one when any field carries one;
-- a union carries one when any alternative payload carries one; and
-- lists and maps remain an explicit unsupported trace-planning boundary until
-  milestone 11.
+- there is exactly one function entry for each IR function;
+- function entries are in ascending `FunctionId` order;
+- selected locals exist, are unique, and are in ascending `LocalId` order;
+- every selected type is marked reference-bearing by `TracePlan`;
+- every omitted local is marked non-reference-bearing;
+- parameter and temporary origins do not alter selection;
+- selected types have an available generated trace expression;
+- entry-argument carriers remain non-roots unless a future traced container
+  plan explicitly changes that fact; and
+- a plan failure produces no partial generated C.
 
-Struct-body traversal additionally consults `MemberStorage`:
+Do not infer roots by inspecting rendered C types or searching emitted text.
+Do not use source names, lexical scopes, spans, or allocation classes as root
+identities.
 
-- a referenced struct field contains a `sao2_ref` and creates a queued edge;
-- an inline struct field contains the child body and is traversed inline;
-- a tuple or union field is traversed according to its value shape; and
-- primitive, unit, and string fields require no trace action.
+## Shadow-frame ABI
 
-A referenced struct cycle is therefore immediately known to carry a reference;
-it must not be mistaken for a recursive by-value query. Memoization must handle
-shared tuple/union subgraphs without duplicating plan entries. Existing layout
-validation remains responsible for rejecting impossible recursive inline
-containment.
+### Common header
 
-### Validation and order
-
-Validate that:
-
-- every planned struct names an existing `StructLayout`;
-- every planned field agrees with the layout's `TypeId`, storage class,
-  offset, size, alignment, and nested-layout identity;
-- every callback dependency has a planned declaration;
-- every aggregate callback names the same C aggregate selected by
-  `LayoutPlan`;
-- primitive-only aggregates do not receive callbacks;
-- containers cannot silently appear in a traceable shape;
-- struct layout identities are unique and match their existing descriptors;
-  and
-- plan entries are unique and deterministically ordered.
-
-Emit forward declarations by identity order. Emit callback definitions in
-physical dependency order where convenient, but do not rely on definition
-order to break referenced cycles.
-
-## Generated traversal ABI
-
-### Trace context and body callback
-
-Forward-declare the runtime context before layout descriptors:
+Emit one common header and callback type whenever at least one function needs a
+frame:
 
 ```c
-typedef struct sao2_trace_context sao2_trace_context;
-typedef void (*sao2_trace_body_fn)(
+typedef struct sao2_shadow_frame sao2_shadow_frame;
+typedef void (*sao2_trace_frame_fn)(
     sao2_trace_context *context,
-    const unsigned char *body
+    const sao2_shadow_frame *frame
 );
+
+struct sao2_shadow_frame {
+    sao2_shadow_frame *previous;
+    sao2_trace_frame_fn trace;
+};
 ```
 
-Extend `sao2_layout_descriptor` with a nullable body callback. A struct body
-with no outgoing references uses `NULL`; it can still be marked as a heap
-owner without running a callback. A reference-bearing body names its generated
-callback.
+Maintain one process-global `sao2_shadow_top`, initially `NULL`. SAO2 v0 is
+single-threaded; this stage does not add thread-local chains or concurrency.
+The pointer is runtime metadata, not a language value or a scanned root.
 
-The callback receives an already validated pointer to the exact struct body.
-It must not rediscover the owner, mark a header, inspect native stack memory,
-allocate managed storage, or reclaim anything. Its only job is to traverse
-inline/by-value children and enqueue referenced struct values through the
-trace context.
+Add narrow link and unlink helpers:
 
-Emit callback prototypes before descriptor initializers so descriptors can
-contain callback addresses while retaining the existing descriptor section.
-Callback pointers are private native metadata and never enter SAO2 values.
+- link requires a non-null frame with a non-null callback, stores the current
+  top in `previous`, and publishes the new top last;
+- unlink requires the supplied frame to be the current top, restores
+  `previous`, and clears the unlinked frame's previous pointer; and
+- a non-LIFO unlink is a compiler/runtime invariant.
 
-### Layout registry
+Neither helper allocates, traces, touches either arena, or fails for valid
+generated input.
 
-Emit a deterministic registry containing every struct layout descriptor,
-ordered by layout identity. When there are no structs, emit a standards-
-conforming sentinel representation with a logical count of zero rather than a
-zero-length C array.
+### Typed function frames
 
-Provide narrow lookup and membership helpers:
+For each function with selected roots, emit an identity-named C struct:
 
-- find the root descriptor recorded by a heap header's layout identity; and
-- prove an exact descriptor supplied by generated code belongs to the registry.
+```c
+typedef struct {
+    sao2_shadow_frame header;
+    /* exact C carriers for selected locals, ordered by LocalId */
+} sao2_shadow_frame_fn_N;
+```
 
-The registry validates allocation-root metadata. It does not search from an
-interior member back to a source-language field and does not replace the exact
-descriptor carried by a trace item.
+Name fields only from `LocalId`, for example `local_3`. Use the same
+`c_type` mapping as ordinary local storage:
 
-### Generated callback forms
+- a struct local is `sao2_ref`;
+- a tuple or union local uses its generated aggregate carrier; and
+- no primitive-only field is emitted.
 
-Use identity-only names and pointer-based traversal:
+Assert that `header` is at offset zero and that every root field has the
+planned C size and alignment. Do not pack frames or depend on their total size
+as a cross-build ABI.
 
-- `sao2_trace_body_def_N` traverses a private struct body;
-- `sao2_trace_value_def_N` traverses a reference-bearing nominal tuple or
-  union; and
-- `sao2_trace_value_ty_N` traverses a reference-bearing anonymous union.
+Frame definitions require complete tuple and union carrier definitions, so
+emit them after value aggregates and struct bodies but before generated
+functions.
 
-For a struct reference value, generate or render a small call to the common
-enqueue helper with `sao2_layout_def_N`; do not recursively invoke the target
-body callback directly.
+### Frame callbacks
 
-Struct body callbacks cast the validated byte pointer to the matching
-`const sao2_body_def_N *` and visit fields in ascending `FieldId` order:
+Emit one callback per typed frame. It casts the common header pointer back to
+the exact function frame after the offset-zero assertion and visits fields in
+ascending `LocalId` order:
 
-- enqueue referenced struct fields with the child's exact descriptor;
-- call a reference-bearing inline child struct's body callback on its embedded
-  address;
-- call a tuple or union value callback on its field address; and
-- emit no statement for non-reference-bearing fields.
+- a struct field calls `sao2_trace_enqueue` with its exact layout descriptor;
+- a reference-bearing tuple calls `sao2_trace_value_def_N`;
+- a nominal or anonymous union calls its Stage 2 value callback; and
+- no bytewise or conservative fallback exists.
 
-Tuple callbacks visit fields in positional order. Union callbacks switch on
-the existing one-based runtime tag, ignore tag zero as inactive zero-safe
-storage, visit only the selected payload, and reject a tag greater than the
-alternative count through the trace context's invalid-state result. Never
-inspect inactive union bytes.
+Callbacks observe zero-initialized fields safely. All-zero references are
+ignored, tag-zero unions are inactive, and no inactive payload is read. Stop
+visiting fields once the trace context has a sticky failure.
 
-Callbacks must check the context's sticky result before performing further
-work. They use native pointers only for the duration of the stopped trace pass
-and never store a body pointer in a language value or trace key.
+The callback takes a `const` frame. Tracing may update heap mark epochs and
+native trace scratch, but it must not mutate root slots or native call state.
 
-## Exact trace work set
+## Root storage is canonical
 
-### Item identity
+### Local declarations
 
-A trace item contains:
+At function entry:
 
-- the complete packed `sao2_ref`; and
-- a pointer to the exact struct layout descriptor.
+- declare and zero-initialize the complete typed frame when one is planned;
+- declare only non-root locals as ordinary zero-initialized C locals; and
+- never declare a second ordinary C local for a selected root.
 
-Its deduplication key is the full tagged `owner_ptr`, unmodified
-`member_ptr`, and descriptor layout identity. The owner tag is part of the
-key so equal numeric offsets in the heap and scoped arenas remain distinct.
+A reference-bearing local's only storage throughout the generated function is
+its frame field. There is no mirrored value, dirty bit, spill operation, or
+synchronization protocol.
 
-Do not deduplicate by owner alone. Two references with the same owner but
-different member offsets or exact layouts may expose different outgoing
-edges. Repeated occurrences of the same exact triple are processed once.
+“Mirrored root synchronization” would keep an ordinary C local for generated
+operations and a second copy in the shadow frame for tracing. Every write would
+then have to update both copies before a possible collection. A stale frame
+copy could lose a live object or retain a dead one. Canonical frame storage
+removes that failure mode because mutator reads, mutator writes, and tracing
+all use the same field.
 
-The all-zero reference is an empty edge and succeeds without entering the set.
-A partial-zero reference is invalid. Reserved owner tags are invalid.
+Centralize local rendering behind a helper which maps:
 
-### Context storage
+- selected `LocalId` to `sao2_frame.local_N`; and
+- non-selected `LocalId` to `sao2_local_N`.
 
-Define `sao2_trace_context` with:
+Thread the current `FunctionId` or validated function root plan explicitly
+through operand, place, destination, aggregate, intrinsic, check, and
+terminator rendering. Avoid ambient renderer state which could accidentally
+use the preceding function's root map.
 
-- a nonzero epoch supplied by its caller;
-- a sticky result: success, native scratch exhaustion, or invalid state;
-- a growable insertion-ordered array of unique trace items;
-- the next array index to drain; and
-- an open-addressed membership table keyed by the exact triple.
+### Complete renderer audit
 
-The unique-item array is also the FIFO work queue. This avoids maintaining two
-copies of the work set: successful first insertion appends one item, and the
-drain cursor advances through insertion order.
+Use the centralized local accessor for every occurrence, including:
 
-Use ordinary C `malloc`, `calloc`, `realloc`, and `free` for collector
-scratch. Never allocate queue or set storage from either SAO2 arena. This adds
-no Rust dependency and prevents trace bookkeeping from recursively invoking
-managed allocation.
+- copy, unary, binary, conversion, and string-index destinations;
+- direct assignment and every projected place root;
+- call destinations and arguments;
+- tuple construction, field writes, comparison, and projection;
+- union zeroing, payload writes, tag writes, tests, extraction, and switches;
+- struct construction publication;
+- inline-struct replacement and referenced-field rebinding;
+- runtime checks, intrinsics, panic operands, and return operands; and
+- helper-generated expressions such as inline destination references.
 
-Use checked `size_t` arithmetic, power-of-two table capacities, a fixed hash
-mix, and a bounded load factor. An empty hash slot can use owner zero because
-valid trace items always have a nonzero owner. Grow required storage before
-publishing a new set entry. A failed growth leaves all existing items valid,
-sets the sticky exhaustion result, and causes subsequent enqueue operations to
-be no-ops.
+No renderer path may construct `sao2_local_N` directly for a selected local.
+Tests should search generated C for both undeclared frame bypasses and
+accidental duplicate storage.
 
-Context initialization and disposal must be safe for a completely zeroed
-context and after partial native allocation failure. Disposal releases all
-scratch and clears its pointers, sizes, cursor, epoch, and result.
+Backend-only names such as struct-construction references, decoded body
+pointers, output writers, return temporaries, and scoped marks remain distinct
+native temporaries. They must never be added to a frame merely because their C
+type could contain a reference; their safety follows from the explicit
+safe-point rules.
 
-Stage 2 reports scratch exhaustion only through the probe-facing trace result.
-Stage 5 will decide how a production collection failure maps to a
-source-attributed allocation failure.
+## Function prologue
 
-### Enqueue and drain
+For a function with roots, emit this logical order:
 
-The enqueue operation:
+1. zero-initialize the complete typed frame;
+2. set its generated callback;
+3. link its common header onto `sao2_shadow_top`;
+4. copy each reference-bearing native parameter into its canonical frame
+   field;
+5. copy each non-root parameter into its ordinary local;
+6. capture the scoped-arena mark when the allocation plan requires one; and
+7. jump to the IR entry block.
 
-1. returns immediately when the context already has a failure;
-2. accepts all-zero as an empty reference;
-3. validates nonzero reference shape and registered exact descriptor;
-4. checks the exact-key membership table;
-5. grows the queue and table transactionally when required;
-6. inserts a new key once; and
-7. appends the item to the FIFO array.
+Linking the zeroed frame before copying parameters guarantees that every
+published slot is trace-safe. No collection or allocation occurs between
+linking and completing parameter copies.
 
-The drain operation processes appended items until its cursor reaches the
-array length or the context fails. Callbacks may append more items while an
-earlier item is being processed. No graph edge is followed through C
-recursion.
+The caller retains every reference-bearing argument in its own linked frame
+until control transfers to the callee. A callee parameter may temporarily
+exist only in the native argument channel because no safe point occurs before
+the callee stores it in its frame.
 
-## Processing one item
+A function without roots retains the existing prologue and does not touch the
+shadow chain. A function with roots but no parameters still links its zeroed
+frame. Recursion creates one distinct frame instance per invocation even
+though every instance shares the same generated callback.
 
-### Common exact-member validation
+## Calls, allocations, and safe points
 
-Classify the reference from its tagged owner and resolve the exact member using
-the item's descriptor. Require:
+Stage 4 will make heap allocation the only collection safe point. Stage 3 must
+make the following contracts true before collection is enabled:
 
-- nonzero valid owner and member fields;
-- a registered descriptor with nonzero valid alignment;
-- member address alignment appropriate for the exact body;
-- no offset or end arithmetic overflow; and
-- exact body end within the selected arena's live range.
+- a caller frame remains linked for the complete callee invocation;
+- every reference-bearing call operand is read from canonical rooted storage;
+- the callee links its zeroed frame and copies root parameters before any
+  operation which can allocate;
+- a call destination's old rooted value remains in its slot while the callee
+  runs and is overwritten only after return;
+- all already evaluated struct-constructor operands remain in rooted IR locals
+  while allocation runs;
+- the new allocation reference and decoded body pointer are produced only
+  after allocation returns;
+- no call which can allocate occurs between receiving a new reference and
+  publishing it to the destination frame field; and
+- no decoded heap or scoped body pointer remains live across a user-function
+  call or heap-allocation call.
 
-For heap references, retain the existing complete-owner bounds check using the
-requested root body size. For scoped references, the headerless scoped arena
-can validate its live cursor, address, and alignment but cannot independently
-reconstruct the source allocation's complete body bounds. Generated projection
-and static typing remain the authority for the owner/member relationship; do
-not add scoped headers or a side table in this stage.
+Existing copy and resolver helpers do not allocate. If any helper gains an
+allocation path later, it must first be re-audited as a safe point rather than
+silently relying on this stage's proof.
 
-If `member_ptr` equals the decoded heap owner offset, require the exact layout
-identity to equal the header's root layout identity. For an interior member,
-the generated static descriptor supplies its type; runtime validation checks
-registry membership, alignment, and owner bounds without searching for a
-field path.
+## Normal returns and termination
 
-The existing mutator-facing body resolver terminates on invariant failure.
-Factor or add a non-terminating checked resolver for the isolated trace engine
-so malformed probe state becomes the context's invalid result. Ordinary
-generated operations may retain their terminating invariant wrapper around the
-same checked mechanics.
+Every normal return from a framed function uses one block-scoped epilogue:
 
-### Heap item
+1. evaluate and capture the return operand in a native temporary of the exact
+   result C type;
+2. unlink the current shadow frame;
+3. restore the function-owned scoped mark when present; and
+4. return the captured value.
 
-For a heap reference:
+Capture must occur before unlinking because the operand may live in the frame.
+Unlink must occur before scoped restoration so no linked root can name storage
+owned by the returning invocation after its cursor is rewound.
 
-1. recover and validate the allocated owner header through the Stage 1 helper;
-2. look up the root descriptor named by the header layout identity;
-3. require root descriptor size to match the allocation header and the root
-   body address to satisfy the descriptor alignment;
-4. validate and resolve the exact member with the supplied descriptor;
-5. set the complete owner's `mark_epoch` to the context epoch; and
-6. invoke the exact descriptor's callback when it is non-null.
+A reference-bearing result may travel in the native return channel after the
+callee unlinks because there is no allocation or collection between unlink,
+optional scoped restoration, native return, and assignment into the caller's
+rooted destination. Escape analysis guarantees that a returned struct
+reference does not identify callee-owned scoped storage.
 
-Marking an already marked owner is harmless and does not suppress exact-member
-traversal. Exact-item deduplication, rather than the owner mark, decides whether
-the callback runs.
+Apply the epilogue to every `Return` terminator, including early returns and
+functions which also own scoped allocations. A primitive result still uses the
+same framed epilogue so link discipline is independent of result type.
 
-### Scoped item
+Terminating panic and compiler-invariant paths do not unwind frames. They end
+the process and may leave the chain linked. Do not introduce cleanup stacks,
+`setjmp`, or C unwinding for these paths.
 
-For a scoped reference:
+Unframed functions retain their current direct return unless they need scoped
+restoration, in which case they retain the existing capture-and-restore shape.
 
-1. validate and resolve the exact live member through the scoped arena;
-2. do not read or write a heap header and do not set a mark epoch; and
-3. invoke the exact descriptor's callback when it is non-null.
+## Root-chain traversal
 
-This is required even though scoped storage is not collectible: a scoped root
-may contain a reference to a heap object. A scoped-to-scoped cycle terminates
-through the same exact work-set deduplication.
+### Traversal helpers
 
-Any malformed item sets the context's sticky invalid result. Do not call the
-global compiler-invariant terminator inside the isolated engine; Stage 4 can
-translate an impossible production trace result at the collection boundary.
-A failed pass may have marked owners processed before the failure. It must not
-roll those marks back, mutate block structure, or reclaim anything. Stage 4
-must sweep only after a fully successful trace; a later epoch makes marks from
-an abandoned pass harmless.
+Add an explicit no-op global-root hook:
 
-## Mark-epoch behavior in this stage
+```c
+static void sao2_trace_global_roots(sao2_trace_context *context);
+```
 
-Allow allocated heap headers to contain either zero or a nonzero mark epoch.
-Free headers must continue to contain zero. New and reused allocated blocks
-still initialize their epoch to zero, and reclamation still clears it.
+SAO2 currently has no source-level global values. Interned string descriptors,
+layout descriptors, failure metadata, arena state, and native argument arrays
+are not GC roots.
 
-The trace context requires a caller-supplied nonzero epoch. The native probe
-uses explicit small epoch values and inspects headers afterward. Stage 2 does
-not own a global current epoch, advance epochs, clear old marks, interpret an
-old mark as liveness, sweep, or handle rollover.
+Add a shadow-root visitor which:
 
-Update Stage 1 heap validation accordingly without weakening any other header
-or free-list invariant.
+1. preserves the chain unchanged;
+2. rejects a null callback or a cycle in otherwise valid frame links;
+3. walks from the current top toward the oldest frame;
+4. invokes each generated frame callback; and
+5. stops immediately when the trace context fails.
 
-## Rendering and runtime integration
+Use a non-allocating cycle check, such as tortoise-and-hare, before invoking
+callbacks. Generated code owns pointer validity; the runtime need not make
+arbitrary forged native pointers safe to dereference.
 
-Render in this dependency order:
+Root enumeration only enqueues edges. It does not initialize or dispose the
+trace context, drain trace work, advance epochs, interpret liveness, or sweep.
+The isolated probe performs those phases explicitly; Stage 4 will define the
+complete transaction.
 
-1. fixed value types and forward aggregate/body declarations;
-2. complete tuple, union, and struct body definitions;
-3. trace-context and callback-type forward declarations;
-4. generated body-callback prototypes;
-5. extended layout descriptors and deterministic registry;
-6. existing diagnostics and scalar runtime;
-7. Stage 1 arena and block runtime;
-8. trace context, work-set, enqueue, and drain runtime;
-9. generated struct, tuple, and union callback definitions;
-10. existing copy, formatting, generated function, and host-adapter sections.
+### Runtime lifecycle
 
-Small declaration-only adjustments are allowed where C requires them, but
-existing runtime behavior and function ordering should otherwise remain
-stable. Emit trace sections only when the program has struct layouts; a
-program with no GC-manageable type should not gain unusable callbacks or
-nonstandard empty arrays.
+Arena initialization requires `sao2_shadow_top == NULL`. Normal entry return
+requires the chain to be empty before arena release. Add an invariant check in
+each host-adapter shape after the SAO2 entry function returns and before
+releasing arena reservations.
 
-Ordinary generated functions do not initialize a trace context or call the
-trace engine in this stage. Host adapters continue to initialize and release
-only the existing arenas.
+Arena release clears collector runtime state only after proving there is no
+active frame. Do not silently discard a nonempty chain, since that would hide a
+generated epilogue defect.
+
+## Rendering order
+
+Preserve existing generated sections and add frame material in this dependency
+order:
+
+1. fixed value types and complete aggregate/body definitions;
+2. Stage 2 trace declarations, descriptors, and layout registry;
+3. common shadow-frame declarations;
+4. typed function-frame definitions and callback prototypes;
+5. diagnostics, scalar helpers, and Stage 1 arena runtime;
+6. Stage 2 trace runtime and value/body callback definitions;
+7. shadow-chain helpers and generated frame callback definitions;
+8. existing allocation, copy, formatting, and value helpers;
+9. generated function prototypes and definitions; and
+10. host adapter.
+
+When no function needs a frame, omit typed frame definitions and callbacks.
+The no-op global-root hook and empty chain may remain with the trace runtime so
+Stage 4 has a uniform integration point, but primitive-only programs with no
+struct layouts must remain standards-conforming and free of unusable trace
+types.
 
 ## Implementation sequence
 
-Implement Stage 2 in this order:
+Implement Stage 3 in this order:
 
-1. Add the reference-bearing type query and immutable `TracePlan`, including
-   container rejection, memoization, validation, and deterministic rendering.
-2. Forward-declare the trace ABI, extend layout descriptors with nullable body
-   callbacks, and emit the layout registry and lookup helpers.
-3. Add exact trace item and context types, sticky results, checked scratch
-   lifecycle, and a deterministic FIFO item array.
-4. Add the open-addressed exact-key membership table, transactional growth,
-   and all-zero/partial-zero handling.
-5. Implement heap and scoped item validation, root-descriptor checks, exact
-   member resolution, heap marking, and drain semantics.
-6. Generate forward declarations and callbacks for struct bodies, tuples, and
-   unions, keeping every reference edge queue-based.
-7. Relax allocated-header validation for nonzero epochs while retaining zero
-   epochs for free and newly allocated blocks.
-8. Build the native trace probe from production planner, descriptor, callback,
-   block-runtime, and trace-runtime sources.
-9. Add ordinary generated-C and source-to-native regressions, then remove
-   duplicate type-recursion or trace-expression logic.
+1. Add `FunctionRootPlan`, `RootPlan`, construction from
+   `TracePlan::type_contains_reference`, full validation, and deterministic
+   direct tests.
+2. Add the common shadow-frame ABI, global top pointer, checked link/unlink
+   helpers, and empty global-root hook.
+3. Emit typed frame definitions, offset/field assertions, callback prototypes,
+   and exact generated frame callbacks.
+4. Centralize local-name and local-place rendering, then migrate every read,
+   write, projection root, destination, and helper-generated expression.
+5. Change function declarations and prologues so framed locals exist only in
+   zero-initialized canonical frame storage and frames link before parameter
+   copies.
+6. Unify normal return rendering around capture, unlink, scoped restore, and
+   return, preserving the existing unframed cases.
+7. Add deterministic global/frame root enumeration and host-adapter empty-chain
+   checks without invoking them from ordinary allocation.
+8. Audit native temporaries and decoded body pointers against the future
+   allocation-only safe-point contract.
+9. Extend the isolated native probe to traverse nested generated frames, then
+   add source-to-native regression coverage and remove all root-local
+   hard-coded names.
 
-Every step must keep ordinary compilation deterministic and executable. Do not
-temporarily scan all bytes of a body, trace inactive union payloads, or use the
-owner mark as the traversal visited set.
+Each step must leave the source-to-executable path working. Do not temporarily
+mirror selected locals into both frame and ordinary storage.
 
 ## Test plan
 
@@ -449,112 +448,108 @@ owner mark as the traversal visited set.
 
 Add focused tests for:
 
-- reference-bearing classification of primitives, structs, nested tuples,
-  named and anonymous unions, and recursive referenced structs;
-- distinction between inline struct-body traversal and referenced struct
-  enqueue operations;
-- rejection of list or map shapes at the explicit milestone boundary;
-- unique deterministic plan entries and callback declarations;
-- descriptor callback selection, including `NULL` for primitive-only bodies;
-- registry order and the standards-conforming zero-struct case;
-- field traversal in `FieldId` order and tuple traversal in positional order;
-- union tag zero, one-based active alternatives, and invalid-tag handling;
-- exact-key comparison using tagged owner, unmodified member, and layout;
-- queue insertion order and enqueue-once behavior;
-- checked queue/table growth and sticky scratch exhaustion;
-- allocated nonzero mark epochs versus mandatory zero free-block epochs;
-- absence of shadow frames, root scanning, sweeping, reclaim calls, allocation
-  retry, and new source failure operations; and
-- byte-for-byte deterministic output.
+- selection of struct, nested tuple, nominal union, anonymous union, parameter,
+  binding, and temporary locals;
+- omission of unit, primitive, string, entry-argument, and other non-carrying
+  locals;
+- one ordered root-plan entry per function and unique ordered `LocalId`
+  fields;
+- no frame for a function without roots;
+- one typed frame definition and callback per function with roots;
+- header offset zero and exact root-field carrier assertions;
+- callback traversal in ascending `LocalId` order;
+- zero-safe struct and union frame fields;
+- link-before-parameter-copy prologues;
+- one distinct frame instance for recursive invocations;
+- canonical frame storage across every operation, place, aggregate,
+  projection, check, terminator, and helper renderer;
+- absence of a duplicate ordinary declaration for every rooted local;
+- capture-before-unlink and unlink-before-scoped-restore on every normal return;
+- unchanged direct returns for unframed/non-scoped functions;
+- caller/callee argument and return no-safepoint ordering;
+- host-adapter empty-chain validation before arena release;
+- no automatic root enumeration, trace drain, sweep, reclaim, allocation
+  retry, epoch ownership, or new source failure operation; and
+- deterministic output across repeated emission.
 
-Direct malformed-plan tests should cover missing layouts, duplicate identities,
-wrong field storage or nested identity, absent callback dependencies,
-primitive-only callbacks, and container leakage. Runtime-state tests should
-cover unregistered descriptors, partial-zero references, reserved tags,
-reclaimed owners, wrong root descriptors, misaligned members, owner-bound
-overflow, invalid union tags, and zero epochs.
+Malformed plan tests should cover missing functions, duplicate or unordered
+locals, selected primitive locals, omitted reference-bearing locals, invalid
+types, and a callback without the required Stage 2 type helper.
 
-### Native trace probe
+Generated-C structural tests should assert that no textual
+`sao2_local_N` occurrence remains for selected local `N`, while unrelated
+non-root locals retain their current spelling and initialization.
 
-Build a generated graph using the production block allocator, layouts, and
-callbacks. Supply roots directly to a trace context and assert marked owner
-offsets without sweeping.
+### Native shadow-frame probe
 
-The probe must cover:
+Build the probe from the production frame declarations, callbacks, trace
+runtime, layout registry, and arena runtime. It may explicitly initialize a
+trace context, visit globals and frames, and drain work; ordinary generated
+programs may not.
 
-- a primitive-only heap object which is marked without a callback;
-- a self-cycle and a multi-object cycle;
-- duplicate paths to the same exact item;
-- two interior members of one owner which lead to different heap children;
-- the same numeric owner/member offsets in heap and scoped arenas;
-- an unaligned but valid inline member;
-- nested inline structs and reference fields;
-- tuples containing references directly and through nested tuples;
-- named and anonymous unions for every active reference-bearing alternative;
-- tag-zero unions whose payload bytes are ignored;
-- inactive union bytes containing a plausible reference which is not traced;
-- a scoped root and scoped-to-scoped path leading to a heap child;
-- a heap reference reached only through an interior scoped member;
-- fresh passes with different explicit epochs;
-- graph depth large enough to demonstrate queue traversal rather than native
-  recursion over reference edges;
-- exact work-set growth and collision handling;
-- injected native scratch-allocation failure and safe disposal;
-- invalid tags, stale heap owners, wrong root descriptors, out-of-bounds
-  members, and invalid union discriminants; and
-- an unchanged, valid Stage 1 heap walk and free list after every successful or
-  failed trace.
+Cover:
 
-The probe must demonstrate the key precision property directly: marking one
-interior member retains its complete owner and traces only that member's
-reachable edges, while separately rooting a second member of the same owner
-adds that member's distinct reachable edges.
+- an empty chain and no-op global-root enumeration;
+- one frame with a root struct and a primitive-only sibling local;
+- nested frames whose roots lead to distinct heap owners;
+- recursion with several instances of one frame type;
+- a struct parameter copied after linking;
+- tuple and active-union roots in frame fields;
+- a tag-zero union and all-zero struct reference;
+- root and unaligned interior references;
+- a scoped frame root which reaches a heap child;
+- two frames exposing different members of one heap owner;
+- overwriting a canonical slot and tracing under a fresh epoch;
+- unlinking an inner frame and proving its unique owner is absent from the next
+  epoch while outer roots remain;
+- LIFO unlink validation and a cycle in valid test frame nodes;
+- sticky trace failure stopping later frame callbacks without changing links;
+- frame-chain preservation across successful and failed enumeration;
+- scoped restoration only after the owning frame is unlinked; and
+- a clean empty chain before arena release.
 
-Use the existing supported-compiler discovery and argument-list invocation.
-Only a genuinely missing supported compiler may skip native assertions.
-Compilation failure, assertion failure, abnormal termination, wrong marks, or
-unexpected status is a test failure. Both Windows and POSIX branches require
-external verification before completion.
+Use current-epoch equality rather than expecting older mark fields to be
+cleared. A root absent from a later pass may retain its previous numeric mark
+until Stage 4 sweeps or Stage 5 resets epochs.
 
 ### Public pipeline regressions
 
-Retain the full Stage 1 runtime probe and ordinary struct programs. Generated
-trace metadata must not alter output, exit status, allocation placement,
-scoped restoration, equality, mutation, diagnostics, or host-adapter cleanup.
+Retain all Stage 1 and Stage 2 probes and run ordinary programs combining:
 
-Exercise source programs whose struct layouts contain:
+- struct-valued parameters, results, locals, and temporaries;
+- tuple and union carriers containing struct references;
+- direct, nested, and recursive calls;
+- root and interior aliases;
+- inline replacement and referenced rebinding;
+- heap and scoped allocations in the same invocation;
+- branches, loops, and early returns; and
+- unit and integer entry adapters with and without arguments.
 
-- no references;
-- direct and recursive referenced fields;
-- multiple levels of inline fields;
-- tuple fields containing references; and
-- active and inactive union fields.
-
-These programs need not invoke collection in Stage 2. They prove the added
-plans, descriptors, and callbacks compile alongside the unchanged mutator.
+Observable output, identity, mutation, failure locations, exit status, scoped
+reuse, heap placement, and diagnostics must remain unchanged. Generated trace
+and frame machinery remains inactive unless the native probe invokes it.
 
 ## Completion gate
 
-Stage 2 is complete when:
+Stage 3 is complete when:
 
-- every supported reference-bearing shape has one validated deterministic
-  trace plan and the required generated callbacks;
-- heap headers identify registered root layouts while each trace item retains
-  its independent exact member layout;
-- exact work items are deduplicated by tagged owner, member, and layout;
-- reference cycles are queue-driven and terminate without recursive graph
-  traversal;
-- heap items mark complete owners and traverse exact members;
-- scoped items remain unmarked but can reach heap owners;
-- tuples, inline structs, and only active union payloads trace precisely;
-- zero references and inactive unions are safe;
-- malformed runtime state and scratch exhaustion produce a sticky trace result
-  without structural heap mutation, and a failed pass is never sweepable;
-- no block is reclaimed and no ordinary program triggers tracing;
-- Stage 1 allocation/reuse behavior and all language-visible behavior remain
-  unchanged;
+- every reference-bearing IR local has exactly one canonical typed frame field;
+- every non-reference-bearing local remains ordinary C storage;
+- every framed invocation links a completely zero-safe frame before root
+  parameter copies and unlinks it on every normal return;
+- generated callbacks enumerate each frame field using its exact static type;
+- the active chain can be traversed without inspecting the native stack;
+- nested calls, recursion, scoped roots, interior roots, tuples, and unions
+  produce the expected Stage 2 trace items and heap marks;
+- call arguments and return channels are safe under the documented
+  allocation-only safe-point model;
+- no decoded body pointer or unrooted backend temporary crosses a future safe
+  point;
+- a normal host return proves the chain is empty before arena release;
+- no ordinary allocation triggers tracing or reclaims a block;
+- all prior allocation, trace, language, and diagnostic behavior is unchanged;
 - direct and native coverage passes on the available platform matrix; and
-- no generated artifacts or new dependency are introduced.
+- no generated artifact or new dependency is introduced.
 
 Contributor guidance prohibits compiling, running tests, or formatting while
 implementing this stage. External verification must use Rust 1.90 or newer,

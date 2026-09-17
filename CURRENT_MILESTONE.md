@@ -93,10 +93,7 @@ ordinary source programs retain milestone-9 behavior.
 
 ## Stage 2: Exact trace plans and callbacks
 
-Status: current.
-
-The detailed implementation plan is in
-[Current Stage: Exact Trace Plans and Callbacks](CURRENT_STAGE.md).
+Status: complete.
 
 Add a compiler-owned trace plan derived from typed IR types and the physical
 layout plan. It records which value shapes can contain struct references and
@@ -122,7 +119,10 @@ when production programs collect.
 
 ## Stage 3: Precise shadow frames
 
-Status: pending.
+Status: current.
+
+The detailed implementation plan is in
+[Current Stage: Precise Shadow Frames](CURRENT_STAGE.md).
 
 Add a root plan for every function after IR validation and escape analysis.
 The plan selects all locals whose type can carry a struct reference, including
