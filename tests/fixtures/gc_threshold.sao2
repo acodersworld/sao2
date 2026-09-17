@@ -1,0 +1,17 @@
+type Point(value int);
+
+fn make_point(value int) Point {
+    Point(value = value)
+}
+
+fn main() {
+    keep := make_point(777);
+    var transient := make_point(0);
+    var index := 0;
+    // Rebinding transient leaves keep as the deliberately live working set.
+    while index < 60000 {
+        transient = make_point(index);
+        index += 1;
+    }
+    println(keep.value);
+}

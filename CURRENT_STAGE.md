@@ -1,6 +1,6 @@
 # Current Stage: GC Integration and Milestone Closure
 
-Status: current.
+Status: complete.
 
 This document expands Stage 6 of
 [Current Milestone: Garbage Collector](CURRENT_MILESTONE.md). It closes

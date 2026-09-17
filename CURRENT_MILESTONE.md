@@ -1,6 +1,6 @@
 # Current Milestone: Garbage Collector
 
-Status: current.
+Status: complete.
 
 This document maps milestone 10 of `ROADMAP.md` into implementation stages.
 The milestone replaces the temporary monotonic heap from milestone 9 with a
@@ -209,10 +209,7 @@ correctness property depends on an epoch never wrapping.
 
 ## Stage 6: Integration and milestone closure
 
-Status: current.
-
-The detailed implementation plan is in
-[Current Stage: GC Integration and Milestone Closure](CURRENT_STAGE.md).
+Status: complete.
 
 Exercise the full public pipeline with readable source programs combining
 heap and scoped allocations, root and interior aliases, inline and referenced

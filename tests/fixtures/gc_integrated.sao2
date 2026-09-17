@@ -1,0 +1,181 @@
+type Leaf(value int);
+type Node(value int, link Link, child &Leaf);
+type Link(Node | ());
+type Pair(Node, Node);
+type Choice(Node | int);
+type Tagged(Start(Node) | Number(int));
+type Outer(left Leaf, right Leaf, shared &Leaf, anchor Node, pair Pair, choice Choice);
+type ScopedHolder(shared &Leaf);
+
+fn inspect_leaf(leaf Leaf) int {
+    leaf.value
+}
+
+fn scoped_leaf() int {
+    leaf := Leaf(value = 8);
+    inspect_leaf(leaf)
+}
+
+fn make_leaf(value int) Leaf {
+    Leaf(value = value)
+}
+
+fn make_cycle(value int) Node {
+    var node := Node(
+        value = value,
+        link = Link(()),
+        child = Leaf(value = value + 100)
+    );
+    node.link = Link(node);
+    node
+}
+
+fn make_pair_cycle(value int) Node {
+    var first := Node(
+        value = value,
+        link = Link(()),
+        child = Leaf(value = value + 100)
+    );
+    second := Node(
+        value = value + 1,
+        link = Link(first),
+        child = Leaf(value = value + 101)
+    );
+    first.link = Link(second);
+    first
+}
+
+fn make_outer(first Node, second Node) Outer {
+    Outer(
+        left = Leaf(value = 1),
+        right = Leaf(value = 2),
+        shared = Leaf(value = 3),
+        anchor = first,
+        pair = Pair(first, second),
+        choice = Choice(first)
+    )
+}
+
+fn read_with_allocation(var node Node) {
+    node.value += 1;
+    replacement := make_leaf(900);
+    node.child = replacement;
+}
+
+fn returned_left(value Outer) Leaf {
+    value.left
+}
+
+fn make_pair(value Node) Pair {
+    Pair(value, value)
+}
+
+fn make_choice(value Node) Choice {
+    Choice(value)
+}
+
+fn trace_from_scoped(child Leaf) {
+    holder := ScopedHolder(shared = child);
+    var scratch := make_leaf(0);
+    var index := 0;
+    while index < 20000 {
+        scratch = make_leaf(index);
+        index += 1;
+    }
+}
+
+fn select_node(first Node, second Node, choose_first bool) Node {
+    if choose_first {
+        return first;
+    }
+    return second;
+}
+
+fn recursive_read(node Node, depth int) int {
+    if depth == 0: node.value else: recursive_read(node, depth - 1)
+}
+
+fn abandon_cycle(depth int) {
+    var node := Node(value = depth, link = Link(()), child = Leaf(value = depth));
+    node.link = Link(node);
+    if depth > 0 {
+        abandon_cycle(depth - 1);
+    }
+}
+
+fn main() {
+    println(scoped_leaf());
+
+    var cycle := make_cycle(10);
+    var pair_cycle := make_pair_cycle(20);
+    var outer := make_outer(cycle, pair_cycle);
+    // These roots, the interior aliases, and the tuple/union carriers remain
+    // live while the loops create allocation pressure.
+    selected := select_node(cycle, pair_cycle, true);
+    println(selected == cycle);
+
+    left_alias := outer.left;
+    right_alias := outer.right;
+    println(left_alias == outer.left);
+    println(left_alias == right_alias);
+    outer.left = Leaf(value = 30);
+    println(left_alias.value);
+    println(right_alias.value);
+
+    old_shared := outer.shared;
+    outer.shared = Leaf(value = 40);
+    println(old_shared.value);
+    println(outer.shared.value);
+
+    old_child := cycle.child;
+    read_with_allocation(cycle);
+    println(old_child.value);
+    println(cycle.child.value);
+    trace_from_scoped(cycle.child);
+
+    anchor_alias := outer.anchor;
+    outer.anchor = pair_cycle;
+    println(anchor_alias == outer.anchor);
+    println(anchor_alias.value);
+
+    cycle_link := cycle.link;
+    if cycle_link is Node: println(cycle_link.value);
+    pair_link := pair_cycle.link;
+    if pair_link is Node: println(pair_link.value);
+
+    tuple := make_pair(cycle);
+    println(tuple == tuple);
+    choice := make_choice(cycle);
+    if choice is Node: println(choice.value);
+    tagged := Tagged.Start(cycle);
+    if tagged is Start: println(tagged.value);
+    inactive := Choice(123);
+
+    returned := returned_left(outer);
+    println(returned == outer.left);
+    println(returned.value);
+    println(recursive_read(cycle, 4));
+
+    var index := 0;
+    var total := 0;
+    while index < 6 {
+        if index % 2 == 0 {
+            total += cycle.value;
+        } else {
+            total += pair_cycle.value;
+        }
+        index += 1;
+    }
+    println(total);
+
+    // The recursive helper's frame is the only root for these cycles.
+    abandon_cycle(3);
+    var transient := make_leaf(0);
+    index = 0;
+    while index < 20000 {
+        transient = make_leaf(index);
+        index += 1;
+    }
+    println(cycle.value);
+    println(pair_cycle.value);
+}

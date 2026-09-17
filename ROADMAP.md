@@ -162,16 +162,16 @@ that pass references to inline structs without letting them escape.
 
 ## 10. Garbage collector
 
-Status: current.
+Status: complete.
 
-The milestone breakdown is in
-[Current Milestone: Garbage Collector](CURRENT_MILESTONE.md). The active
-implementation plan is in
-[Current Stage: GC Integration and Milestone Closure](CURRENT_STAGE.md).
+The completed milestone breakdown is in
+[Garbage Collector Milestone](CURRENT_MILESTONE.md). Its final integration plan
+is in [GC Integration and Milestone Closure](CURRENT_STAGE.md).
 
 - Implement a non-moving, stop-the-world mark-and-sweep heap.
 - Register generated type and allocation-layout descriptors.
-- Enumerate precise global, stack, temporary, and container roots.
+- Enumerate precise global, shadow-frame, and temporary roots, with an explicit
+  traversal extension point for future container roots.
 - Retain native C calls while generating a typed shadow-frame struct and
   traversal callback for each function that can hold roots.
 - Link zero-initialized shadow frames for active invocations and traverse their
@@ -186,9 +186,9 @@ implementation plan is in
 Outcome: cyclic object graphs and escaping interior references are reclaimed
 safely without exposing allocation placement to programs.
 
-The reserved arenas, packed-reference, and exact-interior-tracing mechanism
-should also receive an early isolated prototype before the full runtime depends
-on it.
+The reserved arenas, packed-reference ABI, exact-interior tracer, and collector
+policy are retained in isolated production-runtime probes as well as public
+end-to-end coverage.
 
 ## 11. Containers
 
