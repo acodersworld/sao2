@@ -522,6 +522,10 @@ struct TracePlan {
 
 /// Backend-owned, deterministic storage plan for the precise shadow stack.
 /// IR locals remain the identities: this plan only chooses their C storage.
+///
+/// Milestone 11 extends the type-carrying query below for container carriers;
+/// their backing descriptors and callbacks must then flow through the same
+/// frame fields and `(owner, member, layout)` trace queue.
 #[derive(Clone, Debug)]
 struct FunctionRootPlan { function: FunctionId, locals: Vec<(LocalId, TypeId)> }
 
@@ -872,7 +876,7 @@ impl<'a> LayoutPlanner<'a> {
             Type::Nominal(definition) if matches!(self.program.definitions[definition.index()].layout, DefinitionLayout::Struct(_)) => (8, 4, Some(layout_identity(*definition)?)),
             Type::Nominal(definition) => self.aggregate_physical(AggregateId::Definition(*definition))?,
             Type::Union(_) => self.aggregate_physical(AggregateId::AnonymousUnion(ty))?,
-            Type::List(_) | Type::Map { .. } => return Err(CEmissionError::Invariant(BackendInvariant { definition: None, ty: Some(ty), message: "container has no Stage 2 physical carrier".into() })),
+            Type::List(_) | Type::Map { .. } => return Err(CEmissionError::Invariant(BackendInvariant { definition: None, ty: Some(ty), message: "container physical carriers are deferred to milestone 11".into() })),
         })
     }
 
@@ -1740,6 +1744,9 @@ impl<'a> Renderer<'a> {
             Type::Union(_) => {
                 let _ = writeln!(self.output, "{padding}sao2_trace_value_ty_{}(context, &({expression}));", ty.index());
             }
+            // Milestone 11 adds container carriers here: the root planner,
+            // descriptor registry, and backing callbacks must all use the
+            // same exact trace queue already used by structs and aggregates.
             Type::Unit | Type::Primitive(_) | Type::List(_) | Type::Map { .. } => {}
         }
     }
@@ -1980,6 +1987,14 @@ impl<'a> Renderer<'a> {
         let _ = writeln!(self.output, "    sao2_ref sao2_struct_ref_{id};");
         let _ = writeln!(self.output, "    unsigned char *sao2_struct_bytes_{id};");
         let _ = writeln!(self.output, "    sao2_body_def_{} *sao2_struct_body_{id};", definition.index());
+        for field in &layout.fields {
+            let (_, operand) = operands.iter().find(|(field_id, _)| *field_id == field.id)
+                .expect("validated struct field operand");
+            let value = self.operand(operand);
+            let value_name = format!("sao2_struct_value_{id}_{}", field.id.index());
+            let c_ty = self.c_type(field.ty);
+            let _ = writeln!(self.output, "    {c_ty} {value_name} = {value};");
+        }
         let allocation_helper = match class {
             AllocationClass::Scoped => "sao2_allocate_scoped_struct",
             AllocationClass::Heap => "sao2_allocate_struct",
@@ -1987,9 +2002,7 @@ impl<'a> Renderer<'a> {
         let _ = writeln!(self.output, "    {allocation_helper}(&sao2_layout_def_{}, {}, &sao2_struct_ref_{id}, &sao2_struct_bytes_{id});", definition.index(), failure.index());
         let _ = writeln!(self.output, "    sao2_struct_body_{id} = (sao2_body_def_{0} *)sao2_struct_bytes_{id};", definition.index());
         for field in &layout.fields {
-            let (_, operand) = operands.iter().find(|(field_id, _)| *field_id == field.id)
-                .expect("validated struct field operand");
-            let value = self.operand(operand);
+            let value = format!("sao2_struct_value_{id}_{}", field.id.index());
             if field.storage == MemberStorage::Inline && field.nested_layout.is_some()
                 && matches!(&self.program.types[field.ty.index()], Type::Nominal(inner) if matches!(self.program.definitions[inner.index()].layout, DefinitionLayout::Struct(_))) {
                 let Type::Nominal(inner) = &self.program.types[field.ty.index()] else { unreachable!() };
@@ -2445,9 +2458,8 @@ fn failure_operation_macro(operation: FailureOperation) -> &'static str {
 const ARENA_RUNTIME: &str = r#"
 
 /*
- * Milestone 10 block-heap foundation. Stage 5 collection policy is
- * synchronous, precise, stationary, and bounded to the managed allocation
- * safe point.
+ * Milestone 10 managed heap runtime. Collection is synchronous, precise,
+ * stationary, and bounded to the managed allocation safe point.
  * Scoped allocation remains an independent, restorable bump arena.
  */
 #ifndef SAO2_ARENA_CAPACITY
@@ -2860,7 +2872,11 @@ static sao2_arena_result sao2_heap_allocate_raw(uint64_t body_size, uint64_t ali
     if (result == NULL || alignment != SAO2_REF_ALIGNMENT) return SAO2_ARENA_INVALID;
     if (!sao2_heap_span(body_size, &required_span) || !sao2_heap_span(0, &minimum_span))
         return SAO2_ARENA_EXHAUSTED;
+#ifdef SAO2_RUNTIME_PROBE
+    /* Probes retain the full invariant check; production allocation stays
+     * constant-time and collection validates the complete heap boundary. */
     if (!sao2_heap_validate()) return SAO2_ARENA_INVALID;
+#endif
     selected = sao2_heap_arena.free_head;
     while (selected != 0) {
         sao2_heap_header *header = sao2_heap_header_at(selected);
@@ -2928,15 +2944,25 @@ static sao2_arena_result sao2_heap_allocate(uint64_t body_size, uint64_t alignme
 
 static bool sao2_heap_header_for(sao2_ref reference, sao2_heap_header **result) {
     sao2_arena_kind kind;
-    uint64_t owner, header_offset;
+    uint64_t owner, header_offset, next;
     sao2_heap_header *header;
     if (result == NULL || !sao2_ref_kind(reference, &kind)
-        || kind != SAO2_ARENA_HEAP || !sao2_heap_validate()) return false;
+        || kind != SAO2_ARENA_HEAP) return false;
     owner = (uint64_t)(reference.owner_ptr & ~SAO2_REF_OWNER_TAG_MASK);
     if (owner == 0 || owner < (uint64_t)sizeof(sao2_heap_header) + SAO2_ARENA_INITIAL_CURSOR)
         return false;
     header_offset = owner - (uint64_t)sizeof(sao2_heap_header);
-    if (!sao2_heap_find_block(header_offset, &header)
+    if (header_offset >= sao2_heap_arena.frontier) return false;
+#ifdef SAO2_RUNTIME_PROBE
+    if (!sao2_heap_validate() || !sao2_heap_find_block(header_offset, &header)
+#else
+    /* The allocator publishes owner offsets at block boundaries.  The local
+     * header check preserves stale-reference rejection without rescanning all
+     * preceding blocks on every allocation. */
+    header = sao2_heap_header_at(header_offset);
+    if (!sao2_heap_block_valid(header_offset, sao2_heap_arena.frontier, &next)
+        || next <= header_offset
+#endif
         || header->block_state != SAO2_HEAP_BLOCK_ALLOCATED
         || header_offset + (uint64_t)sizeof(sao2_heap_header) != owner
         || header->lifetime != SAO2_HEAP_LIFETIME
@@ -3184,6 +3210,31 @@ static void sao2_trace_enqueue(sao2_trace_context *context, sao2_ref reference,
     context->slot_count++;
 }
 
+static bool sao2_layout_contains_inline(const sao2_layout_descriptor *root,
+    uint64_t relative, const sao2_layout_descriptor *target, size_t depth) {
+    size_t index;
+    if (root == NULL || target == NULL || depth > sao2_layout_registry_count)
+        return false;
+    if (root == target && relative == 0) return true;
+    for (index = 0; index < root->field_count; index++) {
+        const sao2_layout_field_descriptor *field = &root->fields[index];
+        const sao2_layout_descriptor *child;
+        uint64_t child_relative;
+        if (field->storage != SAO2_LAYOUT_FIELD_INLINE
+            || field->inline_layout == UINT64_MAX || relative < field->offset)
+            continue;
+        child_relative = relative - field->offset;
+        if (child_relative > field->size) continue;
+        child = sao2_layout_find(field->inline_layout);
+        if (child == NULL || child->size != field->size
+            || child->alignment != field->alignment)
+            continue;
+        if (sao2_layout_contains_inline(child, child_relative, target, depth + 1))
+            return true;
+    }
+    return false;
+}
+
 static bool sao2_trace_resolve(sao2_trace_context *context, const sao2_trace_item *item,
     sao2_arena_kind *kind_result, sao2_heap_header **header_result,
     const unsigned char **body_result) {
@@ -3210,7 +3261,9 @@ static bool sao2_trace_resolve(sao2_trace_context *context, const sao2_trace_ite
             || (uintptr_t)(arena->base + (size_t)owner) % root->alignment != 0
             || header->body_size > UINT64_MAX - owner) return false;
         owner_end = owner + header->body_size;
-        if (end > owner_end || (member == owner && item->layout != root)) return false;
+        if (end > owner_end || member < owner
+            || !sao2_layout_contains_inline(root, member - owner, item->layout, 0))
+            return false;
     } else {
         if (owner % SAO2_REF_ALIGNMENT != 0 || end > arena->frontier) return false;
     }
@@ -4215,7 +4268,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_stage_one_packed_reference_and_arena_runtime_before_functions() {
+    fn renders_packed_reference_and_arena_runtime_before_functions() {
         let (mut program, types, location) = program();
         let mut main = Function::new("main", types.unit);
         let block = main.add_block();
@@ -4229,7 +4282,7 @@ mod tests {
         let emitted = emit(&program).unwrap();
         let reference = emitted.find("typedef struct {\n    uint32_t owner_ptr;\n    uint32_t member_ptr;\n} sao2_ref;").unwrap();
         let aggregate = emitted.find("typedef struct sao2_interned_string {").unwrap();
-        let runtime = emitted.find("/*\n * Milestone 10 block-heap foundation.").unwrap();
+        let runtime = emitted.find("/*\n * Milestone 10 managed heap runtime.").unwrap();
         let prototype = emitted.find("sao2_unit sao2_fn_0(void);").unwrap();
         assert!(reference < aggregate && aggregate < runtime && runtime < prototype);
         assert!(emitted.contains("_Static_assert(sizeof(sao2_ref) == 8"));
@@ -4539,7 +4592,8 @@ int main(void) {
         assert!(emitted.contains("sao2_layout_def_0 = { UINT64_C(0), UINT64_C(8), UINT64_C(8), 1"));
         assert!(emitted.contains("sao2_layout_def_1 = { UINT64_C(1), UINT64_C(24), UINT64_C(8), 3"));
         assert!(emitted.contains("static void sao2_allocate_struct(const sao2_layout_descriptor *layout, size_t site,"));
-        assert!(emitted.contains("owner_end = owner + header->body_size;\n        if (end > owner_end)"));
+        assert!(emitted.contains("owner_end = owner + header->body_size;\n        if (end > owner_end || member < owner"));
+        assert!(emitted.contains("static bool sao2_layout_contains_inline(const sao2_layout_descriptor *root,"));
         assert!(!emitted.contains("names must not leak"));
     }
 
@@ -4884,7 +4938,10 @@ int main(void) {
         assert!(emitted.contains("sao2_scoped_mark sao2_function_mark = sao2_scoped_mark_current();"));
         assert!(emitted.contains("int64_t sao2_return_value = INT64_C(0);"));
         assert!(emitted.contains("if (!sao2_scoped_restore(sao2_function_mark)) sao2_compiler_invariant();"));
-        assert!(emitted.contains("sao2_struct_body_0->field_0 = INT64_C(7);"));
+        let initializer = emitted.find("sao2_struct_value_0_0 = INT64_C(7);").unwrap();
+        let allocation = emitted.find("sao2_allocate_scoped_struct(&sao2_layout_def_0").unwrap();
+        assert!(initializer < allocation);
+        assert!(emitted.contains("sao2_struct_body_0->field_0 = sao2_struct_value_0_0;"));
         assert!(emitted.contains("sao2_shadow_frame_fn_0 sao2_frame = {0};"));
         assert!(emitted.contains("sao2_frame.local_0 = sao2_struct_ref_0;"));
         assert!(emitted.contains("sao2_local_1 = sao2_ref_equal(sao2_frame.local_0, sao2_frame.local_0);"));
@@ -4946,6 +5003,18 @@ int main(void) {
         assert!(emitted.contains("sao2_trace_shadow_roots(&context)"));
         assert!(emitted.contains("static bool sao2_heap_sweep(uint32_t epoch)"));
         assert!(emitted.contains("SAO2_ARENA_COLLECTION_FAILED"));
+
+        let global_roots = emitted.find("static void sao2_trace_global_roots").unwrap();
+        let shadow_roots = emitted.find("static void sao2_trace_shadow_roots").unwrap();
+        assert!(global_roots < shadow_roots);
+        assert!(emitted.contains(
+            "item->reference.owner_ptr == reference.owner_ptr\n        && item->reference.member_ptr == reference.member_ptr\n        && item->layout->identity == layout->identity"
+        ));
+        assert!(emitted.contains("if (kind == SAO2_ARENA_HEAP) header->mark_epoch = context->epoch;"));
+        assert!(emitted.contains("sao2_shadow_assert_empty();"));
+        assert!(!emitted.contains("sao2_scan_native_stack"));
+        assert!(!emitted.contains("sao2_write_barrier"));
+        assert!(!emitted.contains("sao2_compact_heap"));
     }
 
     #[test]

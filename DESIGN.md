@@ -126,7 +126,8 @@ Here `target` is inline and `sharedTarget` is a reference. `&` selects member
 storage and does not define a separate first-class reference type. Other
 object-valued members are stored as garbage-collected references. A recursive
 tuple or inline-struct definition that would have infinite size is rejected;
-recursive struct relationships must cross a referenced `&` member.
+recursive struct relationships must cross a referenced `&` member or a
+packed struct-valued tuple/union representation.
 
 Access syntax is identical for inline and referenced members. Accessing an
 inline struct member produces a reference to its stable embedded slot, which
@@ -134,6 +135,12 @@ may be passed or returned like any other struct reference. Assigning a struct
 to an inline member copies its language-visible fields into that slot while
 preserving the slot's identity. Referenced members are rebound instead. Copies
 share any referenced objects.
+
+Struct-valued tuple fields and union alternatives use the packed struct
+reference representation; they do not embed a complete struct body. A finite
+union carrier can therefore carry a reference back to its enclosing struct,
+allowing source programs to build cyclic graphs while the inactive union
+alternatives remain non-traceable.
 
 ### Unions
 

@@ -1480,7 +1480,15 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
                 for member in members {
                     if member.storage == MemberStorage::Inline {
                         if let TypeState::Resolved(ty) = member.ty {
-                            self.collect_inline_type_dependencies(ty, dependencies);
+                            match self.types.get(ty) {
+                                ResolvedType::Nominal(id)
+                                    if matches!(
+                                        &self.type_definition(*id).kind,
+                                        TypeDefinitionKind::Union { .. }
+                                    ) => self.collect_inline_type_dependencies(ty, dependencies),
+                                ResolvedType::Nominal(id) => dependencies.push(*id),
+                                _ => self.collect_inline_type_dependencies(ty, dependencies),
+                            }
                         }
                     }
                 }
@@ -1513,7 +1521,26 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
     ) {
         match self.types.get(ty) {
             ResolvedType::Unit | ResolvedType::Primitive(_) | ResolvedType::List(_) | ResolvedType::Map { .. } => {}
-            ResolvedType::Nominal(id) => dependencies.push(*id),
+            // Struct values are packed references everywhere except an
+            // explicitly inline struct member.  Tuple fields and union
+            // payloads therefore do not contribute a by-value layout edge;
+            // allowing that distinction is what makes a finite union carrier
+            // such as `Node | ()` usable for source-level cyclic graphs.
+            ResolvedType::Nominal(id) => match &self.type_definition(*id).kind {
+                TypeDefinitionKind::Struct(_) => {}
+                TypeDefinitionKind::Tuple(_) => dependencies.push(*id),
+                TypeDefinitionKind::Union { alternatives, .. } => {
+                    for alternative in alternatives.iter() {
+                        let payload = match alternative {
+                            UnionAlternative::Untagged(payload)
+                            | UnionAlternative::Tagged { payload, .. }
+                            | UnionAlternative::Error(payload) => *payload,
+                        };
+                        self.collect_inline_type_dependencies(payload, dependencies);
+                    }
+                }
+                TypeDefinitionKind::Invalid => {}
+            },
             ResolvedType::Union(alternatives) => {
                 for alternative in alternatives.iter() {
                     let payload = match alternative {
@@ -6180,29 +6207,41 @@ mod tests {
 
     #[test]
     fn validates_referenced_storage_and_recursive_inline_layouts() {
-        let source = source(
+        let reference_source = source(
             concat!(
-                "type Node(next &Node); type Safe(items [Safe]); ",
                 "type Pair(int, int); type BadReference(pair &Pair, count &int); ",
-                "type A(b B); type B(A); type Link(C | int); type C(link Link); ",
                 "fn main() {}",
             ),
         );
-        let program = parser::parse(&source).unwrap();
-        let analysis = analyze(&source, &program);
-        let diagnostics = analysis.diagnostics.to_string();
+        let reference_program = parser::parse(&reference_source).unwrap();
+        let reference_analysis = analyze(&reference_source, &reference_program);
+        let reference_diagnostics = reference_analysis.diagnostics.to_string();
 
-        assert_eq!(diagnostics.matches("referenced storage '&'").count(), 2);
-        for name in ["A", "B", "Link", "C"] {
+        assert_eq!(reference_diagnostics.matches("referenced storage '&'").count(), 2);
+
+        let recursive_source = source(
+            concat!(
+                "type Node(next &Node); type Safe(items [Safe]); ",
+                "type A(b B); type B(a A); type Link(C | int); type C(link Link); ",
+                "fn main() {}",
+            ),
+        );
+        let recursive_program = parser::parse(&recursive_source).unwrap();
+        let recursive_analysis = analyze(&recursive_source, &recursive_program);
+        let recursive_diagnostics = recursive_analysis.diagnostics.to_string();
+
+        for name in ["A", "B"] {
             assert!(
-                diagnostics.contains(&format!(
+                recursive_diagnostics.contains(&format!(
                     "type '{name}' has an infinitely recursive inline layout"
                 )),
-                "{diagnostics}",
+                "{recursive_diagnostics}",
             );
         }
-        assert!(!diagnostics.contains("type 'Node' has an infinitely"));
-        assert!(!diagnostics.contains("type 'Safe' has an infinitely"));
+        assert!(!recursive_diagnostics.contains("type 'Node' has an infinitely"));
+        assert!(!recursive_diagnostics.contains("type 'Safe' has an infinitely"));
+        assert!(!recursive_diagnostics.contains("type 'Link' has an infinitely"));
+        assert!(!recursive_diagnostics.contains("type 'C' has an infinitely"));
     }
 
     #[test]

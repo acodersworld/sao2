@@ -45,6 +45,11 @@ fn run_source(directory: &TestDirectory, source: &[u8]) -> Output {
     sao2(&directory.0, &[OsStr::new("run"), source_path.as_os_str()])
 }
 
+fn run_fixture(directory: &TestDirectory, name: &str, source: &[u8]) -> Output {
+    let source_path = directory.write_source(name, source);
+    sao2(&directory.0, &[OsStr::new("run"), source_path.as_os_str()])
+}
+
 fn compiler_is_missing(output: &Output) -> bool {
     String::from_utf8_lossy(&output.stderr).contains("no supported C compiler found")
 }
@@ -385,6 +390,86 @@ fn runs_struct_returns_and_control_flow() {
     );
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(output.stdout, b"33\n");
+}
+
+#[test]
+fn runs_integrated_gc_graphs_through_the_public_pipeline() {
+    let directory = TestDirectory::new("integrated gc graphs");
+    let output = run_fixture(
+        &directory,
+        "integrated gc graphs.sao2",
+        include_bytes!("fixtures/gc_integrated.sao2"),
+    );
+    assert!(
+        !compiler_is_missing(&output),
+        "native GC integration tests require a supported C compiler: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"8\ntrue\ntrue\nfalse\n30\n2\n3\n40\n110\n900\ntrue\n20\n11\n21\ntrue\n11\n11\ntrue\n30\n11\n93\n11\n20\n"
+    );
+}
+
+#[test]
+fn runs_sustained_production_heap_pressure_with_live_roots() {
+    let directory = TestDirectory::new("production gc threshold");
+    let output = run_fixture(
+        &directory,
+        "production gc threshold.sao2",
+        include_bytes!("fixtures/gc_threshold.sao2"),
+    );
+    assert!(
+        !compiler_is_missing(&output),
+        "native GC threshold tests require a supported C compiler: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"777\n");
+}
+
+#[test]
+fn emits_integrated_gc_c_deterministically() {
+    let directory = TestDirectory::new("integrated gc determinism");
+    let source_path = directory.write_source(
+        "integrated gc determinism.sao2",
+        include_bytes!("fixtures/gc_integrated.sao2"),
+    );
+    let first = sao2(
+        &directory.0,
+        &[OsStr::new("build"), source_path.as_os_str()],
+    );
+    assert!(
+        !compiler_is_missing(&first),
+        "native GC determinism tests require a supported C compiler: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let generated = fs::read(directory.0.join("build/program.c")).unwrap();
+
+    let second = sao2(
+        &directory.0,
+        &[OsStr::new("build"), source_path.as_os_str()],
+    );
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(fs::read(directory.0.join("build/program.c")).unwrap(), generated);
 }
 
 #[test]
