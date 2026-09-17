@@ -191,7 +191,9 @@ end-to-end coverage.
 Status: current.
 
 The milestone breakdown is in
-[Current Milestone: Containers](CURRENT_MILESTONE.md).
+[Current Milestone: Containers](CURRENT_MILESTONE.md). The active
+implementation plan is in
+[Current Stage: Managed Container Foundation](CURRENT_STAGE.md).
 
 - Implement lists, maps, indexing, membership, iteration, and mutation.
 - Preserve insertion order in maps.

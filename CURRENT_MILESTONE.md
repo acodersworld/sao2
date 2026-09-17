@@ -83,7 +83,10 @@ runtime behavior depends on them.
 
 ## Stage 1: Managed container foundation
 
-Status: pending.
+Status: current.
+
+The detailed implementation plan is in
+[Current Stage: Managed Container Foundation](CURRENT_STAGE.md).
 
 Define the permanent C carrier, control headers, backing-allocation metadata,
 capacity arithmetic, and generated per-type operation descriptors shared by
