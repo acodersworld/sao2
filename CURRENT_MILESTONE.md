@@ -1,256 +1,290 @@
-# Current Milestone: Garbage Collector
+# Current Milestone: Containers
 
-Status: complete.
+Status: current.
 
-This document maps milestone 10 of `ROADMAP.md` into implementation stages.
-The milestone replaces the temporary monotonic heap from milestone 9 with a
-precise, non-moving, stop-the-world mark-and-sweep collector. The packed
-reference ABI, physical struct layouts, escape decisions, and scoped arena
-remain unchanged.
+This document maps milestone 11 of `ROADMAP.md` into implementation stages.
+The frontend and typed IR already represent list and map types, literals,
+index projections, membership, methods, iteration, and mutation checks. This
+milestone replaces the C backend's deliberate container capability boundary
+with permanent managed storage and complete public execution.
 
-The collector is an implementation detail. It must not add source syntax,
-placement controls, finalizers, weak references, or observable allocation
-addresses. Every stage must preserve the source-to-executable path, and heap
-allocation must continue to report failures at the originating struct
-construction site.
+The milestone must preserve the walking skeleton. Primitive, aggregate,
+struct, scoped-allocation, and garbage-collected programs remain executable
+while container support advances one coherent runtime slice at a time.
 
 ## Fixed architecture
 
-Collection is synchronous and may occur only inside the heap-allocation slow
-path. Generated functions continue to call one another as ordinary C
-functions. A linked shadow-frame chain, rather than the native C stack,
-contains every active reference-bearing local and materialized temporary.
-Root-bearing locals live directly in typed shadow-frame fields; they are not
-mirrored between an ordinary C local and a separate root slot.
+Lists and maps are mutable objects with reference identity. Their language
+carrier is the existing 8-byte packed `sao2_ref`; copying, assignment,
+parameter passing, tuple/union storage, and return copy this carrier and retain
+aliasing. Container equality and inequality compare identity, not contents.
 
-Each heap allocation remains stationary for its complete lifetime. Its packed
-`owner_ptr` continues to identify the complete allocation, while `member_ptr`
-may identify an inline struct within it. Tracing a reference therefore has two
-separate effects:
+Container allocations are conservatively heap-managed in v0. This is a valid
+placement choice because allocation placement is unobservable, and it avoids
+putting independently growing shared storage in the function-scoped arena.
+Any future scoped-container optimization requires a separate proof and is not
+part of this milestone.
 
-1. retain the heap allocation named by `owner_ptr`; and
-2. traverse the statically known value shape at the exact `member_ptr`.
+Each container has a stable managed control object and one or more replaceable
+managed backing allocations. A control object records logical length,
+capacity, iteration-lock state, and packed references to its current backing
+storage. Growth follows allocate, initialize/copy, then publish: no decoded
+body pointer survives the allocation safe point and the old backing remains
+reachable until the replacement is published.
 
-The trace work set is deduplicated by owner, exact member, and referenced
-layout. Deduplicating only by owner is incorrect because two live interior
-references into one allocation can expose different outgoing references.
-Heap headers identify the root allocation layout for validation and sweeping;
-they do not replace the exact layout supplied by a root or field traversal.
+Container bodies and backings use the GC heap rather than unconstrained host
+`malloc`. The existing 4-GiB arena limit, allocation policy, failure
+classification, exact tracing, stationary references, and epoch rollover
+therefore apply to user container storage. Host allocation remains limited to
+collector scratch and platform/runtime metadata already outside the language
+arenas.
 
-Scoped allocations are never marked or swept. They must nevertheless be
-traversed when reachable from a shadow-frame root, because a live scoped
-object may contain references to heap allocations. The escape analysis from
-milestone 9 remains responsible for preventing a heap object or longer-lived
-scope from retaining a scoped allocation.
+Generate deterministic descriptors and typed helpers for each concrete
+container type required by the program. Container tracing visits only
+initialized elements or live map entries. Lists and maps are roots even when
+their element, key, and value types contain no further references; nested
+reference-bearing values recursively use the existing exact traversal
+machinery.
 
-Generated traversal follows only reference-bearing parts of a value:
+Lists use contiguous logical index order. Maps use hashed lookup plus an
+explicit insertion-order representation; hash-table slot order is never
+observable and never defines iteration order. Map keys use the equality and
+stable hashing rules already defined for unit, integers, strings, booleans,
+and recursively valid immutable tuples.
 
-- struct references enqueue their packed reference and the statically known
-  struct layout;
-- inline struct fields are traversed at their embedded slot;
-- tuples recursively traverse their fields;
-- unions traverse only the active payload and ignore zero/inactive storage;
-- primitives, strings, and unit contain no GC references; and
-- lists and maps remain outside this milestone and gain traversal support in
-  milestone 11 through an explicit extension point.
+Iteration locking belongs to the container object, not a particular alias.
+Nested iteration is represented by a checked lock count. Structural mutation
+through any alias is rejected while the count is nonzero; non-structural value
+replacement remains governed by the language design.
 
-The collector has no write barrier. All mutator execution is stopped during a
-collection, and the next collection observes completed stores through the
-current roots. Generated code must not retain a decoded native body pointer
-across a call which can allocate and therefore collect.
+Generated operations invoke child processes only through existing argument-
+list APIs, add no compiler dependency, and emit deterministic standard C for
+the supported 64-bit POSIX and Windows targets.
 
-The existing deterministic layout identities remain compilation-local
-identities. Generated trace plans, descriptors, callbacks, frame fields, and
-registries use compiler identities and stable source-independent ordering.
-They must not depend on native addresses, hash-map iteration order, or source
-identifier spelling.
+## Design decisions required before implementation
 
-## Stage 1: Reclaimable heap foundation
+`DESIGN.md` defines the core semantics but does not yet state every map edge
+case needed by the runtime. Before the relevant stage, make explicit decisions
+for:
 
-Status: complete.
+- whether assigning a missing map key inserts it;
+- whether replacing an existing value retains that key's insertion position;
+- where a removed and later reinserted key appears;
+- how duplicate keys in one map literal are resolved and ordered;
+- whether `removeKey` on a missing key panics or is a no-op;
+- the exact source-attributed reasons for list/map allocation and capacity
+  failure; and
+- whether replacing an existing map value is permitted during iteration while
+  insertion remains forbidden.
 
-Replace the monotonic heap's private representation with a block model which
-can later sweep and reuse storage, without enabling automatic collection yet.
-Keep `sao2_heap_allocate` as the sole policy seam used by generated struct
-construction.
+Do not infer these rules from a convenient C data structure. Update the design
+and corresponding semantic/IR tests as one explicit decision before map
+runtime behavior depends on them.
 
-Extend heap metadata so the runtime can walk every committed block, distinguish
-allocated and free blocks, recover the language body and its layout identity,
-and represent a mark epoch. Define checked splitting and adjacent coalescing,
-with deterministic allocation selection. Reused language bodies must be
-zeroed before publication, and neither headers nor free-list links may appear
-inside language-visible storage.
+## Stage 1: Managed container foundation
 
-Build an early isolated native probe from the same runtime source emitted by
-the backend. With reduced arena capacity, exercise block walking, splitting,
-coalescing, exact header recovery, stable owner offsets, zeroing on reuse, and
-failure atomicity. Test-only probe operations may manufacture block states;
-normal generated programs still allocate without collecting in this stage.
+Status: pending.
 
-Stage 1 is complete when the heap can safely represent and reuse free extents,
-the existing allocation call shape and packed references are unchanged, and
-ordinary source programs retain milestone-9 behavior.
+Define the permanent C carrier, control headers, backing-allocation metadata,
+capacity arithmetic, and generated per-type operation descriptors shared by
+lists and maps. Descriptors provide the size, alignment, copy, equality, hash
+where valid, and trace behavior needed for concrete element/key/value types
+without exposing C types to the language.
 
-## Stage 2: Exact trace plans and callbacks
+Extend trace planning and root planning so every list and map value is a
+traceable object carrier regardless of whether its contents contain
+references. Add container control and backing layouts to the existing layout
+registry, including recursive descriptor dependencies. Make the escape
+analysis conservative around container retention without confusing “contains
+a reference” with “is itself an object reference.”
 
-Status: complete.
+Provide safe internal managed allocation for a control object followed by its
+backing storage. The zero-initialized control must be rooted in canonical frame
+storage before a second allocation can collect. Backing growth must keep the
+old reference published until a fully initialized replacement is ready.
+Failures remain source-attributed and must not publish a partially constructed
+language value.
 
-Add a compiler-owned trace plan derived from typed IR types and the physical
-layout plan. It records which value shapes can contain struct references and
-generates one deterministic traversal callback for each required struct,
-tuple, and union shape. Primitive-only shapes produce no callback.
+Implement the non-allocating `str.len()` builtin as the first complete builtin
+rendering seam, then retain capability rejection for list/map execution until
+their operations are enabled by later stages.
 
-Add the collector work queue and visited set behind a narrow trace context.
-An enqueued item contains a packed reference plus the exact referenced layout.
-Processing a heap item marks its complete owner and traverses from its exact
-member. Processing a scoped item skips marking but performs the same exact
-traversal. Invalid tags, mismatched layouts, out-of-owner members, inactive
-union payloads, and malformed header identities remain runtime invariants.
+Stage 1 is complete when the backend can deterministically plan, render,
+allocate, root, and precisely trace probe container controls and backings using
+production GC paths, while all existing non-container programs remain
+unchanged.
 
-Extend the isolated probe to drive generated callbacks from synthetic roots.
-Cover root and unaligned interior references, two distinct members of one
-owner, cycles, repeated paths, inline structs, tuples, active and inactive
-unions, and a scoped path to a heap child. No native-stack scanning or source-
-visible forced-collection operation is added.
+## Stage 2: Complete lists and entry arguments
 
-Stage 2 is complete when a supplied typed root computes the precise reachable
-heap-owner set for cyclic and interior-reference graphs, without yet changing
-when production programs collect.
+Status: pending.
 
-## Stage 3: Precise shadow frames
+Implement list literals, explicitly typed empty lists, length, positive and
+negative indexing, indexed replacement, append, removal by index, membership,
+identity equality, aliasing, and unbounded geometric growth. Preserve
+left-to-right literal evaluation and logical index order. Bounds and allocation
+failures use their existing typed IR sites or new explicitly designed literal-
+allocation sites.
 
-Status: complete.
+Element storage must support every v0 storable type: unit, primitives,
+interned strings, tuples, unions, structs, lists, and maps. Copy inline values
+and packed references according to existing value semantics. Growth and
+removal must handle padding without using raw byte comparison as language
+equality.
 
-Add a root plan for every function after IR validation and escape analysis.
-The plan selects all locals whose type can carry a struct reference, including
-parameters and compiler-materialized temporaries, and assigns deterministic
-fields in a generated function-specific frame. Non-root locals remain ordinary
-C locals.
+Materialize `main(args [str])` as an ordinary list in original argument order.
+Validate ASCII before entering `main`, preserve canonical string equality for
+duplicate argument text, root the list during host construction, and release
+any host-side argument interning metadata after the generated program and
+arena lifecycle are complete.
 
-Emit a common frame header containing the previous-frame link and a generated
-traversal callback. Each invocation zero-initializes and links its complete
-typed frame before copying reference-bearing parameters into it. All reads,
-writes, projections, aggregate destinations, and call operands for selected
-locals use the frame fields as their canonical storage. Every normal return
-captures its result, unlinks the frame, restores any scoped-arena mark, and
-then returns in the required order.
+Keep list iteration behind the capability gate until Stage 4. Stage 2 is
+complete when ordinary source programs can construct, pass, return, alias,
+mutate, grow, query, and collect lists—including nested and reference-bearing
+elements—and can consume command-line arguments.
 
-The caller keeps arguments rooted until control enters the callee; the callee
-roots reference-bearing parameters before any possible allocation. A returned
-reference may travel in the native return channel because no collection can
-occur between the callee unlink and the caller's assignment. Document and
-lock these safe-point assumptions in direct generated-C tests.
+## Stage 3: Ordered maps
 
-Generate a frame callback which visits every selected field using its exact
-static type. Link even frames which contain only currently inactive root
-storage when required by their plan; zero references and inactive union
-payloads must be harmless. Provide an explicit empty global-root hook for
-future language features rather than treating interned strings or runtime
-metadata as GC roots.
+Status: pending.
 
-Stage 3 is complete when every active reference-bearing IR local has exactly
-one canonical, zero-safe shadow-frame slot and the complete frame chain can be
-traversed without inspecting the native stack. Collection is still not
-automatically triggered.
+Resolve and document the outstanding map edge semantics, then implement map
+literals, explicitly typed empty maps, lookup, indexed insertion/replacement,
+removal by key, length, key membership, identity equality, aliasing, and
+unbounded growth.
 
-## Stage 4: End-to-end mark and sweep
+Use deterministic open-addressed lookup metadata together with explicit
+insertion-order entries. Rehashing may change private slot placement but must
+not change observable order. Equality and hashing must agree for every valid
+key type, including integer extremes, canonical strings, booleans, unit,
+nested nominal tuples, and positive/negative floating zero only where floats
+occur inside values rather than keys.
 
-Status: complete.
+Keep partially initialized slots, tombstones, and capacity-only bytes outside
+the traced live set. Rehash and compaction use allocate/copy/publish
+transactions which remain safe if allocation collects or fails. Updating an
+existing key must preserve the design-selected insertion semantics.
 
-Connect the shadow-frame chain to the trace engine and implement a complete
-collection transaction: advance the collection epoch, visit global and frame
-roots, drain exact trace work, sweep every allocated heap block, coalesce dead
-extents, and leave live owner offsets unchanged.
+Keep map iteration behind the Stage 4 gate. Stage 3 is complete when public
+programs can use ordered maps through every non-iteration operation with exact
+failure attribution, stable key semantics, GC-safe nested values, and
+deterministic generated C.
 
-Wire the transaction into the heap-allocation slow path. Allocation first uses
-available space, then performs one collection and retries before reporting
-arena exhaustion. A struct under construction is not published until its body
-is initialized; all of its already-evaluated reference-bearing operands remain
-rooted in the allocating frame while collection runs.
+## Stage 4: Iteration and structural mutation guards
 
-Use reduced-capacity native programs to prove that unreachable acyclic and
-cyclic graphs are reclaimed, live root and interior aliases retain their
-owners, distinct interior members are both traced, scoped objects lead to heap
-children, and freed extents are reused without moving survivors. Collection
-must not alter scoped cursors, packed references, layout identities, or source
-failure locations.
+Status: pending.
 
-Stage 4 is complete when ordinary source programs can allocate beyond the
-reduced heap's physical capacity through repeated reclamation, while every
-reachable graph remains valid and stationary.
+Render the existing `BeginIteration`, `IterationValue`, `EndIteration`, and
+`IterationUnlocked` IR operations. List iteration yields values in index order;
+map iteration yields keys in insertion order. The iteration source is
+evaluated once and kept rooted for the complete loop.
 
-## Stage 5: Collection policy and rollover safety
+Implement checked nested lock counts on the shared container object so every
+alias observes the same active iterations. Reject append, removal, missing-key
+insertion, and any other structural change while locked. Permit or reject
+non-structural replacement exactly as recorded in `DESIGN.md`.
 
-Status: complete.
+Preserve cleanup on fallthrough, `break`, `continue`, and every normal return
+from nested loops. Panic still terminates without language-level unwinding.
+Counter overflow, underflow, mismatched end operations, and invalid iterator
+state are runtime invariants rather than ordinary source outcomes.
 
-Turn the correct collector into a bounded, repeatable runtime policy. Add a
-deterministic collection threshold so reclamation is not attempted only after
-arena exhaustion, while retaining the collect-and-retry path for allocation
-pressure. Policy counters are private runtime state and are not observable by
-SAO2 programs.
+Stage 4 is complete when nested and aliased list/map loops preserve their
+defined order, every exit balances its lock, and structural mutation reliably
+panics at the original source operation without corrupting the container.
 
-Define failure behavior for collector work storage, metadata growth, commit
-failure, and genuine post-collection arena exhaustion. Preserve the existing
-`StructAllocation` source site and distinguish actionable runtime reasons.
-Collection must be non-reentrant and must leave the heap walkable after every
-failed internal operation; compiler/runtime invariant failures remain distinct
-from source-attributed allocation failures.
+## Stage 5: Recursive tracing and growth hardening
 
-Handle mark-epoch rollover explicitly. Before reusing an epoch value, clear or
-rebase mark state across all allocated blocks so an old mark cannot retain a
-dead object. A reduced-width test configuration must force multiple rollovers
-and collections. Also stress repeated split/coalesce cycles, highly aliased
-graphs, deep graphs without native recursion, and collection immediately
-before and after calls and mutations.
+Status: pending.
 
-Stage 5 is complete when collection remains correct over unbounded logical
-cycles, allocation failures are deterministic and transactional, and no
-correctness property depends on an epoch never wrapping.
+Stress the shared runtime across recursive combinations: lists of lists, maps
+of containers, tuples and unions containing containers, containers containing
+struct roots and interior references, and cyclic graphs crossing container and
+struct boundaries. Confirm exact trace-key behavior and owner retention remain
+correct when backing allocations are replaced.
+
+Exercise repeated growth, rehash, removal, tombstone reuse or compaction,
+allocation-threshold collection, pressure collection, and epoch rollover.
+Collector safe points may occur while constructing literals, appending,
+inserting, or growing, but no decoded element, entry, control, or backing
+pointer may survive such a point.
+
+Harden arithmetic and failure behavior for capacity growth, byte sizing,
+offset representation, arena exhaustion, commit failure, collector scratch
+failure, index failure, missing keys, iteration locks, and impossible internal
+state. Every recoverable failure is transactional and source-attributed; every
+runtime structure remains walkable after failed internal work.
+
+Stage 5 is complete when arbitrary nested and cyclic container graphs remain
+precise under sustained mutation and collection, dead backings and containers
+are reclaimed, live identities never move, and no correctness property relies
+on unused capacity being zero or traced.
 
 ## Stage 6: Integration and milestone closure
 
-Status: complete.
+Status: pending.
 
-Exercise the full public pipeline with readable source programs combining
-heap and scoped allocations, root and interior aliases, inline and referenced
-members, tuples, unions, mutation, branches, loops, direct calls, recursive
-calls, and all normal return shapes. Include cyclic graphs whose only roots
-change over time and enough allocation pressure to require several
-collections.
+Exercise the full public pipeline with readable programs combining lists,
+maps, structs, tuples, unions, strings, command-line arguments, calls,
+recursion, branches, loops, mutation, membership, indexing, and all supported
+return shapes. Include useful algorithms whose working sets grow beyond their
+initial capacities and require repeated garbage collections.
 
-Audit generated code for the milestone boundaries: no conservative native-
-stack scan, moving or compaction, manual free operation, write barrier,
-container implementation, source-visible GC control, raw native pointer in a
-language value, or collection of scoped storage. Ensure generated body pointers
-cannot remain live across allocation safe points.
+Demonstrate reference aliasing, tuple value copying, map insertion order,
+negative list indexing, nested iteration, permitted value replacement, and
+rejected structural mutation. Confirm container identity equality remains
+distinct from structural tuple/key equality.
 
-Retain focused backend and native-probe coverage for facts source programs
-cannot observe: descriptor/callback ordering, exact trace keys, header/body
-separation, frame link order, zero-safe inactive fields, owner marking versus
-member traversal, free-block coalescing, and epoch rollover. Confirm identical
-input produces byte-for-byte identical C.
+Retain focused planner, backend, and native probes for details source cannot
+observe: descriptor order, physical layouts, hash slots, capacity arithmetic,
+root/frame selection, exact tracing, growth publication order, iteration-lock
+balance, free-list reuse, failure injection, and epoch rollover. Identical
+input must produce byte-for-byte identical C.
 
-External verification must use Rust 1.90 or newer and supported C compilers on
-both platform families when available. It must report native-test skips,
-exercise production-size arena reservation, and leave generated artifacts only
-under `build/`. Contributor guidance prohibits compiling, running tests, or
-formatting while implementing this milestone.
+External verification uses Rust 1.90 or newer and supported C compilers on
+both platform families when available. It reports native skips, covers the
+production 4-GiB arena configuration plus reduced stress configurations, and
+leaves generated artifacts only under `build/` or test temporary directories.
 
-Stage 6 and milestone 10 are complete when cyclic and interior-reference
-graphs are reclaimed safely under sustained allocation pressure; all live
-values survive every collection; failures and diagnostics preserve their
-established categories and source locations; and milestone 11 can add traced
-container storage through the documented traversal extension point.
+Stage 6 and milestone 11 are complete when all designed container programs
+execute through the public compiler, storage grows without a language-visible
+bound other than managed allocation failure, tracing is precise across every
+nested shape, iteration semantics are stable, and the implemented language is
+capable of unbounded container-based computation.
+
+## Cross-stage verification
+
+Each stage adds tests at the narrowest useful layer:
+
+- semantic and IR tests retain existing type, mutability, map-key, failure-site,
+  and cleanup contracts;
+- planner tests cover concrete descriptor closure and deterministic ordering;
+- backend tests cover carrier/layout selection and generated operation order;
+- native probes use production runtime fragments for allocation, hashing,
+  tracing, growth, locking, and injected failure facts;
+- public end-to-end programs prove observable values, aliases, order, panics,
+  arguments, and exit status; and
+- regression tests keep every milestone 1-10 program working unchanged.
+
+Native assertions may be skipped only when no supported C compiler is
+available. Generated-C compile errors, runtime assertion failures, abnormal
+termination, incorrect output, unexpected exit status, or silent capability
+fallback are test failures.
 
 ## Milestone boundaries
 
-The following remain outside milestone 10:
+The following remain outside milestone 11:
 
-- lists, maps, their backing storage, and iteration state;
-- changing string interning or placing strings in the traced heap;
-- concurrent, incremental, generational, compacting, or moving collection;
-- weak references, finalizers, resurrection, and user-observable GC controls;
-- native-stack scanning or conservative roots;
-- collecting or individually freeing scoped allocations; and
-- changing escape-analysis placement decisions except to fix a demonstrated
-  correctness defect in milestone 9.
+- printing lists or maps, structural container equality, ordering comparisons,
+  sorting, slicing, comprehensions, and iterator values as first-class objects;
+- additional collection types such as sets, queues, or user-defined iterators;
+- user-selectable hashers, capacity reservation, load factors, or allocation
+  placement;
+- weak containers, finalizers, concurrent mutation, or thread safety;
+- changing ASCII-only strings into a general mutable string type;
+- exposing GC, arena, backing-storage, hash-slot, or address details to source;
+- FFI, modules, closures, or standard-library APIs beyond the v0 design; and
+- diagnostics-wide presentation work belonging to milestone 12.
+
+Contributor guidance prohibits compiling, running tests, or formatting while
+implementing this milestone. Generated artifacts must not be committed, and
+every stage must preserve filenames and byte-oriented source locations for
+diagnostics.

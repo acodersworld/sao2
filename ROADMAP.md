@@ -164,10 +164,6 @@ that pass references to inline structs without letting them escape.
 
 Status: complete.
 
-The completed milestone breakdown is in
-[Garbage Collector Milestone](CURRENT_MILESTONE.md). Its final integration plan
-is in [GC Integration and Milestone Closure](CURRENT_STAGE.md).
-
 - Implement a non-moving, stop-the-world mark-and-sweep heap.
 - Register generated type and allocation-layout descriptors.
 - Enumerate precise global, shadow-frame, and temporary roots, with an explicit
@@ -191,6 +187,11 @@ policy are retained in isolated production-runtime probes as well as public
 end-to-end coverage.
 
 ## 11. Containers
+
+Status: current.
+
+The milestone breakdown is in
+[Current Milestone: Containers](CURRENT_MILESTONE.md).
 
 - Implement lists, maps, indexing, membership, iteration, and mutation.
 - Preserve insertion order in maps.
