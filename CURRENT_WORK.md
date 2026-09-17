@@ -1566,7 +1566,7 @@ programs still allocate every object in the monotonic heap pending Stage 6.
 
 ## Stage 6: Scoped arena lifetimes
 
-Status: current.
+Status: complete.
 
 Consume the Stage 5 allocation plan in the C backend. A `Scoped` struct
 aggregate now allocates from the scoped arena and a `Heap` aggregate retains
@@ -1852,33 +1852,349 @@ reuse plus independent heap and scoped failure behavior.
 
 ## Stage 7: Integration and garbage-collector handoff
 
-Status: planned.
+Status: current.
 
-Complete source-level and generated-C coverage for mixed inline and referenced
-struct graphs. Preserve deterministic output, transactional compilation,
-source locations, warning behavior, entry adapters, and the distinction
-between source failures and toolchain failures.
+Close milestone 9 by exercising the complete source-to-executable path and by
+making its memory-management handoff explicit. Stages 1 through 6 established
+the representation and algorithms; Stage 7 integrates them, fills coverage
+gaps, removes obsolete walking-skeleton descriptions, and records the exact
+contracts milestone 10 may depend on.
 
-Lock down the milestone-10 boundary:
+Stage 7 is not a collector implementation. Do not add marking, sweeping,
+reclamation, collection triggers, shadow frames, root traversal, write
+barriers, or container storage. Do not change language semantics to simplify
+tests. If integration exposes a disagreement, follow `DESIGN.md` and
+`GRAMMAR.ebnf`; treat any deliberate semantic change as a separate explicit
+decision.
 
-- owner metadata identifies allocation size, layout, and lifetime;
-- heap objects are non-moving and retain stable owner offsets;
-- the heap allocator can be replaced without changing generated allocation
-  calls, packed references, or scoped-arena state;
-- owner_ptr selects the arena for both offsets and reserved tag values remain
-  invalid;
-- generated layouts contain enough information for later exact tracing;
-- all-zero references and inactive union payloads remain non-traceable;
-- distinct interior references retain their member offsets and layout
-  identities; and
-- no implementation relies on scanning the native C stack or freeing scoped
-  storage through the future collector.
+### Integration scope
 
-Milestone 9 is complete only after external verification covers both production
-arena paths, layout edge cases, nested identity-preserving copies, conservative
-recursive summaries, safe scoped reuse, and programs that pass references to
-inline structs without allowing them to escape. At that point ROADMAP.md may
-mark milestone 9 complete and milestone 10 current.
+Exercise one coherent pipeline:
+
+```text
+source
+  -> parsing and semantic analysis
+  -> typed IR validation
+  -> escape plan
+  -> physical layout plan
+  -> generated C
+  -> host C compiler
+  -> native execution
+```
+
+The integration suite must cover combinations which isolated stage tests do
+not: a single program may contain inline and referenced members, heap and
+scoped allocations, root and interior aliases, tuple or union carriers,
+mutation, calls, branches, loops, and more than one return. Assert language
+output and failure behavior first; inspect generated C only for properties
+which are intentionally below the language abstraction, such as arena choice,
+mark placement, metadata, or section ordering.
+
+No Stage 7 production path may bypass typed IR, synthesize a second escape
+decision, or infer layout from generated C text. Keep `AllocationPlan` and
+`LayoutPlan` as distinct compiler-owned artifacts. Generated names, source
+names, spans, and destination locals remain unsuitable identities for either
+allocation sites or layouts.
+
+Clean up stale stage comments and temporary wording in generated runtime
+sections. In particular, the arena-runtime banner must describe active heap
+and scoped allocation rather than claiming Stage 4 heap-only behavior. Keep a
+comment visibly identifying the monotonic heap as the milestone-9 temporary
+policy so it cannot be mistaken for the completed automatic-memory-management
+design.
+
+### Source-level struct graph coverage
+
+Add native end-to-end programs in `tests/end_to_end.rs` which use the public
+CLI rather than constructing IR directly. Together they must cover:
+
+- primitive, tuple, and union fields embedded in struct bodies;
+- multiple levels of inline structs, including an unaligned interior member
+  reached beneath an inline parent;
+- referenced struct fields which rebind without changing aliases to the old
+  object;
+- inline struct assignment which recursively copies language-visible fields
+  while preserving the destination slot's packed identity;
+- aliases to a root and to two distinct inline members of one owner, proving
+  equality observes both `owner_ptr` and `member_ptr`;
+- a scoped owner containing another confined scoped reference and a heap
+  reference, without allowing either scoped owner to reach longer-lived
+  storage;
+- a root or inline reference passed through a proven non-retaining call and
+  used again by the caller after the callee returns;
+- a returned root, returned interior reference, projected store into a
+  parameter-owned object, and argument to an escaping parameter, each of which
+  keeps the complete originating allocation on the heap;
+- acyclic direct-call chains which remain analysable and recursive or
+  recursion-dependent call graphs which remain conservative;
+- allocations inside branches and loops plus early returns, showing that one
+  invocation mark encloses all scoped sites and every normal exit restores it;
+  and
+- mixed printing, comparison, mutation, and final integer or unit entry
+  results so struct support does not regress the established host adapter.
+
+Prefer a few readable programs with exact expected output over many nearly
+identical fixtures. Use source constructs for observable behavior and retain
+focused IR/backend tests for otherwise unobservable allocation-class choices.
+Do not expose raw offsets, tags, layout identities, or arena choice through a
+new SAO2 intrinsic.
+
+Add negative source cases at the same boundary for illegal mutation,
+incompatible construction or assignment, and infinitely recursive inline
+layout. These must remain source diagnostics and must not reach escape
+analysis, layout planning, C emission, or the host compiler. A recursive graph
+which crosses a referenced `&` field remains valid.
+
+### Generated layout and owner-metadata contract
+
+Audit and lock the handoff without freezing private C structure sizes which
+milestone 10 is allowed to extend. For every heap allocation, the runtime must
+be able to recover from the decoded complete-owner offset:
+
+- the language body size;
+- the deterministic root layout identity;
+- the heap lifetime class; and
+- collector-owned state initialized to zero.
+
+The header precedes only the complete heap allocation root. Inline subobjects
+have no header, mark, or independent allocation identity. Scoped objects have
+no heap header. Header bytes never contribute to the language-visible body,
+field offsets, copy helpers, equality, or formatting.
+
+Keep struct layout identities equal to the checked widening of
+`DefinitionId.index()`. They are deterministic compilation-local identities,
+not hashes, source names, stable cross-build serialization keys, or native
+descriptor addresses. Identity zero remains valid. The heap header records the
+layout of the complete allocation root even when a live reference's
+`member_ptr` identifies a nested inline struct.
+
+The generated physical descriptor remains the authority for body size,
+alignment, ordered field offsets, storage classes, and nested struct layout
+identities. The compiler-side `FieldLayout` must continue to retain each
+field's `TypeId`, including tuple and union carriers, through rendering. That
+typed information is the milestone-10 input for generated traversal code; the
+current physical field table is not required to become a generic runtime type
+interpreter in Stage 7.
+
+This is the precise tracing attachment point:
+
+1. the heap header identifies the complete owner's layout;
+2. the statically typed root or field being traversed supplies the layout of
+   the exact value at `member_ptr`;
+3. future generated traversal code follows only the active value shape from
+   that member, recursively handling inline structs, tuples, unions, and
+   referenced fields; and
+4. the collector marks the complete owner allocation separately from tracing
+   the exact referenced member.
+
+Milestone 10 may extend the descriptor or pair each layout/type with generated
+traversal callbacks and a deterministic registry. It must not renumber layout
+identities, reinterpret field offsets, place mark bits in struct bodies, or
+require a search from `member_ptr` back to an inline parent. Stage 7 should add
+tests proving the current plan retains all facts needed to generate those
+callbacks later, but it must not emit placeholder callbacks or a partial
+tracer.
+
+### Packed-reference and arena contract
+
+Lock the following generated-C invariants with structural assertions and
+runtime probes where appropriate:
+
+- `sao2_ref` remains exactly two `uint32_t` words and eight bytes;
+- allocation roots are eight-byte aligned, decoded offset zero is reserved,
+  and a zero-sized body still consumes a distinct aligned slot;
+- tag zero selects the heap arena, tag one selects the scoped arena, and tags
+  two through seven are rejected before pointer arithmetic;
+- `member_ptr` is never tag-masked and may be unaligned;
+- owner and member pointers are reconstructed from the same arena base chosen
+  solely from `owner_ptr`;
+- root references have equal decoded owner and member offsets, while inline
+  projection changes only `member_ptr`;
+- equal numeric offsets in different arenas do not compare equal;
+- heap owner offsets remain stable for the process lifetime in milestone 9,
+  and no language reference stores a native pointer; and
+- scoped restoration changes only the scoped live cursor, never heap state,
+  reservation bases, committed high-water marks, or packed references owned by
+  an enclosing invocation.
+
+Resolution must continue to reject all-zero references, partial-zero
+references, reserved tags, offsets outside the selected arena, arithmetic
+overflow, wrong heap layout identities, members outside their complete heap
+owner, and scoped members beyond the live cursor. These are generated-code or
+runtime invariants, not catchable source failures.
+
+Do not add generation counters to packed references in this milestone. A
+discarded scoped reference can become numerically reusable after a later
+allocation; escape analysis is what prevents it from remaining observable.
+Runtime probes may check rejection before reuse and zeroing on reuse, but must
+not promise permanent stale-reference detection.
+
+### Heap-policy replacement seam
+
+Keep generated heap sites calling `sao2_allocate_struct` with a layout
+descriptor and source failure site. That helper remains the only
+struct-construction translation from the arena result into a source panic.
+Below it, `sao2_heap_allocate` owns header placement and the current monotonic
+cursor policy.
+
+Audit generated C so program operations do not read or modify
+`sao2_heap_arena.cursor`, construct heap headers, or call platform reservation
+and commitment helpers directly. Milestone 10 must be able to replace the
+implementation below the heap-allocation interface and preserve:
+
+- the generated allocation-site call shape;
+- allocation failure attribution and reason selection;
+- packed references and non-moving owner offsets;
+- layout identity and language-body placement;
+- the independent scoped allocator, mark stack discipline, and restoration;
+  and
+- source construction's initialize-before-publication transaction.
+
+Do not add a free operation for heap objects or simulate collection by
+rewinding the heap cursor. Do not route scoped allocation through the future
+collector seam. Mutation remains expressed through the existing typed stores
+and copy helpers; milestone 10 decides whether its collector requires a write
+barrier without changing typed IR semantics.
+
+### Zero-safe future roots
+
+Preserve the representations which allow milestone 10 to link a
+zero-initialized shadow frame before every local contains a language value:
+
+- `{ owner_ptr: 0, member_ptr: 0 }` is internal null and never an allocation;
+- union tag zero is inactive and its payload is ignored;
+- generated locals and aggregate temporaries begin zeroed;
+- union injection clears the carrier before writing its selected payload and
+  nonzero tag; and
+- newly allocated and reused scoped bodies are zeroed before publication.
+
+Stage 7 does not generate shadow frames. It verifies only that current value
+initialization does not leave a future traversal callback with uninitialized
+reference or union state. Strings retain their separate interned lifetime and
+must not be mistaken for packed struct references.
+
+The future collector will walk a generated shadow-frame chain, never scan the
+native C stack. No Stage 7 helper may register raw addresses of C locals,
+depend on conservative stack scanning, or retain temporary native body
+pointers across calls which may eventually collect. Current body pointers are
+short-lived expression helpers and must not become language values or roots.
+
+### Diagnostics and pipeline preservation
+
+Extend integration coverage without weakening the established failure
+boundaries:
+
+- parser, analysis, semantic, lowering, IR, escape, and backend failures do
+  not create or overwrite `build/program.c`;
+- warnings produced before a later compiler failure are preserved and printed
+  before that failure;
+- a struct-allocation exhaustion or commit failure is a source-attributed
+  runtime panic naming the construction operation and original filename,
+  function, line, and column;
+- arena reservation failure before source entry remains an environment/runtime
+  failure with no fabricated source site;
+- a missing or failing host C compiler remains a toolchain diagnostic rather
+  than a source diagnostic or program exit;
+- a successfully launched program's exit status and stderr remain program
+  behavior rather than compiler failure; and
+- `--show-c`, `build`, and `run` continue to use the same generated artifact
+  and entry adapter for programs with or without command-line arguments.
+
+Continue invoking the C compiler and generated executable with argument lists,
+never a constructed shell command. Filenames and build directories containing
+spaces must remain supported. Generated artifacts stay under `build/` and are
+not committed.
+
+### Determinism and platform verification
+
+Compile the same source more than once and require identical typed IR, escape
+plan rendering, layout identities, descriptor order, failure-site indices,
+and generated C. Runtime base addresses are intentionally nondeterministic and
+must not appear in output or golden files. Do not introduce iteration over an
+unordered collection into any rendered artifact.
+
+Keep the platform abstraction limited to reservation, page-size discovery,
+commitment, and release. External verification should exercise a supported
+POSIX compiler and the Windows branch when available, including feature-macro
+and header ordering. A platform which cannot provide the required 64-bit
+address model must fail cleanly rather than silently changing the packed ABI.
+
+Use the existing native-test compiler discovery, including `SAO2_CC`. Skip
+only assertions which genuinely require a missing supported C compiler; never
+turn a generated-C compilation failure, runtime panic, wrong output, or
+nonzero program status into a skip. Report native skips explicitly.
+
+### Implementation sequence
+
+Implement Stage 7 in the following order:
+
+1. Inventory the Stage 1 through 6 contracts against `DESIGN.md`,
+   `GRAMMAR.ebnf`, and milestone 9 of `ROADMAP.md`; correct stale generated
+   comments and tests without changing behavior.
+2. Add focused assertions for header semantics, descriptor identities and
+   ordering, retained field `TypeId`s, packed-reference decoding, zero-safe
+   carriers, and the heap-policy replacement seam.
+3. Add source-level end-to-end programs for inline/referenced graphs,
+   identity-preserving copy, aliasing, mutation, mixed lifetimes, calls, and
+   control-flow restoration.
+4. Add focused generated-C probes for invariants which valid source cannot
+   observe: invalid tags and offsets, scoped reuse, independent arena failure,
+   and header/body separation.
+5. Extend transactional compilation, warning, diagnostic-category,
+   `--show-c`, entry-adapter, path-with-spaces, and deterministic-output
+   regressions to at least one struct-using program.
+6. Perform the external Rust 1.90-or-newer and native C verification matrix,
+   recording compiler/platform skips and inspecting generated C for both arena
+   paths.
+7. Only after that verification passes, mark Stage 7 and milestone 9 complete
+   and mark milestone 10 current in `ROADMAP.md`. Start milestone 10 from a new
+   current-work plan rather than appending collector implementation to this
+   document.
+
+Fix integration defects at the layer which owns them. Do not duplicate layout
+or escape logic in a test helper merely to make an end-to-end case pass. Any
+new runtime probe hook must be test-only and must not create an environment
+variable, CLI flag, or source-visible production behavior.
+
+### Tests and completion
+
+The final direct-test matrix must retain all prior stage cases and add:
+
+- descriptor/header consistency for empty, minimally aligned, padded, nested
+  inline, referenced, tuple-bearing, and union-bearing struct layouts;
+- complete-owner bounds and exact-member resolution at offset zero-adjacent,
+  unaligned, last-byte, and overflow boundaries;
+- heap/scoped tag separation, invalid reserved tags, internal null, and
+  distinct root/interior equality cases;
+- exact allocation-plan consumption for mixed classes and conservative
+  recursion without a renderer fallback;
+- one mark per scoped-allocating invocation and capture-before-restore at every
+  normal return shape;
+- zeroing after scoped reuse and independence of heap/scoped cursor and
+  commitment failures;
+- deterministic plan, descriptor, helper, and generated-C order; and
+- absence of collector algorithms, shadow frames, native-stack scanning, or
+  direct heap-policy access from generated operations.
+
+The final native matrix must demonstrate exact output and status for mixed
+struct graphs, root and interior aliasing, inline copy versus referenced
+rebinding, non-escaping calls, escaping returns and stores, nested scoped
+calls, loops and branches, recursive conservatism, source-attributed
+allocation failure, and unchanged primitive/string/tuple/union behavior.
+
+Contributor guidance prohibits compiling, running tests, or formatting while
+preparing or implementing this stage. External verification performs those
+commands separately, using Rust 1.90 or newer, and reports whether native tests
+ran or were skipped because no supported compiler was available.
+
+Stage 7 is complete when the source-to-native integration matrix passes; both
+arena paths and mixed struct graphs have direct and native coverage; output,
+diagnostics, warnings, artifacts, and failure categories remain stable; the
+packed ABI, layout identities, owner metadata, zero-safe representations, and
+heap replacement seam are locked; no collector work has leaked into milestone
+9; and the milestone-10 team can add precise shadow-frame traversal and
+collection without changing source semantics, packed references, scoped
+lifetimes, or generated allocation sites.
 
 ## Milestone boundaries
 
