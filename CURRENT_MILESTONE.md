@@ -83,10 +83,7 @@ runtime behavior depends on them.
 
 ## Stage 1: Managed container foundation
 
-Status: current.
-
-The detailed implementation plan is in
-[Current Stage: Managed Container Foundation](CURRENT_STAGE.md).
+Status: complete.
 
 Define the permanent C carrier, control headers, backing-allocation metadata,
 capacity arithmetic, and generated per-type operation descriptors shared by
@@ -119,7 +116,10 @@ unchanged.
 
 ## Stage 2: Complete lists and entry arguments
 
-Status: pending.
+Status: current.
+
+The detailed implementation plan is in
+[Current Stage: Complete Lists and Entry Arguments](CURRENT_STAGE.md).
 
 Implement list literals, explicitly typed empty lists, length, positive and
 negative indexing, indexed replacement, append, removal by index, membership,
