@@ -145,7 +145,7 @@ and observable output.
 
 ## 9. Struct layout and escape analysis
 
-Status: current.
+Status: complete.
 
 - Generate layouts for inline and referenced struct members.
 - Define the 8-byte packed `owner_ptr` and `member_ptr` reference-struct ABI.
@@ -164,6 +164,8 @@ Outcome: safe scoped allocation works where locally proven, including programs
 that pass references to inline structs without letting them escape.
 
 ## 10. Garbage collector
+
+Status: current.
 
 - Implement a non-moving, stop-the-world mark-and-sweep heap.
 - Register generated type and allocation-layout descriptors.

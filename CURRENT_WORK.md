@@ -1,6 +1,6 @@
 # Current Work: Struct Layout and Escape Analysis
 
-Status: current.
+Status: complete.
 
 This document maps milestone 9 of ROADMAP.md into implementation stages. The
 milestone introduces reference-semantic structs, stable references to inline
@@ -1852,7 +1852,7 @@ reuse plus independent heap and scoped failure behavior.
 
 ## Stage 7: Integration and garbage-collector handoff
 
-Status: current.
+Status: complete.
 
 Close milestone 9 by exercising the complete source-to-executable path and by
 making its memory-management handoff explicit. Stages 1 through 6 established
