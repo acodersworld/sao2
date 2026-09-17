@@ -1208,7 +1208,7 @@ escape, scoped-lifetime, and collector behavior remain unchanged.
 
 ## Stage 5: Context-insensitive escape summaries
 
-Status: current.
+Status: complete.
 
 Add a compiler-owned escape-analysis pass over validated typed IR. The pass
 computes context-insensitive parameter summaries and a deterministic lifetime
@@ -1566,24 +1566,289 @@ programs still allocate every object in the monotonic heap pending Stage 6.
 
 ## Stage 6: Scoped arena lifetimes
 
-Status: planned.
+Status: current.
 
-Apply the escape plan in generated C:
+Consume the Stage 5 allocation plan in the C backend. A `Scoped` struct
+aggregate now allocates from the scoped arena and a `Heap` aggregate retains
+the Stage 3 monotonic-heap path. A function containing at least one scoped
+site owns one scoped cursor mark for the complete invocation and restores that
+mark on every normal return.
 
-- proven non-escaping objects allocate from the scoped arena;
-- all other objects continue to allocate through the heap-arena interface;
-- functions that can allocate scoped objects save one cursor mark and restore
-  it on every normal return;
-- a scoped reference may be passed through non-escaping parameters and may
-  identify an inline member; and
-- passing a value to an escaping parameter forces its complete owner
-  allocation to use the heap arena.
+This stage changes allocation policy only. Do not refine escape summaries,
+attach lifetime information to IR, promote objects dynamically, or introduce
+per-block, per-loop, or per-object cleanup. The validated plan is the sole
+authority for choosing an arena. Recursive, unreachable, unknown, and
+otherwise conservative sites remain heap because Stage 5 already classified
+them that way.
 
-Ensure control-flow lowering cannot bypass restoration on early returns or
-branches. Runtime panic paths terminate the program and do not require an
-unwind protocol. Stress nested calls, loops, branch joins, multiple returns,
-recursive call graphs, interior references, scoped reuse, and independent heap
-and scoped exhaustion.
+### Plan lookup and renderer context
+
+Keep `AllocationPlan` immutable and pass it beside `ir::Program` through
+layout planning and rendering. Extend its crate-level query boundary with
+deterministic lookups equivalent to:
+
+```text
+allocation_class(AllocationId) -> Option<AllocationClass>
+function_has_scoped(FunctionId) -> bool
+```
+
+The allocation entries are already sorted by `AllocationId`; use that order
+for lookup rather than constructing an unordered renderer-side map. Plan
+validation remains mandatory before rendering and continues to reject every
+missing, duplicate, or invalid site. After successful validation, failure to
+find the current struct aggregate is a compiler invariant, never an implicit
+heap fallback.
+
+Store `&AllocationPlan` on `Renderer`. When rendering a function, enumerate
+blocks and operations with their actual indices and form the exact
+`AllocationId { function, block, operation }` for each operation. Pass that
+identity, or its already resolved class, into struct-aggregate rendering. Do
+not identify a site by destination local, source location, definition, or
+emission order: all of those may be shared or reused.
+
+Non-allocation operations do not need a lifetime lookup. Remove the Stage 5
+comment and implementation behavior which deliberately discard the plan, but
+retain the existing compiler orchestration and backend validation boundary.
+No analysis fact may be derived from a C layout or generated name.
+
+### Scoped struct allocation
+
+Retain `sao2_allocate_struct` as the narrow heap-allocation helper so every
+`Heap` site and the future collector handoff keep the existing call shape and
+metadata behavior. Add a parallel helper with this generated-C boundary:
+
+```c
+static void sao2_allocate_scoped_struct(
+    const sao2_layout_descriptor *layout,
+    size_t site,
+    sao2_ref *reference,
+    unsigned char **body);
+```
+
+The helper calls `sao2_scoped_allocate(layout->size, reference)`. On success
+it must verify that the result is a root reference with the scoped tag, a
+nonzero aligned owner offset, and equal owner and member offsets. Resolve the
+body with `sao2_resolve_body(*reference, layout)` so the existing typed-body
+checks also verify the descriptor size, alignment, arena bounds, and current
+scoped cursor. A scoped object has no heap header and must never be passed to
+`sao2_heap_header_for`.
+
+Map allocator results at the source struct-construction failure site:
+
+- `SAO2_ARENA_EXHAUSTED` reports `StructAllocation` with the reason
+  `scoped arena exhausted`;
+- `SAO2_ARENA_COMMIT_FAILED` reports `StructAllocation` with the reason
+  `unable to commit scoped storage`;
+- `SAO2_ARENA_INVALID`, an invalid reference, or a failed postcondition calls
+  `sao2_compiler_invariant`; and
+- only `SAO2_ARENA_OK` publishes storage to the aggregate renderer.
+
+Keep the existing scoped allocator's cursor, commitment, and zeroing rules.
+It reserves at least one aligned slot for a zero-sized body, advances the
+cursor only after successful commitment, uses tag one, and zeroes all bytes
+which can become language-visible on every allocation, including reused
+storage. Restoring a mark does not decommit pages.
+
+For a `Scoped` aggregate, the renderer calls the new helper and then uses the
+same field initialization and delayed destination publication as the heap
+path. Inline struct operands still use the Stage 4 recursive copy helper;
+referenced fields still copy the packed reference. For a `Heap` aggregate,
+emit the existing `sao2_allocate_struct` call byte-for-byte. Do not add an
+arena branch to generated program control flow when the compiler already
+knows the class.
+
+### Function-owned marks
+
+Use `AllocationPlan::function_has_scoped` to decide whether a generated
+function needs a mark. If it does, emit exactly one local mark initialized by
+`sao2_scoped_mark_current()` at function entry, before the initial jump and
+before any operation can allocate. Zero-initializing generated locals and
+copying C parameters may occur on either side of the mark because neither
+touches an arena; keep one consistent order in emitted C.
+
+The mark belongs to the invocation, not to a block or allocation. All scoped
+objects created by that invocation, including allocations repeated by a loop,
+remain live until the function returns. A nested callee which has scoped sites
+saves and restores its own later mark, leaving the caller's cursor and objects
+intact. A callee without scoped sites emits no mark even when it receives a
+scoped reference from its caller.
+
+Functions with only heap sites, no struct aggregates, or only unreachable
+struct aggregates emit no mark and retain their existing return form. Stage 5
+classifies unreachable sites heap, so renderer reachability does not need to
+be recomputed here. Recursive functions and acyclic functions made
+conservative by a recursive dependency likewise remain heap-only.
+
+The entry adapter continues to initialize both arenas before calling the
+source entry function and release them after it returns. Generated source
+functions therefore may treat `sao2_scoped_mark_current()` as infallible;
+runtime initialization failures remain pre-entry failures.
+
+### Normal return restoration
+
+Every `TerminatorKind::Return` in a function which owns a mark must evaluate
+its operand before restoring the cursor. Emit a block-scoped sequence
+equivalent to:
+
+```c
+{
+    <result-type> sao2_return_value = <return-operand>;
+    if (!sao2_scoped_restore(sao2_function_mark))
+        sao2_compiler_invariant();
+    return sao2_return_value;
+}
+```
+
+Use the function's exact generated result carrier for the temporary. The
+compound statement is also valid immediately after a C label and permits the
+same temporary name at multiple return terminators. Evaluating first is
+required because a primitive, tuple, or union return expression may read a
+projected place inside scoped storage even though the returned value itself
+does not retain that storage.
+
+Stage 5 guarantees that a returned reference-bearing value cannot contain an
+origin allocated in this invocation's scoped arena. Do not attempt a runtime
+copy, promotion, tag rewrite, or post-restore reference check. A parameter
+which is returned has an escaping summary bit, so every compiler-visible
+caller allocation passed to it is already heap. A callee-local allocation
+which is returned is likewise already heap.
+
+Emit restoration at every return terminator, including early returns and
+returns reached through branches, switches, or loop exits. Jumps, branches,
+switch arms, and loop back edges do not restore. `Panic`, `ErrorPanic`, failed
+runtime checks, allocation failures, and `Unreachable` terminate the process
+and do not restore; milestone 9 has no unwinding protocol. A failed restore is
+a compiler/runtime invariant rather than a source failure.
+
+Do not centralize returns by changing typed IR or synthesizing a new CFG exit
+block. Keeping cleanup in terminator rendering makes the rule exhaustive for
+the current IR and prevents future return sites from silently bypassing it.
+
+### Lifetime and reference invariants
+
+The Stage 4 packed-reference and resolver rules apply unchanged to both arena
+classes:
+
+- a scoped root has the scoped tag in `owner_ptr` and its untagged owner offset
+  equals `member_ptr`;
+- inline projection preserves the tagged complete owner while changing only
+  `member_ptr`, so an interior reference has exactly the root's lifetime;
+- reference equality compares both packed words, so identical numeric offsets
+  in the heap and scoped arenas are distinct references;
+- a caller-owned scoped reference may cross a call only through parameters
+  whose summaries do not retain it, and the caller's mark encloses the entire
+  call; and
+- heap or longer-lived objects must never retain a reference to a younger
+  scoped owner. Stage 5 construction, mutation, return, and call constraints
+  enforce this statically for compiler-visible values.
+
+A scoped object may retain a heap reference or another scoped reference whose
+lifetime encloses its own. Scoped objects allocated by one invocation share
+that invocation's end mark, so confined containment cycles are reclaimed
+together. The backend must not add a dynamic ownership graph, reference
+counting, or arena-order check.
+
+Before a restore, `sao2_resolve_body` accepts a valid scoped root or interior
+reference only when its complete requested body ends at or below the current
+cursor. Immediately after restore, a reference into the discarded suffix is
+invalid until storage is reused. Static escape safety, not a generation
+counter, prevents stale references from surviving until such reuse. Future
+allocations may reuse the same offsets and must observe zeroed storage.
+
+### Implementation sequence
+
+Implement Stage 6 in the following order:
+
+1. Add allocation-class and per-function scoped queries to `AllocationPlan`,
+   with boundary tests for first, middle, last, and missing identities.
+2. Store the plan on `Renderer`; enumerate operation coordinates during
+   function rendering and prove every struct aggregate selects its exact plan
+   entry.
+3. Add `sao2_allocate_scoped_struct`, its source-attributed exhaustion and
+   commitment failures, and its scoped-root and typed-body postconditions.
+4. Select the heap or scoped helper at each struct aggregate while preserving
+   the common initialization and publication sequence.
+5. Emit one entry mark for each `has_scoped` function and no mark for every
+   other function.
+6. Extend return rendering with a typed pre-restore temporary and checked
+   restoration on every normal return; leave all terminating panic paths
+   unchanged.
+7. Add mixed-lifetime direct and native regression coverage, then update the
+   temporary generated-runtime stage comments to describe active scoped
+   allocation.
+
+At every step, valid programs must remain renderable. Do not land a state in
+which a site emits a scoped allocation without its owning function's mark, or
+a mark is emitted without exhaustive normal-return restoration.
+
+### Tests and completion
+
+Direct plan/backend tests should verify:
+
+- two struct aggregates using the same destination local, definition, or
+  source location still select their separate coordinate-indexed classes;
+- a missing or malformed allocation entry is rejected before renderer output,
+  with no heap fallback;
+- a mixed function emits the scoped helper only at `Scoped` sites and the
+  existing heap helper only at `Heap` sites;
+- a function with one or many scoped sites emits one entry mark, while
+  heap-only, allocation-free, recursive, conservative, and unreachable-site
+  functions emit none;
+- loop-contained scoped allocation does not emit a loop-local mark or restore;
+- every return in a marked function first captures the value, then checks one
+  restore, then returns, including returns in distinct blocks after branches
+  and switches;
+- an unmarked function retains its direct return, and panic, error-panic, and
+  unreachable terminators never emit restoration;
+- the scoped helper reports the exact construction failure site and reason for
+  exhaustion or commit failure, rejects invalid allocator results as
+  invariants, emits no heap header, and resolves through the supplied layout;
+- heap allocations retain their layout-bearing header, failure text, root
+  checks, and generated call shape; and
+- repeated emission from the same program and plan is byte-for-byte
+  deterministic.
+
+Generated-C runtime probes should verify:
+
+- nested marks restore in stack order and a callee restore leaves caller-owned
+  scoped objects valid;
+- restoration rejects marks below the initial cursor or above the current
+  cursor;
+- a discarded scoped root and inline interior reference fail resolution before
+  reuse, while a later allocation can reuse the offset and sees zeroed bytes;
+- heap and scoped objects can use the same decoded offset without comparing
+  equal or resolving through the wrong arena;
+- scoped exhaustion and commitment failure do not advance the cursor or alter
+  the heap arena, and heap exhaustion does not alter scoped state; and
+- zero-sized and maximally aligned layouts preserve the root encoding and
+  cursor alignment rules.
+
+Native source programs should cover a non-escaping local struct, mutation and
+reads through a scoped root, nested inline projection and mutation, passing a
+root or interior reference through a non-escaping callee, nested allocating
+calls, branch joins, loops, and multiple returns. Mixed graphs should show
+scoped owners safely retaining heap children and confined scoped children.
+Returning an owner or interior reference, storing into a parameter-owned or
+heap object, passing to an escaping parameter, and every recursive dependency
+case must continue to allocate the complete owner on the heap.
+
+Exercise allocation failure through controlled runtime probes rather than
+attempting to consume the production 4-GiB reservation in ordinary source
+tests. Preserve existing output, identity, inline-copy, warning, diagnostic,
+transactional-write, and host-adapter regressions.
+
+Contributor guidance prohibits compiling, running tests, or formatting during
+implementation. External verification should use Rust 1.90 or newer, report
+native skips explicitly, and inspect generated C where necessary to confirm
+marks, allocator selection, and restoration order.
+
+Stage 6 is complete when every struct aggregate uses its validated plan class;
+scoped allocation is source-attributed, typed, zeroed, and header-free; each
+function with a scoped site saves exactly one invocation mark; every normal
+return evaluates its result before checked restoration; terminating paths do
+not pretend to unwind; nested calls and interior references preserve owner
+lifetime; heap behavior is unchanged; and external tests demonstrate safe
+reuse plus independent heap and scoped failure behavior.
 
 ## Stage 7: Integration and garbage-collector handoff
 
