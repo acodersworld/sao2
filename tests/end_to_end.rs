@@ -259,6 +259,27 @@ fn runs_an_empty_string() {
 }
 
 #[test]
+fn reports_string_lengths_as_bytes_without_strlen() {
+    let directory = TestDirectory::new("string length");
+    let output = run_source(
+        &directory,
+        br#"fn main() {
+            println("".len());
+            println("abc".len());
+            println("a\0z".len());
+            println("a\n".len());
+        }"#,
+    );
+    assert!(
+        !compiler_is_missing(&output),
+        "native end-to-end tests require a supported C compiler: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"0\n3\n3\n2\n");
+}
+
+#[test]
 fn compares_and_indexes_strings() {
     let directory = TestDirectory::new("string values");
     let source = br#"fn main() {

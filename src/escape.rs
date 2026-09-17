@@ -6,7 +6,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 
-use crate::ir::{self, Aggregate, BlockId, DefinitionLayout, FunctionId, MemberStorage,
+use crate::ir::{self, Aggregate, BlockId, DefinitionId, DefinitionLayout, FunctionId, MemberStorage,
     Operand, OperationKind, OperationSite, Place, Projection, TerminatorKind, Type, TypeId};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -220,20 +220,70 @@ fn place_facts(program: &ir::Program, function: &ir::Function, locals: &[Facts],
     let _ = (program, function); Ok(facts)
 }
 fn place_owner_facts(_program: &ir::Program, _function: &ir::Function, locals: &[Facts], place: &Place) -> Result<Facts, EscapeError> {
-    if !place.projections.iter().any(|p| matches!(p, Projection::StructField { .. })) { return Ok(Facts::new()); }
+    if !place.projections.iter().any(|p| matches!(p,
+        Projection::StructField { .. } | Projection::ListIndex { .. } | Projection::MapIndex { .. }))
+    { return Ok(Facts::new()); }
     Ok(locals[place.local.index()].clone())
 }
 fn unknown_operation(program: &ir::Program, function: &ir::Function, op: &ir::Operation) -> Result<bool, EscapeError> {
-    let type_carries = |ty| carries(program, ty);
+    let type_retains = |ty| container_contents_retain_references(program, ty);
+    let container_retains = |ty| container_operation_retains_references(program, ty);
     Ok(match &op.kind {
-        OperationKind::Aggregate { aggregate: Aggregate::List { ty, .. } | Aggregate::Map { ty, .. }, .. } => type_carries(*ty)?,
-        OperationKind::Builtin { receiver, arguments, .. } => operand_carries(program, function, receiver)? || arguments.iter().any(|v| operand_carries(program, function, v).unwrap_or(true)),
-        OperationKind::BeginIteration { iterable } | OperationKind::EndIteration { iterable } => operand_carries(program, function, iterable)?,
-        OperationKind::IterationValue { iterable, .. } => operand_carries(program, function, iterable)?,
+        OperationKind::Aggregate { aggregate: Aggregate::List { ty, .. } | Aggregate::Map { ty, .. }, .. } => container_retains(*ty)?,
+        OperationKind::Builtin { receiver, arguments, .. } => {
+            let receiver_type = operand_type(program, function, receiver)?;
+            container_retains(receiver_type)? || arguments.iter().any(|value| {
+                operand_type(program, function, value)
+                    .and_then(|ty| type_retains(ty))
+                    .unwrap_or(true)
+            })
+        }
+        OperationKind::BeginIteration { iterable } | OperationKind::EndIteration { iterable } => {
+            let ty = operand_type(program, function, iterable)?;
+            container_retains(ty)?
+        }
+        OperationKind::IterationValue { iterable, .. } => {
+            let ty = operand_type(program, function, iterable)?;
+            container_retains(ty)?
+        }
+        OperationKind::Assign { destination, .. }
+            if destination.projections.iter().any(|projection| matches!(projection,
+                Projection::ListIndex { .. } | Projection::MapIndex { .. })) => {
+            container_projection_type(program, function, destination)
+                .map(container_retains)
+                .transpose()?
+                .unwrap_or(true)
+        }
         _ => false,
     })
 }
-fn operand_carries(program: &ir::Program, function: &ir::Function, operand: &Operand) -> Result<bool, EscapeError> { let ty = match operand { Operand::Constant(v) => v.ty, Operand::Copy(place) => place_type(program, function, place)? }; carries(program, ty) }
+fn container_projection_type(program: &ir::Program, function: &ir::Function, place: &Place) -> Option<TypeId> {
+    let mut ty = function.locals[place.local.index()].ty;
+    for projection in &place.projections {
+        match projection {
+            Projection::ListIndex { .. } | Projection::MapIndex { .. } => return Some(ty),
+            Projection::StructField { definition, field, .. } => {
+                let DefinitionLayout::Struct(fields) = &program.definitions[definition.index()].layout else { return None; };
+                ty = fields[field.index()].ty;
+            }
+            Projection::TupleField { definition, field } => {
+                let DefinitionLayout::Tuple(fields) = &program.definitions[definition.index()].layout else { return None; };
+                ty = fields[field.index()];
+            }
+        }
+    }
+    None
+}
+fn container_operation_retains_references(program: &ir::Program, ty: TypeId) -> Result<bool, EscapeError> {
+    match program.types.get(ty.index()) {
+        Some(Type::List(element)) => container_contents_retain_references(program, *element),
+        Some(Type::Map { key, value }) => Ok(container_contents_retain_references(program, *key)?
+            || container_contents_retain_references(program, *value)?),
+        Some(_) => Ok(false),
+        None => Err(error(None, None, None, "container operation has an invalid type")),
+    }
+}
+fn operand_type(program: &ir::Program, function: &ir::Function, operand: &Operand) -> Result<TypeId, EscapeError> { match operand { Operand::Constant(value) => Ok(value.ty), Operand::Copy(place) => place_type(program, function, place) } }
 fn retention_unknown_type(program: &ir::Program, ty: TypeId) -> Result<bool, EscapeError> {
     retention_unknown_inner(program, ty, &mut BTreeSet::new())
 }
@@ -241,7 +291,9 @@ fn retention_unknown_inner(program: &ir::Program, ty: TypeId, visiting: &mut BTr
     if !visiting.insert(ty) { return Ok(false); }
     let unknown = match &program.types[ty.index()] {
         Type::Unit | Type::Primitive(_) => false,
-        Type::List(_) | Type::Map { .. } => carries(program, ty)?,
+        Type::List(element) => container_contents_retain_references(program, *element)?,
+        Type::Map { key, value } => container_contents_retain_references(program, *key)?
+            || container_contents_retain_references(program, *value)?,
         Type::Nominal(definition) => match &program.definitions[definition.index()].layout {
             DefinitionLayout::Struct(fields) => fields.iter().any(|field| retention_unknown_inner(program, field.ty, visiting).unwrap_or(true)),
             DefinitionLayout::Tuple(fields) => fields.iter().any(|field| retention_unknown_inner(program, *field, visiting).unwrap_or(true)),
@@ -253,19 +305,86 @@ fn retention_unknown_inner(program: &ir::Program, ty: TypeId, visiting: &mut BTr
     Ok(unknown)
 }
 fn place_type(program: &ir::Program, function: &ir::Function, place: &Place) -> Result<TypeId, EscapeError> { let mut ty = function.locals[place.local.index()].ty; for p in &place.projections { ty = match p { Projection::StructField { definition, field, .. } => match &program.definitions[definition.index()].layout { DefinitionLayout::Struct(fields) => fields[field.index()].ty, _ => return Err(error(None,None,None,"struct projection has non-struct definition")) }, Projection::TupleField { definition, field } => match &program.definitions[definition.index()].layout { DefinitionLayout::Tuple(fields) => fields[field.index()], _ => return Err(error(None,None,None,"tuple projection has non-tuple definition")) }, Projection::ListIndex { .. } => match &program.types[ty.index()] { Type::List(item) => *item, _ => return Err(error(None,None,None,"list projection has non-list type")) }, Projection::MapIndex { .. } => match &program.types[ty.index()] { Type::Map { value, .. } => *value, _ => return Err(error(None,None,None,"map projection has non-map type")) } }; } Ok(ty) }
-fn carries(program: &ir::Program, ty: TypeId) -> Result<bool, EscapeError> { carries_inner(program, ty, &mut BTreeSet::new()) }
-fn carries_inner(program: &ir::Program, ty: TypeId, visiting: &mut BTreeSet<TypeId>) -> Result<bool, EscapeError> {
+/// Whether the value itself is a managed object reference.
+pub(crate) fn is_reference_carrier(program: &ir::Program, ty: TypeId) -> Result<bool, EscapeError> {
+    match program.types.get(ty.index()) {
+        Some(Type::List(_) | Type::Map { .. }) => Ok(true),
+        Some(Type::Nominal(definition)) => match &program.definitions[definition.index()].layout {
+            DefinitionLayout::Struct(_) => Ok(true),
+            DefinitionLayout::Tuple(_) | DefinitionLayout::Union(_) => Ok(false),
+        },
+        Some(Type::Unit | Type::Primitive(_) | Type::Union(_)) => Ok(false),
+        None => Err(error(None, None, None, "reference-carrier query has an invalid type")),
+    }
+}
+
+/// Whether canonical storage contains an edge the collector must visit.
+pub(crate) fn contains_traceable_references(program: &ir::Program, ty: TypeId) -> Result<bool, EscapeError> {
+    contains_traceable_inner(program, ty, &mut BTreeSet::new())
+}
+
+fn contains_traceable_inner(program: &ir::Program, ty: TypeId, visiting: &mut BTreeSet<TypeId>) -> Result<bool, EscapeError> {
     if !visiting.insert(ty) { return Ok(false); }
-    let value = match &program.types[ty.index()] {
-        Type::Unit | Type::Primitive(_) => false,
-        // A carrying container is deliberately visible to callers so the
-        // operation-level fallback can make its function conservative.
-        Type::List(element) => carries_inner(program, *element, visiting)?,
-        Type::Map { key, value } => carries_inner(program,*key,visiting)? || carries_inner(program,*value,visiting)?,
-        Type::Nominal(definition) => match &program.definitions[definition.index()].layout { DefinitionLayout::Struct(_) => true, DefinitionLayout::Tuple(fields) => fields.iter().any(|f| carries_inner(program,*f,visiting).unwrap_or(true)), DefinitionLayout::Union(items) => items.iter().any(|a| carries_inner(program,a.payload,visiting).unwrap_or(true)) },
-        Type::Union(items) => items.iter().any(|a| carries_inner(program,a.payload,visiting).unwrap_or(true)),
+    let result = match program.types.get(ty.index()) {
+        Some(Type::Unit | Type::Primitive(_)) => false,
+        Some(Type::List(_) | Type::Map { .. }) => is_reference_carrier(program, ty)?,
+        Some(Type::Nominal(definition)) => match &program.definitions[definition.index()].layout {
+            DefinitionLayout::Struct(_) => is_reference_carrier(program, ty)?,
+            DefinitionLayout::Tuple(fields) => fields.iter().any(|field| contains_traceable_inner(program, *field, visiting).unwrap_or(true)),
+            DefinitionLayout::Union(alternatives) => alternatives.iter().any(|item| contains_traceable_inner(program, item.payload, visiting).unwrap_or(true)),
+        },
+        Some(Type::Union(alternatives)) => alternatives.iter().any(|item| contains_traceable_inner(program, item.payload, visiting).unwrap_or(true)),
+        None => return Err(error(None, None, None, "trace query has an invalid type")),
     };
-    visiting.remove(&ty); Ok(value)
+    visiting.remove(&ty);
+    Ok(result)
+}
+
+/// Whether storing a value in a container can retain another managed object.
+pub(crate) fn container_contents_retain_references(program: &ir::Program, ty: TypeId) -> Result<bool, EscapeError> {
+    retention_references_inner(program, ty, &mut BTreeSet::new())
+}
+
+fn retention_references_inner(program: &ir::Program, ty: TypeId, visiting: &mut BTreeSet<TypeId>) -> Result<bool, EscapeError> {
+    if !visiting.insert(ty) { return Ok(false); }
+    let result = match program.types.get(ty.index()) {
+        Some(Type::Unit | Type::Primitive(_)) => false,
+        Some(Type::List(_) | Type::Map { .. }) => true,
+        Some(Type::Nominal(definition)) => match &program.definitions[definition.index()].layout {
+            DefinitionLayout::Struct(_) => true,
+            DefinitionLayout::Tuple(fields) => fields.iter().any(|field| retention_references_inner(program, *field, visiting).unwrap_or(true)),
+            DefinitionLayout::Union(alternatives) => alternatives.iter().any(|item| retention_references_inner(program, item.payload, visiting).unwrap_or(true)),
+        },
+        Some(Type::Union(alternatives)) => alternatives.iter().any(|item| retention_references_inner(program, item.payload, visiting).unwrap_or(true)),
+        None => return Err(error(None, None, None, "retention query has an invalid type")),
+    };
+    visiting.remove(&ty);
+    Ok(result)
+}
+
+/// Whether a type is valid as a stable, immutable map key.
+pub(crate) fn is_map_key_hashable(program: &ir::Program, ty: TypeId) -> Result<bool, EscapeError> {
+    map_key_hashable_inner(program, ty, &mut BTreeSet::new())
+}
+
+fn map_key_hashable_inner(program: &ir::Program, ty: TypeId, visiting: &mut BTreeSet<DefinitionId>) -> Result<bool, EscapeError> {
+    match program.types.get(ty.index()) {
+        Some(Type::Unit | Type::Primitive(ir::PrimitiveType::Int | ir::PrimitiveType::Str | ir::PrimitiveType::Bool)) => Ok(true),
+        Some(Type::Nominal(definition)) => {
+            let DefinitionLayout::Tuple(fields) = &program.definitions[definition.index()].layout else { return Ok(false); };
+            if !visiting.insert(*definition) { return Ok(true); }
+            let result = fields.iter().all(|field| map_key_hashable_inner(program, *field, visiting).unwrap_or(false));
+            visiting.remove(definition);
+            Ok(result)
+        }
+        Some(Type::Primitive(ir::PrimitiveType::Float | ir::PrimitiveType::Char))
+        | Some(Type::List(_) | Type::Map { .. } | Type::Union(_)) => Ok(false),
+        None => Err(error(None, None, None, "map-key query has an invalid type")),
+    }
+}
+
+fn carries(program: &ir::Program, ty: TypeId) -> Result<bool, EscapeError> {
+    contains_traceable_references(program, ty)
 }
 fn reachable_blocks(function: &ir::Function) -> BTreeSet<BlockId> { let mut result = BTreeSet::new(); let mut queue = VecDeque::new(); queue.push_back(function.entry.expect("validated")); while let Some(block) = queue.pop_front() { if !result.insert(block) { continue; } let term = &function.blocks[block.index()].terminator.as_ref().expect("validated").kind; match term { TerminatorKind::Jump(target) => queue.push_back(*target), TerminatorKind::Branch { then_block, else_block, .. } => { queue.push_back(*then_block); queue.push_back(*else_block); }, TerminatorKind::Switch { targets, .. } => for (_, target) in targets { queue.push_back(*target); }, _ => {} } } result }
 fn error(function: Option<FunctionId>, block: Option<BlockId>, site: Option<OperationSite>, message: impl Into<String>) -> EscapeError { EscapeError { function, block, site, message: message.into() } }
@@ -316,5 +435,91 @@ mod tests {
         assert_eq!(returned.allocations[0].1, AllocationClass::Heap);
         assert!(!returned.function_has_scoped(FunctionId::from_index(0)));
         assert_eq!(local.render(), analyze(&program(false)).unwrap().render());
+    }
+
+    #[test]
+    fn container_queries_separate_carriers_trace_retention_and_map_keys() {
+        let mut program = ir::Program::new(PathBuf::from("queries.sao2"), 1);
+        let unit = program.intern_type(Type::Unit);
+        let integer = program.intern_type(Type::Primitive(ir::PrimitiveType::Int));
+        let float = program.intern_type(Type::Primitive(ir::PrimitiveType::Float));
+        let string = program.intern_type(Type::Primitive(ir::PrimitiveType::Str));
+        let boolean = program.intern_type(Type::Primitive(ir::PrimitiveType::Bool));
+        let character = program.intern_type(Type::Primitive(ir::PrimitiveType::Char));
+
+        let mut point_definition = ir::NominalDefinition::structure("Point");
+        point_definition.add_struct_field("value", integer, MemberStorage::Inline);
+        let point_definition = program.add_definition(point_definition);
+        let point = program.intern_type(Type::Nominal(point_definition));
+
+        let mut key_definition = ir::NominalDefinition::tuple("Key");
+        key_definition.add_tuple_field(integer);
+        key_definition.add_tuple_field(boolean);
+        let key_definition = program.add_definition(key_definition);
+        let key = program.intern_type(Type::Nominal(key_definition));
+
+        let scalar_list = program.intern_type(Type::List(integer));
+        let nested_scalar_list = program.intern_type(Type::List(scalar_list));
+        let reference_list = program.intern_type(Type::List(point));
+        let map = program.intern_type(Type::Map { key, value: reference_list });
+
+        assert!(!is_reference_carrier(&program, integer).unwrap());
+        assert!(!is_reference_carrier(&program, key).unwrap());
+        assert!(is_reference_carrier(&program, point).unwrap());
+        assert!(is_reference_carrier(&program, scalar_list).unwrap());
+        assert!(is_reference_carrier(&program, map).unwrap());
+
+        assert!(!contains_traceable_references(&program, integer).unwrap());
+        assert!(contains_traceable_references(&program, scalar_list).unwrap());
+        assert!(!contains_traceable_references(&program, key).unwrap());
+        assert!(contains_traceable_references(&program, map).unwrap());
+
+        assert!(!container_contents_retain_references(&program, integer).unwrap());
+        assert!(container_contents_retain_references(&program, scalar_list).unwrap());
+        assert!(container_contents_retain_references(&program, nested_scalar_list).unwrap());
+        assert!(container_contents_retain_references(&program, point).unwrap());
+        assert!(container_contents_retain_references(&program, reference_list).unwrap());
+        assert!(container_contents_retain_references(&program, map).unwrap());
+
+        assert!(is_map_key_hashable(&program, unit).unwrap());
+        assert!(is_map_key_hashable(&program, integer).unwrap());
+        assert!(is_map_key_hashable(&program, string).unwrap());
+        assert!(is_map_key_hashable(&program, boolean).unwrap());
+        assert!(is_map_key_hashable(&program, key).unwrap());
+        assert!(!is_map_key_hashable(&program, float).unwrap());
+        assert!(!is_map_key_hashable(&program, character).unwrap());
+        assert!(!is_map_key_hashable(&program, point).unwrap());
+        assert!(!is_map_key_hashable(&program, scalar_list).unwrap());
+    }
+
+    #[test]
+    fn scalar_only_container_types_do_not_poison_struct_escape() {
+        let mut program = program(false);
+        let integer = ir::TypeId::from_index(1);
+        let scalar_list = program.intern_type(Type::List(integer));
+        program.functions[0].add_local(scalar_list, None, ir::LocalOrigin::Temporary);
+
+        let plan = analyze(&program).unwrap();
+        assert_eq!(plan.allocations[0].1, AllocationClass::Scoped);
+        assert!(!plan.summaries[0].conservative);
+    }
+
+    #[test]
+    fn reference_bearing_container_storage_forces_struct_heap_lifetime() {
+        let mut program = program(false);
+        let point = program.functions[0].locals[0].ty;
+        let list = program.intern_type(Type::List(point));
+        let list_local = program.functions[0].add_local(list, None, ir::LocalOrigin::Temporary);
+        let location = program.intern_location(ir::ByteSpan::new(0, 0));
+        let point_local = ir::LocalId::from_index(0);
+        let block = program.functions[0].entry.expect("test function entry");
+        program.functions[0].blocks[block.index()].push(OperationKind::Aggregate {
+            destination: list_local,
+            aggregate: Aggregate::List { ty: list, elements: vec![Operand::Copy(Place::local(point_local))] },
+        }, location);
+
+        let plan = analyze(&program).unwrap();
+        assert_eq!(plan.allocations[0].1, AllocationClass::Heap);
+        assert!(plan.summaries[0].conservative);
     }
 }
