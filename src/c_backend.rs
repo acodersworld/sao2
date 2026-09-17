@@ -34,7 +34,8 @@ pub(crate) fn emit_with_plan(program: &ir::Program, plan: &AllocationPlan) -> Re
     CapabilityValidator::new(program).validate()?;
     let layouts = LayoutPlanner::new(program).plan()?;
     let traces = TracePlanner::new(program, &layouts).plan()?;
-    Ok(Renderer::new(program, plan, layouts, traces).render())
+    let roots = RootPlanner::new(program, &traces).plan()?;
+    Ok(Renderer::new(program, plan, layouts, traces, roots).render())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -519,6 +520,74 @@ struct TracePlan {
     aggregate_callbacks: Vec<AggregateId>,
 }
 
+/// Backend-owned, deterministic storage plan for the precise shadow stack.
+/// IR locals remain the identities: this plan only chooses their C storage.
+#[derive(Clone, Debug)]
+struct FunctionRootPlan { function: FunctionId, locals: Vec<(LocalId, TypeId)> }
+
+#[derive(Clone, Debug)]
+struct RootPlan { functions: Vec<FunctionRootPlan> }
+
+impl RootPlan {
+    fn function(&self, id: FunctionId) -> &FunctionRootPlan {
+        self.functions.get(id.index()).expect("validated root plan")
+    }
+    fn contains(&self, function: FunctionId, local: LocalId) -> bool {
+        self.function(function).locals.binary_search_by_key(&local, |(id, _)| *id).is_ok()
+    }
+}
+
+struct RootPlanner<'a> { program: &'a ir::Program, traces: &'a TracePlan }
+
+impl<'a> RootPlanner<'a> {
+    fn new(program: &'a ir::Program, traces: &'a TracePlan) -> Self { Self { program, traces } }
+    fn plan(&self) -> Result<RootPlan, CEmissionError> {
+        let functions = self.program.functions.iter().enumerate().map(|(index, function)| {
+            let locals = function.locals.iter().enumerate().filter_map(|(local, item)| {
+                self.traces.type_contains_reference[item.ty.index()]
+                    .then_some((LocalId::from_index(local), item.ty))
+            }).collect();
+            FunctionRootPlan { function: FunctionId::from_index(index), locals }
+        }).collect();
+        let plan = RootPlan { functions };
+        self.validate(&plan)?;
+        Ok(plan)
+    }
+    fn validate(&self, plan: &RootPlan) -> Result<(), CEmissionError> {
+        if plan.functions.len() != self.program.functions.len() { return self.fail("root plan function count mismatch"); }
+        for (index, function) in self.program.functions.iter().enumerate() {
+            let entry = plan.functions.get(index).ok_or_else(|| CEmissionError::Invariant(BackendInvariant { definition: None, ty: None, message: "root plan function missing".into() }))?;
+            if entry.function != FunctionId::from_index(index) { return self.fail("root plan functions are unordered"); }
+            for (position, (local, ty)) in entry.locals.iter().enumerate() {
+                if local.index() >= function.locals.len() || function.locals[local.index()].ty != *ty
+                    || !self.traces.type_contains_reference[ty.index()] || !self.trace_expression_available(*ty) { return self.fail("invalid selected root local"); }
+                if position > 0 && entry.locals[position - 1].0 >= *local { return self.fail("duplicate or unordered root local"); }
+            }
+            for (local, item) in function.locals.iter().enumerate() {
+                let selected = entry.locals.binary_search_by_key(&LocalId::from_index(local), |(id, _)| *id).is_ok();
+                if selected != self.traces.type_contains_reference[item.ty.index()] { return self.fail("root plan omits or includes an invalid local"); }
+            }
+        }
+        Ok(())
+    }
+    fn fail<T>(&self, message: &str) -> Result<T, CEmissionError> {
+        Err(CEmissionError::Invariant(BackendInvariant { definition: None, ty: None, message: message.into() }))
+    }
+    fn trace_expression_available(&self, ty: TypeId) -> bool {
+        match &self.program.types[ty.index()] {
+            Type::Nominal(definition) => match &self.program.definitions[definition.index()].layout {
+                // A struct root always has a trace expression: enqueueing its
+                // packed reference and exact layout.  A body callback is only
+                // needed when that body itself has outgoing references.
+                DefinitionLayout::Struct(_) => true,
+                DefinitionLayout::Tuple(_) | DefinitionLayout::Union(_) => self.traces.aggregate_callbacks.contains(&AggregateId::Definition(*definition)),
+            },
+            Type::Union(_) => self.traces.aggregate_callbacks.contains(&AggregateId::AnonymousUnion(ty)),
+            Type::Unit | Type::Primitive(_) | Type::List(_) | Type::Map { .. } => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TraceVisitState { Visiting, Complete(bool) }
 
@@ -841,6 +910,8 @@ struct Renderer<'a> {
     definitions: Vec<AggregateId>,
     struct_layouts: Vec<StructLayout>,
     trace_plan: TracePlan,
+    root_plan: RootPlan,
+    current_function: Option<FunctionId>,
     strings: Vec<StringLiteral>,
     labels: Vec<Vec<u8>>,
     output: String,
@@ -853,8 +924,8 @@ struct StringLiteral {
 }
 
 impl<'a> Renderer<'a> {
-    fn new(program: &'a ir::Program, allocation_plan: &'a AllocationPlan, layouts: LayoutPlan, trace_plan: TracePlan) -> Self {
-        let mut renderer = Self { program, allocation_plan, definitions: layouts.aggregates, struct_layouts: layouts.structs, trace_plan, strings: collect_strings(program), labels: Vec::new(), output: String::new() };
+    fn new(program: &'a ir::Program, allocation_plan: &'a AllocationPlan, layouts: LayoutPlan, trace_plan: TracePlan, root_plan: RootPlan) -> Self {
+        let mut renderer = Self { program, allocation_plan, definitions: layouts.aggregates, struct_layouts: layouts.structs, trace_plan, root_plan, current_function: None, strings: collect_strings(program), labels: Vec::new(), output: String::new() };
         renderer.plan_format_labels();
         renderer
     }
@@ -929,6 +1000,10 @@ impl<'a> Renderer<'a> {
             self.render_trace_declarations();
             self.render_struct_descriptors(&layouts);
         }
+        if self.root_plan.functions.iter().any(|item| !item.locals.is_empty()) {
+            self.render_shadow_declarations();
+            self.render_shadow_frame_definitions();
+        }
         self.render_runtime_metadata();
         self.render_writer_declarations();
         self.render_scalar_helpers();
@@ -936,6 +1011,10 @@ impl<'a> Renderer<'a> {
         if !self.struct_layouts.is_empty() {
             self.render_trace_runtime();
             self.render_trace_callbacks();
+            if self.root_plan.functions.iter().any(|item| !item.locals.is_empty()) {
+                self.render_shadow_runtime();
+                self.render_shadow_callbacks();
+            }
         }
         self.render_struct_allocation_helpers();
         self.render_struct_copy_helpers();
@@ -1647,6 +1726,65 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    fn render_shadow_declarations(&mut self) {
+        self.output.push_str(concat!(
+            "\ntypedef struct sao2_shadow_frame sao2_shadow_frame;\n",
+            "typedef void (*sao2_trace_frame_fn)(sao2_trace_context *context, const sao2_shadow_frame *frame);\n",
+            "struct sao2_shadow_frame { sao2_shadow_frame *previous; sao2_trace_frame_fn trace; };\n",
+            "static sao2_shadow_frame *sao2_shadow_top = NULL;\n\n",
+        ));
+    }
+
+    fn render_shadow_frame_definitions(&mut self) {
+        for entry in self.root_plan.functions.clone().into_iter().filter(|item| !item.locals.is_empty()) {
+            let id = entry.function.index();
+            let _ = writeln!(self.output, "typedef struct sao2_shadow_frame_fn_{id} {{");
+            self.output.push_str("    sao2_shadow_frame header;\n");
+            for (local, ty) in &entry.locals {
+                let _ = writeln!(self.output, "    {} local_{};", self.c_type(*ty), local.index());
+            }
+            let _ = writeln!(self.output, "}} sao2_shadow_frame_fn_{id};");
+            let _ = writeln!(self.output, "_Static_assert(offsetof(sao2_shadow_frame_fn_{id}, header) == 0, \"SAO2 shadow header offset\");");
+            for (local, ty) in &entry.locals {
+                let c_ty = self.c_type(*ty);
+                let _ = writeln!(self.output, "_Static_assert(sizeof(((sao2_shadow_frame_fn_{id} *)0)->local_{}) == sizeof({c_ty}), \"SAO2 shadow field size\");", local.index());
+                let _ = writeln!(self.output, "_Static_assert(_Alignof(((sao2_shadow_frame_fn_{id} *)0)->local_{}) == _Alignof({c_ty}), \"SAO2 shadow field alignment\");", local.index());
+            }
+            let _ = writeln!(self.output, "static void sao2_trace_frame_fn_{id}(sao2_trace_context *context, const sao2_shadow_frame *frame);\n");
+        }
+    }
+
+    fn render_shadow_runtime(&mut self) {
+        self.output.push_str(concat!(
+            "static void sao2_shadow_link(sao2_shadow_frame *frame) {\n",
+            "    if (frame == NULL || frame->trace == NULL) sao2_compiler_invariant();\n",
+            "    frame->previous = sao2_shadow_top; sao2_shadow_top = frame;\n}\n",
+            "static void sao2_shadow_unlink(sao2_shadow_frame *frame) {\n",
+            "    if (frame == NULL || sao2_shadow_top != frame) sao2_compiler_invariant();\n",
+            "    sao2_shadow_top = frame->previous; frame->previous = NULL;\n}\n",
+            "static void sao2_trace_global_roots(sao2_trace_context *context) { (void)context; }\n",
+            "static void sao2_shadow_assert_empty(void) { if (sao2_shadow_top != NULL) sao2_compiler_invariant(); }\n",
+            "static void sao2_trace_shadow_roots(sao2_trace_context *context) {\n",
+            "    sao2_shadow_frame *slow = sao2_shadow_top, *fast = sao2_shadow_top, *frame;\n",
+            "    while (fast != NULL && fast->previous != NULL) { slow = slow->previous; fast = fast->previous->previous; if (slow == fast) { context->result = SAO2_TRACE_INVALID; return; } }\n",
+            "    for (frame = sao2_shadow_top; frame != NULL && context->result == SAO2_TRACE_OK; frame = frame->previous) {\n",
+            "        if (frame->trace == NULL) { context->result = SAO2_TRACE_INVALID; return; } frame->trace(context, frame);\n    }\n}\n\n",
+        ));
+    }
+
+    fn render_shadow_callbacks(&mut self) {
+        for entry in self.root_plan.functions.clone().into_iter().filter(|item| !item.locals.is_empty()) {
+            let id = entry.function.index();
+            let _ = writeln!(self.output, "static void sao2_trace_frame_fn_{id}(sao2_trace_context *context, const sao2_shadow_frame *frame) {{");
+            let _ = writeln!(self.output, "    const sao2_shadow_frame_fn_{id} *typed = (const sao2_shadow_frame_fn_{id} *)frame;");
+            self.output.push_str("    if (context->result != SAO2_TRACE_OK) return;\n");
+            for (local, ty) in &entry.locals {
+                self.render_trace_value(*ty, MemberStorage::Referenced, &format!("typed->local_{}", local.index()), 1);
+            }
+            self.output.push_str("}\n\n");
+        }
+    }
+
     fn render_union(&mut self, alternatives: &[ir::UnionAlternative]) {
         self.output.push_str("    uint32_t tag;\n    union {\n");
         for (index, alternative) in alternatives.iter().enumerate() {
@@ -1679,16 +1817,24 @@ impl<'a> Renderer<'a> {
     }
 
     fn render_function(&mut self, id: FunctionId, function: &Function) {
+        self.current_function = Some(id);
+        let framed = !self.root_plan.function(id).locals.is_empty();
         self.render_signature(id, function);
         self.output.push_str(" {\n");
+        if framed {
+            let _ = writeln!(self.output, "    sao2_shadow_frame_fn_{} sao2_frame = {{0}};", id.index());
+            let _ = writeln!(self.output, "    sao2_frame.header.trace = sao2_trace_frame_fn_{};", id.index());
+            self.output.push_str("    sao2_shadow_link(&sao2_frame.header);\n");
+        }
         for (index, local) in function.locals.iter().enumerate() {
+            if self.root_plan.contains(id, LocalId::from_index(index)) { continue; }
             let ty = local.ty;
             let c_ty = if self.is_entry_args(id, ty) { "sao2_args".to_owned() }
                 else { self.c_type(ty) };
             let _ = writeln!(self.output, "    {c_ty} sao2_local_{index} = {{0}};");
         }
         for (position, local) in function.parameters.iter().enumerate() {
-            let _ = writeln!(self.output, "    sao2_local_{} = sao2_arg_{position};", local.index());
+            let _ = writeln!(self.output, "    {} = sao2_arg_{position};", self.local(*local));
         }
         let has_scoped = self.allocation_plan.function_has_scoped(id);
         if has_scoped {
@@ -1701,9 +1847,10 @@ impl<'a> Renderer<'a> {
             for (operation_index, operation) in block.operations.iter().enumerate() {
                 self.render_operation(id, ir::BlockId::from_index(block_index), operation_index, function, &operation.kind);
             }
-            self.render_terminator(function, has_scoped, &block.terminator.as_ref().expect("validated block").kind);
+            self.render_terminator(function, framed, has_scoped, &block.terminator.as_ref().expect("validated block").kind);
         }
         self.output.push_str("}\n");
+        self.current_function = None;
     }
 
     fn render_operation(&mut self, function_id: FunctionId, block_id: ir::BlockId,
@@ -1711,7 +1858,7 @@ impl<'a> Renderer<'a> {
         match operation {
             OperationKind::Copy { destination, operand } => {
                 let value = self.operand(operand);
-                let _ = writeln!(self.output, "    sao2_local_{} = {value};", destination.index());
+                let _ = writeln!(self.output, "    {} = {value};", self.local(*destination));
             }
             OperationKind::Unary { destination, operator, operand } => {
                 let value = self.operand(operand);
@@ -1721,19 +1868,19 @@ impl<'a> Renderer<'a> {
                     UnaryOperator::Plus => format!("+{value}"),
                     UnaryOperator::Minus => format!("-{value}"),
                 };
-                let _ = writeln!(self.output, "    sao2_local_{} = {expression};", destination.index());
+                let _ = writeln!(self.output, "    {} = {expression};", self.local(*destination));
             }
             OperationKind::Binary { destination, operator, left, right } => {
                 let left_value = self.operand(left);
                 let right_value = self.operand(right);
                 let left_ty = self.operand_type(function, left);
                 let expression = self.binary_expression(*operator, left_ty, &left_value, &right_value);
-                let _ = writeln!(self.output, "    sao2_local_{} = {expression};", destination.index());
+                let _ = writeln!(self.output, "    {} = {expression};", self.local(*destination));
             }
             OperationKind::Convert { destination, conversion, operand } => {
                 let value = self.operand(operand);
                 let cast = match conversion { NumericConversion::IntToFloat => "double", NumericConversion::FloatToInt => "int64_t" };
-                let _ = writeln!(self.output, "    sao2_local_{} = ({cast})({value});", destination.index());
+                let _ = writeln!(self.output, "    {} = ({cast})({value});", self.local(*destination));
             }
             OperationKind::Assign { destination, value } => {
                 let value = self.operand(value);
@@ -1747,28 +1894,28 @@ impl<'a> Renderer<'a> {
             }
             OperationKind::Call { destination, function: callee, arguments } => {
                 let arguments = arguments.iter().map(|argument| self.operand(argument)).collect::<Vec<_>>().join(", ");
-                let _ = writeln!(self.output, "    sao2_local_{} = sao2_fn_{}({arguments});", destination.index(), callee.index());
+                let _ = writeln!(self.output, "    {} = sao2_fn_{}({arguments});", self.local(*destination), callee.index());
             }
             OperationKind::UnionInject { destination, union_type, alternative, payload } => {
                 let c_ty = self.c_type(*union_type);
                 let payload = self.operand(payload);
-                let destination = destination.index();
+                let destination = self.local(*destination);
                 let alternative = alternative.index();
-                let _ = writeln!(self.output, "    sao2_local_{destination} = ({c_ty}){{0}};");
-                let _ = writeln!(self.output, "    sao2_local_{destination}.payload.alternative_{alternative} = {payload};");
-                let _ = writeln!(self.output, "    sao2_local_{destination}.tag = UINT32_C({});", alternative + 1);
+                let _ = writeln!(self.output, "    {destination} = ({c_ty}){{0}};");
+                let _ = writeln!(self.output, "    {destination}.payload.alternative_{alternative} = {payload};");
+                let _ = writeln!(self.output, "    {destination}.tag = UINT32_C({});", alternative + 1);
             }
             OperationKind::UnionTest { destination, union, alternative } => {
                 let union = self.operand(union);
                 let tag = alternative.index() + 1;
-                let _ = writeln!(self.output, "    sao2_local_{} = ({union}).tag == UINT32_C({tag});", destination.index());
+                let _ = writeln!(self.output, "    {} = ({union}).tag == UINT32_C({tag});", self.local(*destination));
             }
             OperationKind::UnionPayload { destination, union, alternative } => {
                 let union = self.operand(union);
                 let alternative = alternative.index();
                 let tag = alternative + 1;
                 let _ = writeln!(self.output, "    if (({union}).tag != UINT32_C({tag})) sao2_compiler_invariant();");
-                let _ = writeln!(self.output, "    sao2_local_{} = ({union}).payload.alternative_{alternative};", destination.index());
+                let _ = writeln!(self.output, "    {} = ({union}).payload.alternative_{alternative};", self.local(*destination));
             }
             OperationKind::Intrinsic { destination, intrinsic, arguments, failure } => {
                 self.render_intrinsic(function, *destination, *intrinsic, arguments, *failure);
@@ -1778,17 +1925,17 @@ impl<'a> Renderer<'a> {
                 let index = self.operand(index);
                 let _ = writeln!(
                     self.output,
-                    "    sao2_local_{} = sao2_string_index({string}, {index}, {});",
-                    destination.index(),
+                    "    {} = sao2_string_index({string}, {index}, {});",
+                    self.local(*destination),
                     failure.index(),
                 );
             }
             OperationKind::Aggregate { destination, aggregate: ir::Aggregate::Tuple { definition: _, elements } } => {
                 let c_ty = self.c_type(function.locals[destination.index()].ty);
-                let _ = writeln!(self.output, "    sao2_local_{} = ({c_ty}){{0}};", destination.index());
+                let _ = writeln!(self.output, "    {} = ({c_ty}){{0}};", self.local(*destination));
                 for (index, element) in elements.iter().enumerate() {
                     let value = self.operand(element);
-                    let _ = writeln!(self.output, "    sao2_local_{}.field_{index} = {value};", destination.index());
+                    let _ = writeln!(self.output, "    {}.field_{index} = {value};", self.local(*destination));
                 }
             }
             OperationKind::Aggregate { destination, aggregate: ir::Aggregate::Struct { definition, fields, failure } } => {
@@ -1809,6 +1956,7 @@ impl<'a> Renderer<'a> {
         let layout = self.struct_layouts.iter().find(|item| item.definition == definition)
             .expect("validated struct layout").clone();
         let id = destination.index();
+        let destination_name = self.local(destination);
         self.output.push_str("    {\n");
         let _ = writeln!(self.output, "    sao2_ref sao2_struct_ref_{id};");
         let _ = writeln!(self.output, "    unsigned char *sao2_struct_bytes_{id};");
@@ -1831,11 +1979,11 @@ impl<'a> Renderer<'a> {
                 let _ = writeln!(self.output, "    sao2_struct_body_{id}->field_{} = {value};", field.id.index());
             }
         }
-        let _ = writeln!(self.output, "    sao2_local_{id} = sao2_struct_ref_{id};");
+        let _ = writeln!(self.output, "    {destination_name} = sao2_struct_ref_{id};");
         self.output.push_str("    }\n");
     }
 
-    fn render_terminator(&mut self, function: &Function, has_scoped: bool, terminator: &TerminatorKind) {
+    fn render_terminator(&mut self, function: &Function, framed: bool, has_scoped: bool, terminator: &TerminatorKind) {
         match terminator {
             TerminatorKind::Jump(target) => {
                 let _ = writeln!(self.output, "    goto sao2_block_{};", target.index());
@@ -1850,11 +1998,12 @@ impl<'a> Renderer<'a> {
             }
             TerminatorKind::Return(value) => {
                 let value = self.operand(value);
-                if has_scoped {
+                if framed || has_scoped {
                     let result = self.c_type(function.result);
                     self.output.push_str("    {\n");
                     let _ = writeln!(self.output, "        {result} sao2_return_value = {value};");
-                    self.output.push_str("        if (!sao2_scoped_restore(sao2_function_mark)) sao2_compiler_invariant();\n");
+                    if framed { self.output.push_str("        sao2_shadow_unlink(&sao2_frame.header);\n"); }
+                    if has_scoped { self.output.push_str("        if (!sao2_scoped_restore(sao2_function_mark)) sao2_compiler_invariant();\n"); }
                     self.output.push_str("        return sao2_return_value;\n    }\n");
                 } else {
                     let _ = writeln!(self.output, "    return {value};");
@@ -1918,6 +2067,9 @@ impl<'a> Renderer<'a> {
         }
 
         let arguments = if has_args { "sao2_entry_args" } else { "" };
+        if self.root_plan.functions.iter().any(|item| !item.locals.is_empty()) {
+            self.output.push_str("    sao2_shadow_assert_empty();\n");
+        }
         self.output.push_str(concat!(
             "    if (!sao2_arena_runtime_init())\n",
             "        sao2_pre_entry_panic_arena();\n",
@@ -1925,11 +2077,14 @@ impl<'a> Renderer<'a> {
         match &self.program.types[function.result.index()] {
             Type::Unit => {
                 let _ = writeln!(self.output, "    sao2_unit sao2_result = sao2_fn_{}({arguments});", entry.index());
-                self.output.push_str("    (void)sao2_result;\n    sao2_arena_runtime_release();\n");
+                self.output.push_str("    (void)sao2_result;\n");
+                if self.root_plan.functions.iter().any(|item| !item.locals.is_empty()) { self.output.push_str("    sao2_shadow_assert_empty();\n"); }
+                self.output.push_str("    sao2_arena_runtime_release();\n");
                 self.output.push_str("    return EXIT_SUCCESS;\n");
             }
             Type::Primitive(PrimitiveType::Int) => {
                 let _ = writeln!(self.output, "    int64_t sao2_result = sao2_fn_{}({arguments});", entry.index());
+                if self.root_plan.functions.iter().any(|item| !item.locals.is_empty()) { self.output.push_str("    sao2_shadow_assert_empty();\n"); }
                 self.output.push_str(concat!(
                     "    if (sao2_result < INT_MIN || sao2_result > INT_MAX)\n",
                     "        { sao2_arena_runtime_release(); sao2_pre_entry_panic_exit_status(); }\n",
@@ -2000,7 +2155,7 @@ impl<'a> Renderer<'a> {
         if intrinsic == Intrinsic::Println {
             let _ = writeln!(self.output, "    sao2_writer_char(&{writer}, UINT8_C(10));");
         }
-        let _ = writeln!(self.output, "    sao2_local_{} = (sao2_unit){{0}};", destination.index());
+        let _ = writeln!(self.output, "    {} = (sao2_unit){{0}};", self.local(destination));
         self.output.push_str("    }\n");
     }
 
@@ -2076,6 +2231,12 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    fn local(&self, local: LocalId) -> String {
+        let function = self.current_function.expect("local rendered outside a function");
+        if self.root_plan.contains(function, local) { format!("sao2_frame.local_{}", local.index()) }
+        else { format!("sao2_local_{}", local.index()) }
+    }
+
     fn operand_type(&self, function: &Function, operand: &Operand) -> TypeId {
         match operand {
             Operand::Constant(constant) => constant.ty,
@@ -2088,7 +2249,7 @@ impl<'a> Renderer<'a> {
     }
 
     fn place_through(&self, place: &Place, count: usize) -> String {
-        let mut rendered = format!("sao2_local_{}", place.local.index());
+        let mut rendered = self.local(place.local);
         for projection in place.projections.iter().take(count) {
             match projection {
                 Projection::TupleField { field, .. } => {
@@ -4288,9 +4449,10 @@ int main(void) {
         assert!(emitted.contains("int64_t sao2_return_value = INT64_C(0);"));
         assert!(emitted.contains("if (!sao2_scoped_restore(sao2_function_mark)) sao2_compiler_invariant();"));
         assert!(emitted.contains("sao2_struct_body_0->field_0 = INT64_C(7);"));
-        assert!(emitted.contains("sao2_local_0 = sao2_struct_ref_0;"));
-        assert!(emitted.contains("sao2_local_1 = sao2_ref_equal(sao2_local_0, sao2_local_0);"));
-        assert!(emitted.contains("sao2_local_2 = ((sao2_body_def_0 *)sao2_resolve_body(sao2_local_0, &sao2_layout_def_0))->field_0;"));
+        assert!(emitted.contains("sao2_shadow_frame_fn_0 sao2_frame = {0};"));
+        assert!(emitted.contains("sao2_frame.local_0 = sao2_struct_ref_0;"));
+        assert!(emitted.contains("sao2_local_1 = sao2_ref_equal(sao2_frame.local_0, sao2_frame.local_0);"));
+        assert!(emitted.contains("sao2_local_2 = ((sao2_body_def_0 *)sao2_resolve_body(sao2_frame.local_0, &sao2_layout_def_0))->field_0;"));
         assert!(emitted.contains("static unsigned char *sao2_resolve_body"));
         assert!(emitted.contains("sao2_fail(site, SAO2_FAILURE_STRUCT_ALLOCATION"));
     }
