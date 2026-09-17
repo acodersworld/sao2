@@ -1138,7 +1138,8 @@ impl<'a> Renderer<'a> {
 
     fn collection_enabled(&self) -> bool {
         !self.struct_layouts.is_empty()
-            && self.root_plan.functions.iter().any(|item| !item.locals.is_empty())
+            && (self.root_plan.functions.iter().any(|item| !item.locals.is_empty())
+                || self.allocation_plan.allocations.iter().any(|(_, class)| *class == AllocationClass::Heap))
     }
 
     fn render_struct_allocation_helpers(&mut self) {
@@ -2444,14 +2445,19 @@ fn failure_operation_macro(operation: FailureOperation) -> &'static str {
 const ARENA_RUNTIME: &str = r#"
 
 /*
- * Milestone 10 block-heap foundation. Active precise collection can walk,
- * reclaim, coalesce, and reuse heap blocks. Collection is synchronous and
- * exhaustion-triggered in generated programs; proactive policy and epoch
- * rollover remain pending Stage 5 work. Scoped allocation remains an
- * independent, restorable bump arena.
+ * Milestone 10 block-heap foundation. Stage 5 collection policy is
+ * synchronous, precise, stationary, and bounded to the managed allocation
+ * safe point.
+ * Scoped allocation remains an independent, restorable bump arena.
  */
 #ifndef SAO2_ARENA_CAPACITY
 #define SAO2_ARENA_CAPACITY UINT64_C(4294967296)
+#endif
+#ifndef SAO2_GC_ALLOCATION_THRESHOLD
+#define SAO2_GC_ALLOCATION_THRESHOLD UINT64_C(1048576)
+#endif
+#ifndef SAO2_GC_EPOCH_LIMIT
+#define SAO2_GC_EPOCH_LIMIT UINT32_MAX
 #endif
 #define SAO2_ARENA_INITIAL_CURSOR UINT64_C(8)
 #define SAO2_REF_OWNER_TAG_MASK UINT32_C(7)
@@ -2495,13 +2501,25 @@ typedef struct {
 _Static_assert(sizeof(sao2_heap_header) != 0, "SAO2 heap header must not be empty");
 _Static_assert(sizeof(sao2_heap_header) == 48, "SAO2 heap header ABI");
 _Static_assert(sizeof(sao2_heap_header) % 8 == 0, "SAO2 heap header must preserve body alignment");
+_Static_assert((SAO2_GC_ALLOCATION_THRESHOLD) >= 0
+    && (uintmax_t)(SAO2_GC_ALLOCATION_THRESHOLD) > (uintmax_t)0
+    && (uintmax_t)(SAO2_GC_ALLOCATION_THRESHOLD) <= (uintmax_t)UINT64_MAX,
+    "SAO2 GC allocation threshold must be a positive uint64_t");
+_Static_assert((uint64_t)(SAO2_GC_EPOCH_LIMIT) > UINT64_C(0)
+    && (uint64_t)(SAO2_GC_EPOCH_LIMIT) <= (uint64_t)UINT32_MAX,
+    "SAO2 GC epoch limit must be a positive uint32_t");
 
 static sao2_arena sao2_heap_arena;
 static sao2_arena sao2_scoped_arena;
 static bool sao2_arenas_initialized;
-/* Stage 4 consumes epochs monotonically; Stage 5 owns rollover. */
 static uint32_t sao2_gc_epoch;
 static bool sao2_gc_active;
+static uint64_t sao2_gc_allocation_debt;
+
+#ifdef SAO2_RUNTIME_PROBE
+static uint64_t sao2_probe_collection_count;
+static uint32_t sao2_probe_last_collection_trigger;
+#endif
 
 typedef struct {
     uint64_t allocated_blocks_examined;
@@ -2606,6 +2624,11 @@ static bool sao2_arena_runtime_init(void) {
     sao2_scoped_arena.frontier = SAO2_ARENA_INITIAL_CURSOR;
     sao2_gc_epoch = 0;
     sao2_gc_active = false;
+    sao2_gc_allocation_debt = 0;
+#ifdef SAO2_RUNTIME_PROBE
+    sao2_probe_collection_count = 0;
+    sao2_probe_last_collection_trigger = 0;
+#endif
     memset(&sao2_last_gc_stats, 0, sizeof sao2_last_gc_stats);
     sao2_arenas_initialized = true;
     return true;
@@ -2621,6 +2644,11 @@ static void sao2_arena_runtime_release(void) {
     sao2_arenas_initialized = false;
     sao2_gc_epoch = 0;
     sao2_gc_active = false;
+    sao2_gc_allocation_debt = 0;
+#ifdef SAO2_RUNTIME_PROBE
+    sao2_probe_collection_count = 0;
+    sao2_probe_last_collection_trigger = 0;
+#endif
     memset(&sao2_last_gc_stats, 0, sizeof sao2_last_gc_stats);
 }
 
@@ -2823,12 +2851,10 @@ static void sao2_heap_initialize_free(sao2_heap_header *header, uint64_t span, u
     header->reserved = 0;
 }
 
-#ifdef SAO2_HEAP_COLLECTION_MODE
-static sao2_arena_result sao2_heap_try_allocate(uint64_t body_size, uint64_t alignment,
-#else
-static sao2_arena_result sao2_heap_allocate(uint64_t body_size, uint64_t alignment,
-#endif
-    uint64_t layout_identity, sao2_ref *result) {
+/* The raw allocator has no policy or collection side effects.  The optional
+ * span result is written only on success, after all fallible work is done. */
+static sao2_arena_result sao2_heap_allocate_raw(uint64_t body_size, uint64_t alignment,
+    uint64_t layout_identity, sao2_ref *result, uint64_t *assigned_span) {
     uint64_t required_span, minimum_span, previous = 0, selected, body_offset;
     sao2_ref published;
     if (result == NULL || alignment != SAO2_REF_ALIGNMENT) return SAO2_ARENA_INVALID;
@@ -2862,6 +2888,7 @@ static sao2_arena_result sao2_heap_allocate(uint64_t body_size, uint64_t alignme
         sao2_heap_initialize_allocated(header, allocation_span, body_size, layout_identity);
         memset(sao2_heap_arena.base + (size_t)body_offset, 0,
             (size_t)(allocation_span - (uint64_t)sizeof(sao2_heap_header)));
+        if (assigned_span != NULL) *assigned_span = allocation_span;
         *result = published;
         return SAO2_ARENA_OK;
     } else {
@@ -2881,10 +2908,23 @@ static sao2_arena_result sao2_heap_allocate(uint64_t body_size, uint64_t alignme
         memset(sao2_heap_arena.base + (size_t)body_offset, 0,
             (size_t)(required_span - (uint64_t)sizeof(sao2_heap_header)));
         sao2_heap_arena.frontier = end;
+        if (assigned_span != NULL) *assigned_span = required_span;
         *result = published;
     }
     return SAO2_ARENA_OK;
 }
+
+#ifdef SAO2_HEAP_COLLECTION_MODE
+static sao2_arena_result sao2_heap_try_allocate(uint64_t body_size, uint64_t alignment,
+    uint64_t layout_identity, sao2_ref *result) {
+    return sao2_heap_allocate_raw(body_size, alignment, layout_identity, result, NULL);
+}
+#else
+static sao2_arena_result sao2_heap_allocate(uint64_t body_size, uint64_t alignment,
+    uint64_t layout_identity, sao2_ref *result) {
+    return sao2_heap_allocate_raw(body_size, alignment, layout_identity, result, NULL);
+}
+#endif
 
 static bool sao2_heap_header_for(sao2_ref reference, sao2_heap_header **result) {
     sao2_arena_kind kind;
@@ -3207,9 +3247,11 @@ typedef enum {
     SAO2_COLLECTION_OK,
     SAO2_COLLECTION_TRACE_SCRATCH_EXHAUSTED,
     SAO2_COLLECTION_INVALID,
-    SAO2_COLLECTION_EPOCH_EXHAUSTED,
     SAO2_COLLECTION_REENTRANT
 } sao2_collection_result;
+
+#define SAO2_GC_TRIGGER_POLICY UINT32_C(1)
+#define SAO2_GC_TRIGGER_PRESSURE UINT32_C(2)
 
 static void sao2_collection_append_free_run(uint64_t offset, uint64_t span,
     uint64_t *head, uint64_t *tail) {
@@ -3285,18 +3327,67 @@ static bool sao2_heap_sweep(uint32_t epoch) {
     return true;
 }
 
-static sao2_collection_result sao2_collect(void) {
+static sao2_collection_result sao2_prepare_collection_epoch(uint32_t *epoch) {
+    uint64_t offset, next;
+
+    if (sao2_gc_active) return SAO2_COLLECTION_REENTRANT;
+    if (epoch == NULL || !sao2_arenas_initialized
+        || (uint64_t)sao2_gc_epoch > (uint64_t)SAO2_GC_EPOCH_LIMIT
+        || !sao2_heap_validate()) return SAO2_COLLECTION_INVALID;
+
+    sao2_gc_active = true;
+    if (sao2_gc_epoch == (uint32_t)SAO2_GC_EPOCH_LIMIT) {
+        /* The validation above covers every physical step and free-list
+         * link before this mutation pass begins.  A second malformed read is
+         * therefore an invariant failure, not a recoverable collection
+         * result. */
+        offset = SAO2_ARENA_INITIAL_CURSOR;
+        while (offset < sao2_heap_arena.frontier) {
+            sao2_heap_header *header;
+            if (!sao2_heap_block_valid(offset, sao2_heap_arena.frontier, &next)
+                || next <= offset) sao2_compiler_invariant();
+            header = sao2_heap_header_at(offset);
+            if (header->block_state == SAO2_HEAP_BLOCK_ALLOCATED) {
+                header->mark_epoch = 0;
+            } else if (header->block_state == SAO2_HEAP_BLOCK_FREE) {
+                if (header->mark_epoch != 0) sao2_compiler_invariant();
+            } else {
+                sao2_compiler_invariant();
+            }
+            offset = next;
+        }
+        if (offset != sao2_heap_arena.frontier) sao2_compiler_invariant();
+        sao2_gc_epoch = 0;
+    }
+    if (sao2_gc_epoch >= (uint32_t)SAO2_GC_EPOCH_LIMIT) sao2_compiler_invariant();
+    *epoch = ++sao2_gc_epoch;
+    return SAO2_COLLECTION_OK;
+}
+
+static void sao2_gc_charge(uint64_t span) {
+    if (span < (uint64_t)sizeof(sao2_heap_header)
+        || span % SAO2_REF_ALIGNMENT != 0
+        || span > sao2_heap_arena.capacity) sao2_compiler_invariant();
+    if (span > UINT64_MAX - sao2_gc_allocation_debt)
+        sao2_gc_allocation_debt = UINT64_MAX;
+    else
+        sao2_gc_allocation_debt += span;
+}
+
+static sao2_collection_result sao2_collect_for_trigger(uint32_t trigger) {
     sao2_trace_context context;
     sao2_trace_result trace_result;
     sao2_collection_result result;
     uint32_t epoch;
 
-    if (sao2_gc_active) return SAO2_COLLECTION_REENTRANT;
-    if (!sao2_arenas_initialized || !sao2_heap_validate()) return SAO2_COLLECTION_INVALID;
-    if (sao2_gc_epoch == UINT32_MAX) return SAO2_COLLECTION_EPOCH_EXHAUSTED;
-
-    sao2_gc_active = true;
-    epoch = ++sao2_gc_epoch;
+    result = sao2_prepare_collection_epoch(&epoch);
+    if (result != SAO2_COLLECTION_OK) return result;
+#ifdef SAO2_RUNTIME_PROBE
+    sao2_probe_collection_count++;
+    sao2_probe_last_collection_trigger = trigger;
+#else
+    (void)trigger;
+#endif
     memset(&sao2_last_gc_stats, 0, sizeof sao2_last_gc_stats);
     sao2_trace_context_init(&context, epoch);
 
@@ -3315,35 +3406,72 @@ static sao2_collection_result sao2_collect(void) {
 
     sao2_trace_context_dispose(&context);
     sao2_gc_active = false;
+    if (result == SAO2_COLLECTION_OK) sao2_gc_allocation_debt = 0;
     return result;
+}
+
+static sao2_collection_result sao2_collect(void) {
+    return sao2_collect_for_trigger(0);
+}
+
+static sao2_arena_result sao2_collection_failure(sao2_collection_result result) {
+    if (result == SAO2_COLLECTION_TRACE_SCRATCH_EXHAUSTED)
+        return SAO2_ARENA_COLLECTION_FAILED;
+    if (result == SAO2_COLLECTION_INVALID || result == SAO2_COLLECTION_REENTRANT)
+        return SAO2_ARENA_INVALID;
+    sao2_compiler_invariant();
 }
 
 static sao2_arena_result sao2_heap_allocate(uint64_t body_size, uint64_t alignment,
     uint64_t layout_identity, sao2_ref *result) {
     sao2_ref candidate;
-    uint64_t required_span;
-    sao2_arena_result status = sao2_heap_try_allocate(body_size, alignment,
-        layout_identity, &candidate);
+    sao2_arena_result status;
     sao2_collection_result collection;
+    uint64_t required_span, assigned_span;
 
-    if (status != SAO2_ARENA_EXHAUSTED) {
-        if (status == SAO2_ARENA_OK) *result = candidate;
-        return status;
-    }
-    if (result == NULL || alignment != SAO2_REF_ALIGNMENT
-        || !sao2_heap_span(body_size, &required_span)
-        || sao2_heap_arena.capacity < SAO2_ARENA_INITIAL_CURSOR
-        || required_span > sao2_heap_arena.capacity - SAO2_ARENA_INITIAL_CURSOR
+    /* Request validation is deliberately before the policy check.  An
+     * impossible request must not collect an otherwise valid heap. */
+    if (result == NULL || alignment != SAO2_REF_ALIGNMENT) return SAO2_ARENA_INVALID;
+    if (!sao2_heap_span(body_size, &required_span)) return SAO2_ARENA_EXHAUSTED;
+    if (!sao2_arenas_initialized || sao2_heap_arena.base == NULL
+        || sao2_heap_arena.capacity < SAO2_ARENA_INITIAL_CURSOR)
+        return SAO2_ARENA_INVALID;
+    if (required_span > sao2_heap_arena.capacity - SAO2_ARENA_INITIAL_CURSOR
         || required_span > UINT64_C(4294967296) - SAO2_ARENA_INITIAL_CURSOR)
         return SAO2_ARENA_EXHAUSTED;
 
-    collection = sao2_collect();
-    if (collection != SAO2_COLLECTION_OK) {
-        if (collection == SAO2_COLLECTION_INVALID) return SAO2_ARENA_INVALID;
-        return SAO2_ARENA_COLLECTION_FAILED;
+    if (sao2_gc_allocation_debt >= (uint64_t)(SAO2_GC_ALLOCATION_THRESHOLD)) {
+        collection = sao2_collect_for_trigger(SAO2_GC_TRIGGER_POLICY);
+        if (collection != SAO2_COLLECTION_OK)
+            return sao2_collection_failure(collection);
+        status = sao2_heap_allocate_raw(body_size, alignment, layout_identity,
+            &candidate, &assigned_span);
+        if (status == SAO2_ARENA_OK) {
+            sao2_gc_charge(assigned_span);
+            *result = candidate;
+        }
+        return status;
     }
-    status = sao2_heap_try_allocate(body_size, alignment, layout_identity, &candidate);
-    if (status == SAO2_ARENA_OK) *result = candidate;
+
+    status = sao2_heap_allocate_raw(body_size, alignment, layout_identity,
+        &candidate, &assigned_span);
+    if (status != SAO2_ARENA_EXHAUSTED) {
+        if (status == SAO2_ARENA_OK) {
+            sao2_gc_charge(assigned_span);
+            *result = candidate;
+        }
+        return status;
+    }
+
+    collection = sao2_collect_for_trigger(SAO2_GC_TRIGGER_PRESSURE);
+    if (collection != SAO2_COLLECTION_OK)
+        return sao2_collection_failure(collection);
+    status = sao2_heap_allocate_raw(body_size, alignment, layout_identity,
+        &candidate, &assigned_span);
+    if (status == SAO2_ARENA_OK) {
+        sao2_gc_charge(assigned_span);
+        *result = candidate;
+    }
     return status;
 }
 "#;
@@ -3413,7 +3541,7 @@ static void sao2_allocate_struct(const sao2_layout_descriptor *layout, size_t si
         sao2_fail(site, SAO2_FAILURE_STRUCT_ALLOCATION, reason, sizeof reason - 1);
     }
     if (status == SAO2_ARENA_COLLECTION_FAILED) {
-        static const unsigned char reason[] = "unable to complete garbage collection";
+        static const unsigned char reason[] = "unable to allocate garbage collector work storage";
         sao2_fail(site, SAO2_FAILURE_STRUCT_ALLOCATION, reason, sizeof reason - 1);
     }
     if (status != SAO2_ARENA_OK) sao2_compiler_invariant();
@@ -4607,6 +4735,116 @@ int main(void) {
     }
 
     #[test]
+    fn native_collection_policy_probe_reuses_epochs_and_distinguishes_pressure() {
+        let directory = NativeProbeDirectory::new();
+        let source_path = directory.0.join("collection policy probe.c");
+        let (mut program, types, location) = program();
+        let definition = program.add_definition(NominalDefinition::structure("Point"));
+        let point = program.intern_type(Type::Nominal(definition));
+        program.definitions[definition.index()].add_struct_field("value", types.int, MemberStorage::Inline);
+        let failure = program.intern_failure_site(ir::FailureSite {
+            location, function: FunctionId::from_index(0), operation: FailureOperation::StructAllocation,
+            line: 1, column: 1,
+        });
+        let mut main = Function::new("main", types.int);
+        let value = main.add_local(point, None, LocalOrigin::Temporary);
+        let block = main.add_block();
+        main.entry = Some(block);
+        main.blocks[block.index()].push(OperationKind::Aggregate {
+            destination: value,
+            aggregate: Aggregate::Struct {
+                definition,
+                fields: vec![(ir::FieldId::from_index(0), constant(types.int, ConstantValue::Integer(1)))],
+                failure,
+            },
+        }, location);
+        main.blocks[block.index()].terminate(
+            TerminatorKind::Return(constant(types.int, ConstantValue::Integer(0))), location,
+        );
+        let main_id = program.add_function(main);
+        program.entry = Some(main_id);
+        let plan = AllocationPlan {
+            summaries: vec![escape::FunctionSummary { parameter_escapes: Vec::new(), conservative: false }],
+            allocations: vec![(AllocationId { function: main_id, block, operation: 0 }, AllocationClass::Heap)],
+            has_scoped: vec![false],
+        };
+
+        let mut source = emit_with_plan(&program, &plan).unwrap();
+        source = source.replacen(
+            "typedef struct { uint8_t value; } sao2_unit;",
+            concat!(
+                "#define main sao2_generated_main\n",
+                "#define SAO2_ARENA_CAPACITY UINT64_C(65536)\n",
+                "#define SAO2_GC_ALLOCATION_THRESHOLD UINT64_C(64)\n",
+                "#define SAO2_GC_EPOCH_LIMIT UINT32_C(2)\n",
+                "#define SAO2_RUNTIME_PROBE\n",
+                "static bool sao2_probe_fail_next_commit;\n",
+                "typedef struct { uint8_t value; } sao2_unit;",
+            ),
+            1,
+        );
+        source.push_str(r#"
+#undef main
+#define CHECK(condition) do { if (!(condition)) { fprintf(stderr, "collection policy probe check failed at line %d\n", __LINE__); return 1; } } while (0)
+
+int main(void) {
+    sao2_ref reference, raw;
+    sao2_heap_header *header;
+    int index;
+
+    CHECK(sao2_arena_runtime_init());
+    for (index = 0; index < 7; ++index) {
+        CHECK(sao2_heap_allocate(sao2_layout_def_0.size, SAO2_REF_ALIGNMENT,
+            sao2_layout_def_0.identity, &reference) == SAO2_ARENA_OK);
+        CHECK(sao2_heap_validate());
+    }
+    CHECK(sao2_probe_collection_count == UINT64_C(3));
+    CHECK(sao2_probe_last_collection_trigger == SAO2_GC_TRIGGER_POLICY);
+    CHECK(sao2_gc_epoch == UINT32_C(1));
+
+    CHECK(sao2_heap_try_allocate(sao2_layout_def_0.size, SAO2_REF_ALIGNMENT,
+        sao2_layout_def_0.identity, &reference) == SAO2_ARENA_OK);
+    CHECK(sao2_heap_header_for(reference, &header));
+    header->mark_epoch = UINT32_C(1);
+    sao2_gc_epoch = (uint32_t)SAO2_GC_EPOCH_LIMIT;
+    sao2_gc_allocation_debt = 0;
+    CHECK(sao2_collect() == SAO2_COLLECTION_OK);
+    CHECK(sao2_heap_validate());
+    CHECK(sao2_heap_arena.frontier == SAO2_ARENA_INITIAL_CURSOR);
+    CHECK(sao2_gc_epoch == UINT32_C(1));
+    CHECK(sao2_probe_collection_count == UINT64_C(4));
+
+    while (sao2_heap_try_allocate(sao2_layout_def_0.size, SAO2_REF_ALIGNMENT,
+        sao2_layout_def_0.identity, &raw) == SAO2_ARENA_OK) {}
+    sao2_gc_allocation_debt = 0;
+    CHECK(sao2_heap_allocate(sao2_layout_def_0.size, SAO2_REF_ALIGNMENT,
+        sao2_layout_def_0.identity, &reference) == SAO2_ARENA_OK);
+    CHECK(sao2_probe_collection_count == UINT64_C(5));
+    CHECK(sao2_probe_last_collection_trigger == SAO2_GC_TRIGGER_PRESSURE);
+    CHECK(sao2_heap_validate());
+
+    sao2_arena_runtime_release();
+    return 0;
+}
+"#);
+        fs::write(&source_path, source).unwrap();
+
+        let executable = match crate::host_compiler::compile(&source_path) {
+            Ok(executable) => executable,
+            Err(error) if error.to_string().contains("no supported C compiler found") => return,
+            Err(error) => panic!("native collection-policy probe did not compile: {error}"),
+        };
+        let output = Command::new(executable).output().unwrap();
+        assert!(
+            output.status.success(),
+            "native collection-policy probe failed with {}: {}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
     fn renders_scoped_struct_construction_and_reference_equality() {
         let (mut program, types, location) = program();
         let definition = program.add_definition(NominalDefinition::structure("Point"));
@@ -4695,6 +4933,15 @@ int main(void) {
         assert!(emitted.contains("#define SAO2_HEAP_COLLECTION_MODE"));
         assert!(emitted.contains("static sao2_arena_result sao2_heap_try_allocate("));
         assert!(emitted.contains("static sao2_collection_result sao2_collect(void)"));
+        assert!(emitted.contains("#define SAO2_GC_ALLOCATION_THRESHOLD UINT64_C(1048576)"));
+        assert!(emitted.contains("#define SAO2_GC_EPOCH_LIMIT UINT32_MAX"));
+        assert!(emitted.contains("static uint64_t sao2_gc_allocation_debt;"));
+        assert!(emitted.contains("static sao2_collection_result sao2_prepare_collection_epoch(uint32_t *epoch)"));
+        assert!(emitted.contains("static sao2_arena_result sao2_heap_allocate_raw("));
+        assert!(emitted.contains("SAO2_GC_TRIGGER_POLICY"));
+        assert!(emitted.contains("SAO2_GC_TRIGGER_PRESSURE"));
+        assert!(!emitted.contains("SAO2_COLLECTION_EPOCH_EXHAUSTED"));
+        assert!(emitted.contains("unable to allocate garbage collector work storage"));
         assert!(emitted.contains("sao2_trace_global_roots(&context)"));
         assert!(emitted.contains("sao2_trace_shadow_roots(&context)"));
         assert!(emitted.contains("static bool sao2_heap_sweep(uint32_t epoch)"));
