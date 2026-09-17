@@ -119,10 +119,7 @@ when production programs collect.
 
 ## Stage 3: Precise shadow frames
 
-Status: current.
-
-The detailed implementation plan is in
-[Current Stage: Precise Shadow Frames](CURRENT_STAGE.md).
+Status: complete.
 
 Add a root plan for every function after IR validation and escape analysis.
 The plan selects all locals whose type can carry a struct reference, including
@@ -158,7 +155,10 @@ automatically triggered.
 
 ## Stage 4: End-to-end mark and sweep
 
-Status: pending.
+Status: current.
+
+The detailed implementation plan is in
+[Current Stage: End-to-End Mark and Sweep](CURRENT_STAGE.md).
 
 Connect the shadow-frame chain to the trace engine and implement a complete
 collection transaction: advance the collection epoch, visit global and frame
