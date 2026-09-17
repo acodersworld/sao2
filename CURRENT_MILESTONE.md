@@ -155,10 +155,7 @@ automatically triggered.
 
 ## Stage 4: End-to-end mark and sweep
 
-Status: current.
-
-The detailed implementation plan is in
-[Current Stage: End-to-End Mark and Sweep](CURRENT_STAGE.md).
+Status: complete.
 
 Connect the shadow-frame chain to the trace engine and implement a complete
 collection transaction: advance the collection epoch, visit global and frame
@@ -184,7 +181,10 @@ reachable graph remains valid and stationary.
 
 ## Stage 5: Collection policy and rollover safety
 
-Status: pending.
+Status: current.
+
+The detailed implementation plan is in
+[Current Stage: Collection Policy and Rollover Safety](CURRENT_STAGE.md).
 
 Turn the correct collector into a bounded, repeatable runtime policy. Add a
 deterministic collection threshold so reclamation is not attempted only after
