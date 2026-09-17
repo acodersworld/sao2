@@ -67,10 +67,7 @@ identifier spelling.
 
 ## Stage 1: Reclaimable heap foundation
 
-Status: current.
-
-The detailed implementation plan is in
-[Current Stage: Reclaimable Heap Foundation](CURRENT_STAGE.md).
+Status: complete.
 
 Replace the monotonic heap's private representation with a block model which
 can later sweep and reuse storage, without enabling automatic collection yet.
@@ -96,7 +93,10 @@ ordinary source programs retain milestone-9 behavior.
 
 ## Stage 2: Exact trace plans and callbacks
 
-Status: pending.
+Status: current.
+
+The detailed implementation plan is in
+[Current Stage: Exact Trace Plans and Callbacks](CURRENT_STAGE.md).
 
 Add a compiler-owned trace plan derived from typed IR types and the physical
 layout plan. It records which value shapes can contain struct references and
