@@ -1401,7 +1401,7 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
         for span in invalid {
             self.error(
                 span,
-                "map key type must be int, str, bool, or an immutable tuple of valid map keys",
+                "map key type must be unit, int, str, bool, or an immutable tuple of valid map keys",
             );
         }
     }
@@ -4109,7 +4109,7 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
         if !self.analysis.is_valid_map_key(key, &mut Vec::new()) {
             return self.analysis.error(
                 expression.span,
-                "map key type must be int, str, bool, or an immutable tuple of valid map keys",
+                "map key type must be unit, int, str, bool, or an immutable tuple of valid map keys",
             );
         }
         let map = self.analysis.types.intern(ResolvedType::Map { key, value });
@@ -4139,7 +4139,7 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
         {
             return self.analysis.error(
                 ty.span,
-                "map key type must be int, str, bool, or an immutable tuple of valid map keys",
+                "map key type must be unit, int, str, bool, or an immutable tuple of valid map keys",
             );
         }
         self.coerce(expression, TypeState::Resolved(resolved), expected)
@@ -6301,7 +6301,7 @@ mod tests {
 
         assert_eq!(
             diagnostics
-                .matches("map key type must be int, str, bool, or an immutable tuple")
+                .matches("map key type must be unit, int, str, bool, or an immutable tuple")
                 .count(),
             3
         );

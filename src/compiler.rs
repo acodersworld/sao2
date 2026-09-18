@@ -368,7 +368,7 @@ mod tests {
         let output_path = build_directory.join("program.c");
         fs::write(&output_path, "existing generated C").unwrap();
 
-        let source = source("fn main() { value := {1: 2}; value.len(); }");
+        let source = source("fn main() { for item in [1, 2] { print(item); } }");
         let diagnostic = compile_into(&source, &build_directory)
             .unwrap_err()
             .to_string();

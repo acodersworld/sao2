@@ -48,6 +48,13 @@ Maps are constructed with brace literals containing `key: value` entries:
 
 Every key and value must have the map's key and value types respectively.
 
+Map indexed assignment inserts a key when it is absent. Replacing an existing
+key changes only its value and preserves that key's insertion position. Removing
+and later reinserting a key places it at the end of insertion order. A map
+literal evaluates each key and value from left to right; the first occurrence
+of an equal key establishes its position and the last occurrence supplies its
+final value.
+
 ## Container operations
 
 Lists and maps use indexing for lookup and mutation:
@@ -67,6 +74,12 @@ items.append(value);
 items.removeIndex(index);
 table.removeKey(key);
 ```
+
+`removeKey` panics with `map key not found` when the key is absent. Reading a
+missing key, including the initial read of a compound assignment, panics with
+the same message. Replacing an existing map value is non-structural and is
+permitted during iteration; inserting a missing key or removing a key is a
+structural mutation and panics while the map is being iterated.
 
 Lists, maps, and strings provide `len()`:
 

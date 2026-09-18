@@ -10,7 +10,7 @@ use crate::ir::{
     self, AlternativeConstructor, BinaryOperator, ConstantValue, DefinitionId, DefinitionLayout, FailureOperation,
     FailureSiteId, Function, FunctionId, IntegerOperation, Intrinsic, LocalId, MemberStorage,
     NumericConversion, OperationKind, OperationSite, Operand, Place, PrimitiveType, Projection,
-    RuntimeCheck, TerminatorKind, Type, TypeId, UnaryOperator, ValidationError,
+    RuntimeCheck, TerminatorKind, Type, TypeId, UnaryOperator, ValidationError, MapAccessMode,
 };
 use crate::escape::{self, AllocationClass, AllocationId, AllocationPlan};
 
@@ -209,11 +209,6 @@ impl<'a> CapabilityValidator<'a> {
     }
 
     fn operation(&self, function: &Function, operation: &OperationKind) -> Result<(), CEmissionError> {
-        if matches!(operation, OperationKind::Assign { destination, .. } if place_has_unsupported_read_projection(destination))
-            || operation_operands_have_unsupported_projection(operation)
-        {
-            return self.unsupported("place projection");
-        }
         match operation {
             OperationKind::Copy { destination, operand } => {
                 self.executable_union_use(function.locals[destination.index()].ty)?;
@@ -238,10 +233,9 @@ impl<'a> CapabilityValidator<'a> {
                 if self.is_scalar(ty)
                     || matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual)
                         && self.is_equatable_value(ty, &mut Vec::new())
-                        && !matches!(self.program.types[ty.index()], Type::Map { .. })
                     || matches!(operator, BinaryOperator::In)
                         && self.is_equatable_value(ty, &mut Vec::new())
-                        && matches!(&self.program.types[self.operand_type(function, right).index()], Type::List(_))
+                        && matches!(&self.program.types[self.operand_type(function, right).index()], Type::List(_) | Type::Map { .. })
                 {
                     Ok(())
                 } else {
@@ -256,7 +250,7 @@ impl<'a> CapabilityValidator<'a> {
             OperationKind::Aggregate { aggregate: ir::Aggregate::Tuple { .. }, .. } => Ok(()),
             OperationKind::Aggregate { aggregate: ir::Aggregate::Struct { .. }, .. } => Ok(()),
             OperationKind::Aggregate { aggregate: ir::Aggregate::List { .. }, .. } => Ok(()),
-            OperationKind::Aggregate { aggregate: ir::Aggregate::Map { .. }, .. } => self.unsupported("aggregate construction"),
+            OperationKind::Aggregate { aggregate: ir::Aggregate::Map { .. }, .. } => Ok(()),
             OperationKind::StringIndex { .. } => Ok(()),
             OperationKind::Intrinsic { intrinsic, arguments, .. } => match intrinsic {
                 Intrinsic::Print if arguments.len() == 1 && self.output_operand(function, &arguments[0]) => Ok(()),
@@ -270,11 +264,15 @@ impl<'a> CapabilityValidator<'a> {
                 if arguments.is_empty() && matches!(self.program.types[self.operand_type(function, receiver).index()], Type::List(_)) => Ok(()),
             OperationKind::Builtin { method: ir::BuiltinMethod::ListAppend | ir::BuiltinMethod::ListRemoveIndex, receiver, arguments, .. }
                 if !arguments.is_empty() && matches!(self.program.types[self.operand_type(function, receiver).index()], Type::List(_)) => Ok(()),
+            OperationKind::Builtin { method: ir::BuiltinMethod::MapLen, receiver, arguments, .. }
+                if arguments.is_empty() && matches!(self.program.types[self.operand_type(function, receiver).index()], Type::Map { .. }) => Ok(()),
+            OperationKind::Builtin { method: ir::BuiltinMethod::MapRemoveKey, receiver, arguments, .. }
+                if arguments.len() == 1 && matches!(self.program.types[self.operand_type(function, receiver).index()], Type::Map { .. }) => Ok(()),
             OperationKind::Builtin { .. } => self.unsupported("built-in container operation"),
             OperationKind::BeginIteration { .. } | OperationKind::EndIteration { .. }
             | OperationKind::IterationValue { .. } => self.unsupported("container iteration"),
             OperationKind::Check(RuntimeCheck::IterationUnlocked { receiver, .. }) =>
-                if matches!(self.program.types[self.operand_type(function, receiver).index()], Type::List(_)) {
+                if matches!(self.program.types[self.operand_type(function, receiver).index()], Type::List(_) | Type::Map { .. }) {
                     Ok(())
                 } else {
                     self.unsupported("container mutation check")
@@ -284,9 +282,6 @@ impl<'a> CapabilityValidator<'a> {
     }
 
     fn terminator(&self, function: &Function, terminator: &TerminatorKind) -> Result<(), CEmissionError> {
-        if terminator_operands_have_unsupported_projection(terminator) {
-            return self.unsupported("place projection");
-        }
         match terminator {
             TerminatorKind::Jump(_) | TerminatorKind::Branch { .. }
             | TerminatorKind::Panic { .. } | TerminatorKind::Unreachable => Ok(()),
@@ -1666,7 +1661,7 @@ impl<'a> Renderer<'a> {
             .filter(|container| container.kind == ContainerKind::List)
             .cloned()
             .collect::<Vec<_>>();
-        if lists.is_empty() { return; }
+        if !lists.is_empty() {
         self.output.push_str("\n/* Stage 2 typed list operations. */\n");
         for container in lists {
             let ty = container.ty.index();
@@ -1827,6 +1822,195 @@ impl<'a> Renderer<'a> {
             self.output.push_str("    for (uint64_t index = 0; index < control->length; ++index) {\n");
             let _ = writeln!(self.output, "        if ({descriptor}.equal(&records[index].value, &value) == true) return true;");
             self.output.push_str("    }\n    return false;\n}\n\n");
+        }
+        }
+        self.render_map_operation_helpers();
+    }
+
+    fn render_map_operation_helpers(&mut self) {
+        let maps = self
+            .containers
+            .iter()
+            .filter(|container| container.kind == ContainerKind::Map)
+            .cloned()
+            .collect::<Vec<_>>();
+        if maps.is_empty() || !self.collection_enabled() { return; }
+
+        self.output.push_str("\n/* Stage 3 typed ordered-map operations. */\n");
+        for container in maps {
+            let ty = container.ty.index();
+            let key = container.key.expect("map key");
+            let value = container.value.expect("map value");
+            let control = container_control_name(container.ty);
+            let entry_record = backing_record_name(container.ty, BackingRole::OrderedEntries);
+            let slot_record = backing_record_name(container.ty, BackingRole::LookupSlots);
+            let entry_layout = backing_layout_name(container.ty, BackingRole::OrderedEntries);
+            let slot_layout = backing_layout_name(container.ty, BackingRole::LookupSlots);
+            let entry_offset = self.managed_layout(container.ty, BackingRole::OrderedEntries).payload_offset;
+            let slot_offset = self.managed_layout(container.ty, BackingRole::LookupSlots).payload_offset;
+            let key_c_type = self.c_type(key);
+            let value_c_type = self.c_type(value);
+            let key_descriptor = format!("sao2_value_descriptor_ty_{}", key.index());
+            let value_descriptor = format!("sao2_value_descriptor_ty_{}", value.index());
+            let transaction = format!("sao2_map_transaction_ty_{ty}");
+
+            let _ = writeln!(self.output, "typedef struct {transaction} {{");
+            self.output.push_str("    sao2_shadow_frame header;\n");
+            self.output.push_str("    sao2_ref ordered_entries;\n    sao2_ref lookup_slots;\n");
+            let _ = writeln!(self.output, "}} {transaction};");
+            let _ = writeln!(self.output, "static void sao2_trace_{transaction}(sao2_trace_context *context, const sao2_shadow_frame *frame) {{");
+            let _ = writeln!(self.output, "    const {transaction} *typed = (const {transaction} *)frame;");
+            self.output.push_str("    if (context->result != SAO2_TRACE_OK) return;\n");
+            let _ = writeln!(self.output, "    if (typed->ordered_entries.owner_ptr != 0 || typed->ordered_entries.member_ptr != 0) sao2_trace_enqueue(context, typed->ordered_entries, &{entry_layout});");
+            let _ = writeln!(self.output, "    if (typed->lookup_slots.owner_ptr != 0 || typed->lookup_slots.member_ptr != 0) sao2_trace_enqueue(context, typed->lookup_slots, &{slot_layout});");
+            self.output.push_str("}\n\n");
+
+            let _ = writeln!(self.output, "static _Noreturn void sao2_map_fail_ty_{ty}(size_t site, uint32_t operation, sao2_arena_result status) {{");
+            self.output.push_str("    static const unsigned char exhausted[] = \"heap arena exhausted\";\n");
+            self.output.push_str("    static const unsigned char commit[] = \"unable to commit heap storage\";\n");
+            self.output.push_str("    static const unsigned char scratch[] = \"unable to allocate garbage collector work storage\";\n");
+            self.output.push_str("    if (status == SAO2_ARENA_EXHAUSTED) sao2_fail(site, operation, exhausted, sizeof exhausted - 1);\n");
+            self.output.push_str("    if (status == SAO2_ARENA_COMMIT_FAILED) sao2_fail(site, operation, commit, sizeof commit - 1);\n");
+            self.output.push_str("    if (status == SAO2_ARENA_COLLECTION_FAILED) sao2_fail(site, operation, scratch, sizeof scratch - 1);\n");
+            self.output.push_str("    sao2_compiler_invariant();\n}\n\n");
+
+            let _ = writeln!(self.output, "static bool sao2_map_entry_capacity_ty_{ty}(uint64_t required, uint64_t current, uint64_t *result) {{");
+            self.output.push_str("    uint64_t capacity;\n");
+            self.output.push_str("    if (result == NULL || required == 0 || required > (uint64_t)INT64_MAX || current > (uint64_t)INT64_MAX) return false;\n");
+            self.output.push_str("    capacity = current == 0 ? UINT64_C(4) : current;\n");
+            self.output.push_str("    while (capacity < required) {\n        if (capacity > (uint64_t)INT64_MAX / UINT64_C(2)) return false;\n        capacity *= UINT64_C(2);\n    }\n    *result = capacity; return true;\n}\n\n");
+
+            let _ = writeln!(self.output, "static bool sao2_map_slot_capacity_ty_{ty}(uint64_t required, uint64_t current, uint64_t *result) {{");
+            self.output.push_str("    uint64_t capacity;\n");
+            self.output.push_str("    if (result == NULL || required == 0 || required > (uint64_t)INT64_MAX || current > (uint64_t)INT64_MAX) return false;\n");
+            self.output.push_str("    if (current == 0) capacity = UINT64_C(8); else capacity = current;\n");
+            self.output.push_str("    while (required > capacity / UINT64_C(2)) {\n        if (capacity > (uint64_t)INT64_MAX / UINT64_C(2)) return false;\n        capacity *= UINT64_C(2);\n    }\n    *result = capacity; return true;\n}\n\n");
+
+            let _ = writeln!(self.output, "static {control} *sao2_map_control_ty_{ty}(sao2_ref reference) {{");
+            let _ = writeln!(self.output, "    {control} *value; uint64_t owner; const sao2_backing_prefix *entries_prefix; const sao2_backing_prefix *slots_prefix;");
+            self.output.push_str("    owner = (uint64_t)(reference.owner_ptr & ~SAO2_REF_OWNER_TAG_MASK);\n");
+            self.output.push_str("    if ((reference.owner_ptr & SAO2_REF_OWNER_TAG_MASK) != SAO2_REF_HEAP_TAG || reference.member_ptr != (uint32_t)owner || owner == 0) sao2_compiler_invariant();\n");
+            let _ = writeln!(self.output, "    value = ({control} *)sao2_resolve_body(reference, &sao2_layout_control_ty_{ty});");
+            self.output.push_str("    if (value->length > value->entry_capacity || value->length > value->slot_capacity / UINT64_C(2) || value->entry_capacity > (uint64_t)INT64_MAX || value->slot_capacity > (uint64_t)INT64_MAX) sao2_compiler_invariant();\n");
+            self.output.push_str("    if ((value->ordered_entries.owner_ptr == 0 && value->ordered_entries.member_ptr == 0) != (value->entry_capacity == 0) || (value->lookup_slots.owner_ptr == 0 && value->lookup_slots.member_ptr == 0) != (value->slot_capacity == 0)) sao2_compiler_invariant();\n");
+            self.output.push_str("    if (value->entry_capacity != 0) {\n");
+            let _ = writeln!(self.output, "        entries_prefix = (const sao2_backing_prefix *)sao2_resolve_body(value->ordered_entries, &{entry_layout});");
+            self.output.push_str("        if (entries_prefix->initialized != value->length || entries_prefix->capacity != value->entry_capacity) sao2_compiler_invariant();\n    }\n");
+            self.output.push_str("    if (value->slot_capacity != 0) {\n");
+            let _ = writeln!(self.output, "        slots_prefix = (const sao2_backing_prefix *)sao2_resolve_body(value->lookup_slots, &{slot_layout});");
+            self.output.push_str("        if (slots_prefix->initialized != value->length || slots_prefix->capacity != value->slot_capacity) sao2_compiler_invariant();\n    }\n    return value;\n}\n\n");
+
+            let _ = writeln!(self.output, "static bool sao2_map_find_ty_{ty}(sao2_ref reference, const {key_c_type} *wanted, uint64_t *entry_position, uint64_t *slot_position) {{");
+            self.output.push_str("    uint64_t hash, position, step; unsigned char *slots_body; const ");
+            let _ = writeln!(self.output, "{entry_record} *entries; {slot_record} *slots; {control} *control;");
+            self.output.push_str("    if (wanted == NULL || entry_position == NULL || slot_position == NULL) sao2_compiler_invariant();\n");
+            let _ = writeln!(self.output, "    control = sao2_map_control_ty_{ty}(reference);");
+            self.output.push_str("    if (control->length == 0) return false;\n");
+            let _ = writeln!(self.output, "    hash = {key_descriptor}.hash(wanted);\n");
+            let _ = writeln!(self.output, "    slots_body = sao2_resolve_body(control->lookup_slots, &{slot_layout});");
+            let _ = writeln!(self.output, "    slots = ({slot_record} *)(slots_body + UINT64_C({slot_offset}));");
+            let _ = writeln!(self.output, "    entries = (const {entry_record} *)(sao2_resolve_body(control->ordered_entries, &{entry_layout}) + UINT64_C({entry_offset}));");
+            self.output.push_str("    position = hash & (control->slot_capacity - UINT64_C(1));\n");
+            let _ = writeln!(self.output, "    for (step = 0; step < control->slot_capacity; ++step) {{\n        uint64_t encoded = slots[position];\n        if (encoded == 0) return false;\n        if (encoded > control->length) sao2_compiler_invariant();\n        if ({key_descriptor}.equal(&entries[encoded - UINT64_C(1)].key, wanted)) {{ *entry_position = encoded - UINT64_C(1); *slot_position = position; return true; }}\n        position = (position + UINT64_C(1)) & (control->slot_capacity - UINT64_C(1));\n    }}\n    sao2_compiler_invariant();\n}}\n\n");
+
+            let _ = writeln!(self.output, "static void sao2_map_rebuild_slots_ty_{ty}(uint64_t slot_capacity, uint64_t length, {slot_record} *slots, const {entry_record} *entries) {{");
+            self.output.push_str("    uint64_t index, position, step, hash;\n");
+            self.output.push_str("    if (slot_capacity == 0 || length > slot_capacity / UINT64_C(2) || slots == NULL || entries == NULL) sao2_compiler_invariant();\n");
+            self.output.push_str("    memset(slots, 0, (size_t)(slot_capacity * UINT64_C(8)));\n");
+            self.output.push_str("    for (index = 0; index < length; ++index) {\n");
+            let _ = writeln!(self.output, "        hash = {key_descriptor}.hash(&entries[index].key); position = hash & (slot_capacity - UINT64_C(1));");
+            self.output.push_str("        for (step = 0; step < slot_capacity; ++step) {\n            if (slots[position] == 0) { slots[position] = index + UINT64_C(1); break; }\n            position = (position + UINT64_C(1)) & (slot_capacity - UINT64_C(1));\n        }\n        if (step == slot_capacity) sao2_compiler_invariant();\n    }\n}\n\n");
+
+            let _ = writeln!(self.output, "static int64_t sao2_map_length_ty_{ty}(sao2_ref reference) {{ return (int64_t)sao2_map_control_ty_{ty}(reference)->length; }}\n");
+            let _ = writeln!(self.output, "static void sao2_check_map_iteration_unlocked_ty_{ty}(sao2_ref reference, size_t site) {{");
+            self.output.push_str("    uint32_t operation = sao2_failure(site)->operation;\n");
+            self.output.push_str("    if (operation != SAO2_FAILURE_MAP_INSERT && operation != SAO2_FAILURE_MAP_REMOVE_KEY) sao2_compiler_invariant();\n");
+            let _ = writeln!(self.output, "    if (sao2_map_control_ty_{ty}(reference)->lock_count != 0) {{");
+            self.output.push_str("        static const unsigned char reason[] = \"container structurally modified during iteration\";\n");
+            self.output.push_str("        sao2_fail(site, operation, reason, sizeof reason - 1);\n    }\n}\n\n");
+            let _ = writeln!(self.output, "static bool sao2_map_contains_ty_{ty}(sao2_ref reference, {key_c_type} key_value) {{ uint64_t entry, slot; return sao2_map_find_ty_{ty}(reference, &key_value, &entry, &slot); }}\n");
+
+            let _ = writeln!(self.output, "static void sao2_map_load_ty_{ty}(sao2_ref reference, const {key_c_type} *key_value, {value_c_type} *destination, size_t site);");
+            let _ = writeln!(self.output, "static {value_c_type} sao2_map_get_ty_{ty}(sao2_ref reference, const {key_c_type} *key_value, size_t site) {{");
+            let _ = writeln!(self.output, "    {value_c_type} value = {{0}};");
+            let _ = writeln!(self.output, "    sao2_map_load_ty_{ty}(reference, key_value, &value, site);");
+            self.output.push_str("    return value;\n}\n\n");
+
+            let _ = writeln!(self.output, "static void sao2_map_load_ty_{ty}(sao2_ref reference, const {key_c_type} *key_value, {value_c_type} *destination, size_t site) {{");
+            self.output.push_str("    uint64_t entry, slot; const ");
+            let _ = writeln!(self.output, "{entry_record} *entries;");
+            self.output.push_str("    if (destination == NULL) sao2_compiler_invariant();\n");
+            let _ = writeln!(self.output, "    if (!sao2_map_find_ty_{ty}(reference, key_value, &entry, &slot)) {{ static const unsigned char reason[] = \"map key not found\"; sao2_fail(site, SAO2_FAILURE_MAP_INDEX, reason, sizeof reason - 1); }}");
+            let _ = writeln!(self.output, "    entries = ({entry_record} *)(sao2_resolve_body(sao2_map_control_ty_{ty}(reference)->ordered_entries, &{entry_layout}) + UINT64_C({entry_offset}));");
+            let _ = writeln!(self.output, "    {value_descriptor}.copy(destination, &entries[entry].value); (void)slot;");
+            self.output.push_str("}\n\n");
+
+            let _ = writeln!(self.output, "static void sao2_map_store_existing_ty_{ty}(sao2_ref reference, const {key_c_type} *key_value, const {value_c_type} *source, size_t site) {{");
+            self.output.push_str("    uint64_t entry, slot; ");
+            let _ = writeln!(self.output, "{entry_record} *entries;");
+            self.output.push_str("    if (source == NULL) sao2_compiler_invariant();\n");
+            let _ = writeln!(self.output, "    if (!sao2_map_find_ty_{ty}(reference, key_value, &entry, &slot)) {{ static const unsigned char reason[] = \"map key not found\"; sao2_fail(site, SAO2_FAILURE_MAP_INDEX, reason, sizeof reason - 1); }}");
+            let _ = writeln!(self.output, "    entries = ({entry_record} *)(sao2_resolve_body(sao2_map_control_ty_{ty}(reference)->ordered_entries, &{entry_layout}) + UINT64_C({entry_offset}));");
+            let _ = writeln!(self.output, "    {value_descriptor}.copy(&entries[entry].value, source); (void)slot;");
+            self.output.push_str("}\n\n");
+
+            let _ = writeln!(self.output, "static void sao2_map_insert_ty_{ty}(sao2_ref reference, const {key_c_type} *key_value, const {value_c_type} *source, size_t site, {transaction} *transaction_frame) {{");
+            self.output.push_str("    uint64_t entry, slot, required, entry_capacity, slot_capacity, position, step, hash; sao2_arena_result status; ");
+            let _ = writeln!(self.output, "{control} *control; {entry_record} *entries; {slot_record} *slots; {entry_record} *new_entries; {slot_record} *new_slots; unsigned char *body;");
+            self.output.push_str("    if (key_value == NULL || source == NULL || transaction_frame == NULL) sao2_compiler_invariant();\n");
+            let _ = writeln!(self.output, "    control = sao2_map_control_ty_{ty}(reference); hash = {key_descriptor}.hash(key_value);");
+            let _ = writeln!(self.output, "    if (sao2_map_find_ty_{ty}(reference, key_value, &entry, &slot)) {{ entries = ({entry_record} *)(sao2_resolve_body(control->ordered_entries, &{entry_layout}) + UINT64_C({entry_offset})); {value_descriptor}.copy(&entries[entry].value, source); return; }}");
+            self.output.push_str("    sao2_require_operation(site, SAO2_FAILURE_MAP_INSERT);\n");
+            let _ = writeln!(self.output, "    if (control->lock_count != 0) {{ static const unsigned char reason[] = \"container structurally modified during iteration\"; sao2_fail(site, SAO2_FAILURE_MAP_INSERT, reason, sizeof reason - 1); }}");
+            self.output.push_str("    if (control->length >= (uint64_t)INT64_MAX) sao2_map_fail_ty_" );
+            let _ = writeln!(self.output, "{ty}(site, SAO2_FAILURE_MAP_INSERT, SAO2_ARENA_EXHAUSTED);");
+            self.output.push_str("    required = control->length + UINT64_C(1);\n");
+            let _ = writeln!(self.output, "    if (required <= control->entry_capacity && required <= control->slot_capacity / UINT64_C(2)) {{");
+            let _ = writeln!(self.output, "        body = sao2_resolve_body(control->ordered_entries, &{entry_layout}); entries = ({entry_record} *)(body + UINT64_C({entry_offset})); {key_descriptor}.copy(&entries[control->length].key, key_value); {value_descriptor}.copy(&entries[control->length].value, source); ((sao2_backing_prefix *)body)->initialized = required;");
+            let _ = writeln!(self.output, "        body = sao2_resolve_body(control->lookup_slots, &{slot_layout}); slots = ({slot_record} *)(body + UINT64_C({slot_offset})); position = hash & (control->slot_capacity - UINT64_C(1));");
+            self.output.push_str("        for (step = 0; step < control->slot_capacity; ++step) { if (slots[position] == 0) { slots[position] = control->length + UINT64_C(1); break; } position = (position + UINT64_C(1)) & (control->slot_capacity - UINT64_C(1)); }\n");
+            self.output.push_str("        if (step == control->slot_capacity) sao2_compiler_invariant();\n");
+            let _ = writeln!(self.output, "        ((sao2_backing_prefix *)body)->initialized = required; control->length = required; return;\n    }}");
+            let _ = writeln!(self.output, "    if (!sao2_map_entry_capacity_ty_{ty}(required, control->entry_capacity, &entry_capacity) || !sao2_map_slot_capacity_ty_{ty}(required, control->slot_capacity, &slot_capacity)) sao2_map_fail_ty_{ty}(site, SAO2_FAILURE_MAP_INSERT, SAO2_ARENA_EXHAUSTED);");
+            self.output.push_str("    transaction_frame->ordered_entries = (sao2_ref){0}; transaction_frame->lookup_slots = (sao2_ref){0};\n");
+            let _ = writeln!(self.output, "    status = sao2_allocate_container_backing_ty_{ty}_ordered_entries(entry_capacity, &transaction_frame->ordered_entries, &body); if (status != SAO2_ARENA_OK) sao2_map_fail_ty_{ty}(site, SAO2_FAILURE_MAP_INSERT, status);");
+            let _ = writeln!(self.output, "    status = sao2_allocate_container_backing_ty_{ty}_lookup_slots(slot_capacity, &transaction_frame->lookup_slots, &body); if (status != SAO2_ARENA_OK) sao2_map_fail_ty_{ty}(site, SAO2_FAILURE_MAP_INSERT, status);");
+            let _ = writeln!(self.output, "    control = sao2_map_control_ty_{ty}(reference); body = sao2_resolve_body(transaction_frame->ordered_entries, &{entry_layout}); new_entries = ({entry_record} *)(body + UINT64_C({entry_offset}));");
+            self.output.push_str("    if (control->length != 0) {\n");
+            let _ = writeln!(self.output, "        entries = (const {entry_record} *)(sao2_resolve_body(control->ordered_entries, &{entry_layout}) + UINT64_C({entry_offset})); for (entry = 0; entry < control->length; ++entry) {{ {key_descriptor}.copy(&new_entries[entry].key, &entries[entry].key); {value_descriptor}.copy(&new_entries[entry].value, &entries[entry].value); ((sao2_backing_prefix *)body)->initialized = entry + UINT64_C(1); }}");
+            self.output.push_str("    }\n");
+            let _ = writeln!(self.output, "    {key_descriptor}.copy(&new_entries[control->length].key, key_value); {value_descriptor}.copy(&new_entries[control->length].value, source); ((sao2_backing_prefix *)body)->initialized = required;");
+            let _ = writeln!(self.output, "    body = sao2_resolve_body(transaction_frame->lookup_slots, &{slot_layout}); new_slots = ({slot_record} *)(body + UINT64_C({slot_offset}));");
+            let _ = writeln!(self.output, "    sao2_map_rebuild_slots_ty_{ty}(slot_capacity, required, new_slots, new_entries); ((sao2_backing_prefix *)body)->initialized = required;");
+            self.output.push_str("    control = sao2_map_control_ty_" );
+            let _ = writeln!(self.output, "{ty}(reference); control->ordered_entries = transaction_frame->ordered_entries; control->lookup_slots = transaction_frame->lookup_slots; control->entry_capacity = entry_capacity; control->slot_capacity = slot_capacity; control->length = required;\n}}\n\n");
+
+            let _ = writeln!(self.output, "static void sao2_map_remove_ty_{ty}(sao2_ref reference, const {key_c_type} *key_value, size_t site) {{");
+            self.output.push_str("    uint64_t entry, slot, index; ");
+            let _ = writeln!(self.output, "{control} *control; {entry_record} *entries; {slot_record} *slots; unsigned char *entry_body, *slot_body;");
+            let _ = writeln!(self.output, "    control = sao2_map_control_ty_{ty}(reference); sao2_require_operation(site, SAO2_FAILURE_MAP_REMOVE_KEY); if (control->lock_count != 0) {{ static const unsigned char reason[] = \"container structurally modified during iteration\"; sao2_fail(site, SAO2_FAILURE_MAP_REMOVE_KEY, reason, sizeof reason - 1); }}");
+            let _ = writeln!(self.output, "    if (!sao2_map_find_ty_{ty}(reference, key_value, &entry, &slot)) {{ static const unsigned char reason[] = \"map key not found\"; sao2_fail(site, SAO2_FAILURE_MAP_REMOVE_KEY, reason, sizeof reason - 1); }}");
+            let _ = writeln!(self.output, "    entry_body = sao2_resolve_body(control->ordered_entries, &{entry_layout}); entries = ({entry_record} *)(entry_body + UINT64_C({entry_offset})); for (index = entry; index + UINT64_C(1) < control->length; ++index) {{ {key_descriptor}.copy(&entries[index].key, &entries[index + UINT64_C(1)].key); {value_descriptor}.copy(&entries[index].value, &entries[index + UINT64_C(1)].value); }}");
+            self.output.push_str("    if (control->length == 0) sao2_compiler_invariant();\n");
+            let _ = writeln!(self.output, "    index = control->length - UINT64_C(1); memset(&entries[index], 0, sizeof entries[index]); ((sao2_backing_prefix *)entry_body)->initialized = index;");
+            let _ = writeln!(self.output, "    slot_body = sao2_resolve_body(control->lookup_slots, &{slot_layout}); slots = ({slot_record} *)(slot_body + UINT64_C({slot_offset})); sao2_map_rebuild_slots_ty_{ty}(control->slot_capacity, index, slots, entries); ((sao2_backing_prefix *)slot_body)->initialized = index; control->length = index;\n}}\n\n");
+
+            let _ = writeln!(self.output, "static void sao2_map_construct_ty_{ty}(sao2_ref *destination, const {key_c_type} *keys, const {value_c_type} *values, uint64_t count, size_t site, {transaction} *transaction_frame) {{");
+            self.output.push_str("    uint64_t entry_capacity, slot_capacity, index, existing, unique; sao2_arena_result status; unsigned char *body; ");
+            let _ = writeln!(self.output, "{control} *control; {entry_record} *entries; {slot_record} *slots;");
+            self.output.push_str("    if (destination == NULL || transaction_frame == NULL || (count != 0 && (keys == NULL || values == NULL))) sao2_compiler_invariant();\n");
+            let _ = writeln!(self.output, "    *destination = (sao2_ref){{0}}; status = sao2_allocate_container_control_ty_{ty}(destination, &body); if (status != SAO2_ARENA_OK) sao2_map_fail_ty_{ty}(site, SAO2_FAILURE_MAP_ALLOCATION, status); memset(body, 0, sizeof({control})); if (count == 0) return;");
+            let _ = writeln!(self.output, "    if (!sao2_map_entry_capacity_ty_{ty}(count, UINT64_C(0), &entry_capacity) || !sao2_map_slot_capacity_ty_{ty}(count, UINT64_C(0), &slot_capacity)) sao2_map_fail_ty_{ty}(site, SAO2_FAILURE_MAP_ALLOCATION, SAO2_ARENA_EXHAUSTED);");
+            self.output.push_str("    transaction_frame->ordered_entries = (sao2_ref){0}; transaction_frame->lookup_slots = (sao2_ref){0};\n");
+            let _ = writeln!(self.output, "    status = sao2_allocate_container_backing_ty_{ty}_ordered_entries(entry_capacity, &transaction_frame->ordered_entries, &body); if (status != SAO2_ARENA_OK) sao2_map_fail_ty_{ty}(site, SAO2_FAILURE_MAP_ALLOCATION, status);");
+            let _ = writeln!(self.output, "    status = sao2_allocate_container_backing_ty_{ty}_lookup_slots(slot_capacity, &transaction_frame->lookup_slots, &body); if (status != SAO2_ARENA_OK) sao2_map_fail_ty_{ty}(site, SAO2_FAILURE_MAP_ALLOCATION, status);");
+            let _ = writeln!(self.output, "    body = sao2_resolve_body(transaction_frame->ordered_entries, &{entry_layout}); entries = ({entry_record} *)(body + UINT64_C({entry_offset})); control = ({control} *)sao2_resolve_body(*destination, &sao2_layout_control_ty_{ty});");
+            self.output.push_str("    unique = 0;\n    for (index = 0; index < count; ++index) {\n        for (existing = 0; existing < unique; ++existing) { if (" );
+            let _ = writeln!(self.output, "{key_descriptor}.equal(&entries[existing].key, &keys[index])) break; }}");
+            self.output.push_str("        if (existing == unique) { ");
+            let _ = writeln!(self.output, "{key_descriptor}.copy(&entries[unique].key, &keys[index]); {value_descriptor}.copy(&entries[unique].value, &values[index]); unique += UINT64_C(1); ((sao2_backing_prefix *)body)->initialized = unique; }} else {{ {value_descriptor}.copy(&entries[existing].value, &values[index]); }}");
+            self.output.push_str("    }\n");
+            let _ = writeln!(self.output, "    body = sao2_resolve_body(transaction_frame->lookup_slots, &{slot_layout}); slots = ({slot_record} *)(body + UINT64_C({slot_offset})); sao2_map_rebuild_slots_ty_{ty}(slot_capacity, unique, slots, entries); ((sao2_backing_prefix *)body)->initialized = unique; control = ({control} *)sao2_resolve_body(*destination, &sao2_layout_control_ty_{ty}); control->ordered_entries = transaction_frame->ordered_entries; control->lookup_slots = transaction_frame->lookup_slots; control->entry_capacity = entry_capacity; control->slot_capacity = slot_capacity; control->length = unique;\n}}\n\n");
         }
     }
 
@@ -2769,7 +2953,7 @@ impl<'a> Renderer<'a> {
         operation_index: usize, function: &Function, operation: &OperationKind) {
         match operation {
             OperationKind::Copy { destination, operand } => {
-                if operand_has_list_projection(operand) {
+                if operand_has_container_projection(operand) {
                     let Operand::Copy(place) = operand else { unreachable!() };
                     self.render_projected_copy(function, *destination, place);
                 } else {
@@ -2802,7 +2986,7 @@ impl<'a> Renderer<'a> {
             }
             OperationKind::Assign { destination, value } => {
                 let value = self.operand(value);
-                if place_has_list_projection(destination) {
+                if place_has_container_projection(destination) {
                     self.render_projected_assignment(function, destination, &value);
                 } else if let Some((definition, field)) = self.inline_assignment(destination) {
                     let destination_ref = self.inline_destination_reference(destination, definition, field);
@@ -2867,6 +3051,9 @@ impl<'a> Renderer<'a> {
             OperationKind::Aggregate { destination, aggregate: ir::Aggregate::List { ty, elements, failure } } => {
                 self.render_list_aggregate(*destination, *ty, elements, *failure);
             }
+            OperationKind::Aggregate { destination, aggregate: ir::Aggregate::Map { ty, entries, failure } } => {
+                self.render_map_aggregate(*destination, *ty, entries, *failure);
+            }
             OperationKind::Builtin { destination, method: ir::BuiltinMethod::StrLen, receiver, .. } => {
                 let receiver = self.operand(receiver);
                 let _ = writeln!(self.output, "    {} = sao2_string_length({receiver});", self.local(*destination));
@@ -2890,8 +3077,28 @@ impl<'a> Renderer<'a> {
                 let _ = writeln!(self.output, "    sao2_list_remove_ty_{}({receiver_value}, {argument}, {});", list_ty.index(), failure.index());
                 let _ = writeln!(self.output, "    {} = (sao2_unit){{0}};", self.local(*destination));
             }
+            OperationKind::Builtin { destination, method: ir::BuiltinMethod::MapLen, receiver, .. } => {
+                let map_ty = self.map_type_index(function, receiver);
+                let receiver = self.operand(receiver);
+                let _ = writeln!(self.output, "    {} = sao2_map_length_ty_{}({receiver});", self.local(*destination), map_ty.index());
+            }
+            OperationKind::Builtin { destination, method: ir::BuiltinMethod::MapRemoveKey, receiver, arguments, failure: Some(failure) } => {
+                let receiver_value = self.operand(receiver);
+                let map_ty = self.map_type_index(function, receiver);
+                let argument = self.operand(arguments.first().expect("validated removeKey argument"));
+                let key_ty = match &self.program.types[map_ty.index()] {
+                    Type::Map { key, .. } => *key,
+                    _ => unreachable!("validated map receiver"),
+                };
+                let key_name = format!("sao2_map_remove_key_{}_{}", destination.index(), operation_index);
+                self.output.push_str("    {\n");
+                let _ = writeln!(self.output, "    {} {key_name} = {argument};", self.c_type(key_ty));
+                let _ = writeln!(self.output, "    sao2_map_remove_ty_{}({receiver_value}, &{key_name}, {});", map_ty.index(), failure.index());
+                let _ = writeln!(self.output, "    {} = (sao2_unit){{0}};", self.local(*destination));
+                self.output.push_str("    }\n");
+            }
             OperationKind::Check(check) => self.render_check(function, check),
-            OperationKind::Aggregate { .. } | OperationKind::Builtin { .. }
+            OperationKind::Builtin { .. }
             | OperationKind::BeginIteration { .. } | OperationKind::EndIteration { .. }
             | OperationKind::IterationValue { .. } => unreachable!("capability validation rejected operation"),
         }
@@ -2968,6 +3175,39 @@ impl<'a> Renderer<'a> {
         self.output.push_str("    }\n");
     }
 
+    fn render_map_aggregate(&mut self, destination: LocalId, ty: TypeId,
+        entries: &[(Operand, Operand)], failure: FailureSiteId) {
+        let Type::Map { key, value } = self.program.types[ty.index()] else {
+            unreachable!("validated map aggregate type")
+        };
+        let transaction = format!("sao2_map_transaction_ty_{}", ty.index());
+        let id = destination.index();
+        let destination_name = self.local(destination);
+
+        self.output.push_str("    {\n");
+        let _ = writeln!(self.output, "    {transaction} sao2_map_transaction_{id} = {{0}};");
+        let _ = writeln!(self.output, "    sao2_map_transaction_{id}.header.trace = sao2_trace_{transaction};");
+        self.output.push_str("    sao2_shadow_link(&sao2_map_transaction_" );
+        let _ = writeln!(self.output, "{id}.header);");
+        if !entries.is_empty() {
+            let key_type = self.c_type(key);
+            let value_type = self.c_type(value);
+            let _ = writeln!(self.output, "    {key_type} sao2_map_keys_{id}[{}];", entries.len());
+            let _ = writeln!(self.output, "    {value_type} sao2_map_values_{id}[{}];", entries.len());
+            for (index, (key_operand, value_operand)) in entries.iter().enumerate() {
+                let key_value = self.operand(key_operand);
+                let value_value = self.operand(value_operand);
+                let _ = writeln!(self.output, "    sao2_map_keys_{id}[{index}] = {key_value};");
+                let _ = writeln!(self.output, "    sao2_map_values_{id}[{index}] = {value_value};");
+            }
+            let _ = writeln!(self.output, "    sao2_map_construct_ty_{}(&{destination_name}, sao2_map_keys_{id}, sao2_map_values_{id}, UINT64_C({}), {}, &sao2_map_transaction_{id});", ty.index(), entries.len(), failure.index());
+        } else {
+            let _ = writeln!(self.output, "    sao2_map_construct_ty_{}(&{destination_name}, NULL, NULL, UINT64_C(0), {}, &sao2_map_transaction_{id});", ty.index(), failure.index());
+        }
+        let _ = writeln!(self.output, "    sao2_shadow_unlink(&sao2_map_transaction_{id}.header);");
+        self.output.push_str("    }\n");
+    }
+
     fn render_projected_copy(&mut self, function: &Function, destination: LocalId, place: &Place) {
         let mut expression = self.local(place.local);
         let mut ty = function.locals[place.local.index()].ty;
@@ -3002,7 +3242,17 @@ impl<'a> Renderer<'a> {
                     }
                     ty = field_layout.ty;
                 }
-                Projection::MapIndex { .. } => unreachable!("capability validation rejected map projection"),
+                Projection::MapIndex { key: key_local, failure, .. } => {
+                    let Type::Map { value, .. } = self.program.types[ty.index()] else {
+                        unreachable!("validated map projection")
+                    };
+                    let value_name = format!("sao2_projected_value_{}_{}", destination.index(), index);
+                    let value_type = self.c_type(value);
+                    let _ = writeln!(self.output, "    {value_type} {value_name} = {{0}};");
+                    let _ = writeln!(self.output, "    sao2_map_load_ty_{}({expression}, &{}, &{value_name}, {});", ty.index(), self.local(*key_local), failure.index());
+                    expression = value_name;
+                    ty = value;
+                }
             }
         }
         let _ = writeln!(self.output, "    {} = {expression};", self.local(destination));
@@ -3066,7 +3316,37 @@ impl<'a> Renderer<'a> {
                     }
                     ty = field_layout.ty;
                 }
-                Projection::MapIndex { .. } => unreachable!("capability validation rejected map assignment projection"),
+                Projection::MapIndex { key: key_local, failure, mode } => {
+                    let Type::Map { value: element, .. } = self.program.types[ty.index()] else {
+                        unreachable!("validated map assignment projection")
+                    };
+                    let key = self.local(*key_local);
+                    if is_last {
+                        let value_type = self.c_type(element);
+                        let _ = writeln!(self.output, "    {value_type} {value_name} = {value};");
+                        match mode {
+                            MapAccessMode::Read => {
+                                let _ = writeln!(self.output, "    sao2_map_store_existing_ty_{}({expression}, &{key}, &{value_name}, {});", ty.index(), failure.index());
+                            }
+                            MapAccessMode::Insert => {
+                                let transaction = format!("sao2_map_transaction_ty_{}", ty.index());
+                                let transaction_name = format!("sao2_map_transaction_assign_{}_{}", place.local.index(), index);
+                                let _ = writeln!(self.output, "    {transaction} {transaction_name} = {{0}};");
+                                let _ = writeln!(self.output, "    {transaction_name}.header.trace = sao2_trace_{transaction};");
+                                let _ = writeln!(self.output, "    sao2_shadow_link(&{transaction_name}.header);");
+                                let _ = writeln!(self.output, "    sao2_map_insert_ty_{}({expression}, &{key}, &{value_name}, {}, &{transaction_name});", ty.index(), failure.index());
+                                let _ = writeln!(self.output, "    sao2_shadow_unlink(&{transaction_name}.header);");
+                            }
+                        }
+                    } else {
+                        let value_name = format!("sao2_assignment_projection_{}_{}", place.local.index(), index);
+                        let value_type = self.c_type(element);
+                        let _ = writeln!(self.output, "    {value_type} {value_name} = {{0}};");
+                        let _ = writeln!(self.output, "    sao2_map_load_ty_{}({expression}, &{key}, &{value_name}, {});", ty.index(), failure.index());
+                        expression = value_name;
+                    }
+                    ty = element;
+                }
             }
         }
         self.output.push_str("    }\n");
@@ -3215,9 +3495,16 @@ impl<'a> Renderer<'a> {
 
     fn render_check(&mut self, function: &Function, check: &RuntimeCheck) {
         if let RuntimeCheck::IterationUnlocked { receiver, failure } = check {
-            let list_ty = self.list_type_index(function, receiver);
-            let receiver = self.operand(receiver);
-            let _ = writeln!(self.output, "    sao2_check_list_iteration_unlocked_ty_{}({receiver}, {});", list_ty.index(), failure.index());
+            let receiver_operand = receiver;
+            let receiver = self.operand(receiver_operand);
+            let receiver_ty = self.operand_type(function, receiver_operand);
+            if matches!(self.program.types[receiver_ty.index()], Type::List(_)) {
+                let list_ty = self.list_type_index(function, receiver_operand);
+                let _ = writeln!(self.output, "    sao2_check_list_iteration_unlocked_ty_{}({receiver}, {});", list_ty.index(), failure.index());
+            } else {
+                let map_ty = self.map_type_index(function, receiver_operand);
+                let _ = writeln!(self.output, "    sao2_check_map_iteration_unlocked_ty_{}({receiver}, {});", map_ty.index(), failure.index());
+            }
             return;
         }
         let (helper, operands, failure) = match check {
@@ -3284,6 +3571,9 @@ impl<'a> Renderer<'a> {
     fn binary_expression(&self, operator: BinaryOperator, ty: TypeId, right_ty: TypeId, left: &str, right: &str) -> String {
         if operator == BinaryOperator::In && matches!(self.program.types[right_ty.index()], Type::List(_)) {
             return format!("{}({right}, {left})", self.list_contains_helper(right_ty));
+        }
+        if operator == BinaryOperator::In && matches!(self.program.types[right_ty.index()], Type::Map { .. }) {
+            return format!("{}({right}, {left})", self.map_contains_helper(right_ty));
         }
         if matches!(&self.program.types[ty.index()], Type::Primitive(PrimitiveType::Str)) {
             return match operator {
@@ -3397,6 +3687,20 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    fn map_type_index(&self, function: &Function, operand: &Operand) -> TypeId {
+        let ty = self.operand_type(function, operand);
+        if matches!(self.program.types[ty.index()], Type::Map { .. }) { ty }
+        else { unreachable!("validated map operand") }
+    }
+
+    fn map_contains_helper(&self, ty: TypeId) -> String {
+        if matches!(self.program.types[ty.index()], Type::Map { .. }) {
+            format!("sao2_map_contains_ty_{}", ty.index())
+        } else {
+            unreachable!("validated map membership type")
+        }
+    }
+
     fn union_alternatives(&self, ty: TypeId) -> Option<&[ir::UnionAlternative]> {
         match &self.program.types[ty.index()] {
             Type::Union(alternatives) => Some(alternatives),
@@ -3452,8 +3756,12 @@ impl<'a> Renderer<'a> {
                     rendered = format!("sao2_list_get_ty_{}({rendered}, {}, {})", ty.index(), self.local(*index), failure.index());
                     ty = element;
                 }
-                Projection::MapIndex { .. } => {
-                    unreachable!("capability validation rejected map projection")
+                Projection::MapIndex { key, failure, .. } => {
+                    let Type::Map { value, .. } = self.program.types[ty.index()] else {
+                        unreachable!("validated map projection")
+                    };
+                    rendered = format!("sao2_map_get_ty_{}({rendered}, &{}, {})", ty.index(), self.local(*key), failure.index());
+                    ty = value;
                 }
             }
         }
@@ -3513,7 +3821,10 @@ impl<'a> Renderer<'a> {
                     element
                 }
                 Projection::MapIndex { .. } => {
-                    unreachable!("capability validation rejected map projection")
+                    let Type::Map { value, .. } = self.program.types[ty.index()] else {
+                        unreachable!("validated map projection")
+                    };
+                    value
                 }
             };
         }
@@ -3561,6 +3872,7 @@ const ALL_FAILURE_OPERATIONS: &[FailureOperation] = &[
     FailureOperation::MapRemoveKey, FailureOperation::Output,
     FailureOperation::ExplicitPanic, FailureOperation::UnhandledError,
     FailureOperation::StructAllocation, FailureOperation::ListAllocation,
+    FailureOperation::MapAllocation, FailureOperation::MapInsert,
 ];
 
 fn failure_operation_code(operation: FailureOperation) -> u32 {
@@ -3589,6 +3901,8 @@ fn failure_operation_code(operation: FailureOperation) -> u32 {
         FailureOperation::UnhandledError => 21,
         FailureOperation::StructAllocation => 22,
         FailureOperation::ListAllocation => 23,
+        FailureOperation::MapAllocation => 24,
+        FailureOperation::MapInsert => 25,
     }
 }
 
@@ -3615,6 +3929,8 @@ fn failure_operation_macro(operation: FailureOperation) -> &'static str {
         FailureOperation::MapRemoveKey => "SAO2_FAILURE_MAP_REMOVE_KEY",
         FailureOperation::StructAllocation => "SAO2_FAILURE_STRUCT_ALLOCATION",
         FailureOperation::ListAllocation => "SAO2_FAILURE_LIST_ALLOCATION",
+        FailureOperation::MapAllocation => "SAO2_FAILURE_MAP_ALLOCATION",
+        FailureOperation::MapInsert => "SAO2_FAILURE_MAP_INSERT",
         FailureOperation::Output => "SAO2_FAILURE_OUTPUT",
         FailureOperation::ExplicitPanic => "SAO2_FAILURE_EXPLICIT_PANIC",
         FailureOperation::UnhandledError => "SAO2_FAILURE_UNHANDLED_ERROR",
@@ -5403,38 +5719,13 @@ fn trace_aggregate_suffix(aggregate: AggregateId) -> String {
     }
 }
 
-fn place_has_unsupported_read_projection(place: &Place) -> bool {
+fn place_has_container_projection(place: &Place) -> bool {
     place.projections.iter().any(|projection| matches!(projection,
-        Projection::MapIndex { .. }))
+        Projection::ListIndex { .. } | Projection::MapIndex { .. }))
 }
 
-fn place_has_list_projection(place: &Place) -> bool {
-    place.projections.iter().any(|projection| matches!(projection,
-        Projection::ListIndex { .. }))
-}
-
-fn operand_has_list_projection(operand: &Operand) -> bool {
-    matches!(operand, Operand::Copy(place) if place_has_list_projection(place))
-}
-
-fn operation_operands_have_unsupported_projection(operation: &OperationKind) -> bool {
-    let mut found = false;
-    visit_operation_operands(operation, &mut |operand| {
-        if let Operand::Copy(place) = operand {
-            found |= place_has_unsupported_read_projection(place);
-        }
-    });
-    found
-}
-
-fn terminator_operands_have_unsupported_projection(terminator: &TerminatorKind) -> bool {
-    let mut found = false;
-    visit_terminator_operands(terminator, &mut |operand| {
-        if let Operand::Copy(place) = operand {
-            found |= place_has_unsupported_read_projection(place);
-        }
-    });
-    found
+fn operand_has_container_projection(operand: &Operand) -> bool {
+    matches!(operand, Operand::Copy(place) if place_has_container_projection(place))
 }
 
 #[cfg(test)]

@@ -308,6 +308,93 @@ fn runs_complete_list_operations_and_aliasing() {
 }
 
 #[test]
+fn runs_ordered_map_operations_and_reinsertion() {
+    let directory = TestDirectory::new("map operations");
+    let source = br#"
+        fn main() {
+            var values := {1: 10, 2: 20, 1: 30};
+            println(values.len());
+            println(values[1]);
+            values[2] = 22;
+            values[3] = 33;
+            println(values.len());
+            println(2 in values);
+            values.removeKey(2);
+            println(values.len());
+            println(2 in values);
+            values[2] = 222;
+            println(values.len());
+            println(values[2]);
+        }
+    "#;
+    let output = run_source(&directory, source);
+    assert!(!compiler_is_missing(&output), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"2\n30\n3\ntrue\n2\nfalse\n3\n222\n");
+}
+
+#[test]
+fn runs_maps_with_reference_values_and_nested_projection() {
+    let directory = TestDirectory::new("map reference values");
+    let source = br#"
+        fn main() {
+            var groups := {1: [10]};
+            groups[1].append(11);
+            groups[1][0] = 12;
+            groups[2] = [20, 21];
+            groups[3] = [30];
+            groups[4] = [40];
+            groups[5] = [50];
+            groups[6] = [60];
+            println(groups.len());
+            println(groups[1][0]);
+            println(groups[1][-1]);
+            println(groups[5][0]);
+            var nested := {1: {2: 20}};
+            nested[1][3] = 30;
+            println(nested[1].len());
+            println(nested[1][3]);
+        }
+    "#;
+    let output = run_source(&directory, source);
+    assert!(!compiler_is_missing(&output), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"6\n12\n11\n50\n2\n30\n");
+}
+
+#[test]
+fn runs_string_and_tuple_map_keys() {
+    let directory = TestDirectory::new("map key shapes");
+    let source = br#"
+        type Key(int, str);
+        fn main() {
+            var names := {"one": 1, "two": 2};
+            println(names["two"]);
+            println("one" in names);
+            var tuples := {Key(1, "one"): 10};
+            println(Key(1, "one") in tuples);
+            println(tuples[Key(1, "one")]);
+        }
+    "#;
+    let output = run_source(&directory, source);
+    assert!(!compiler_is_missing(&output), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"2\ntrue\ntrue\n10\n");
+}
+
+#[test]
+fn reports_missing_map_keys_as_language_panics() {
+    let directory = TestDirectory::new("map missing key");
+    let output = run_source(&directory, b"fn main() { values := {1: 10}; values[2]; }");
+    assert!(!compiler_is_missing(&output), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("sao2: panic: map key not found"), "{stderr}");
+    assert!(stderr.contains("program with spaces.sao2:1:"), "{stderr}");
+}
+
+#[test]
 fn runs_nested_lists_and_union_membership() {
     let directory = TestDirectory::new("nested lists");
     let source = br#"

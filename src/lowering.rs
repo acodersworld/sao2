@@ -490,7 +490,8 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
             ExpressionKind::TypedEmptyMap(_) => {
                 let raw = self.raw_type(expression)?;
                 let ty = self.ty(raw)?;
-                self.aggregate(expression, ir::Aggregate::Map { ty, entries: Vec::new() })?
+                let failure = self.failure(expression.span, ir::FailureOperation::MapAllocation)?;
+                self.aggregate(expression, ir::Aggregate::Map { ty, entries: Vec::new(), failure })?
             }
             ExpressionKind::Call { arguments, .. } => return self.call(expression, arguments),
             ExpressionKind::Member { value, .. } => return self.member(expression, value),
@@ -646,7 +647,8 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
         }
         let raw = self.raw_type(expression)?;
         let ty = self.ty(raw)?;
-        Ok(Some(self.aggregate(expression, ir::Aggregate::Map { ty, entries: values })?))
+        let failure = self.failure(expression.span, ir::FailureOperation::MapAllocation)?;
+        Ok(Some(self.aggregate(expression, ir::Aggregate::Map { ty, entries: values, failure })?))
     }
 
     fn call(&mut self, expression: &'ast Expression, arguments: &'ast [Argument]) -> Result<Option<ir::Operand>, LoweringError> {
@@ -781,7 +783,7 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
             }
             ProjectionKind::Map { .. } => {
                 let failure = self.failure(index.span, ir::FailureOperation::MapIndex)?;
-                place.projections.push(ir::Projection::MapIndex { key: index_place.local, failure });
+                place.projections.push(ir::Projection::MapIndex { key: index_place.local, failure, mode: ir::MapAccessMode::Read });
             }
             _ => return Err(invariant("index expression has a non-index projection")),
         }
@@ -1282,7 +1284,7 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
             let ir::Operand::Copy(root_place) = root_operand else { unreachable!() };
             place = root_place;
         }
-        for step in annotation.steps.iter() {
+        for (step_index, step) in annotation.steps.iter().enumerate() {
             match step {
                 AccessPathStep::StructMember { declaration, field, storage, .. } => place.projections.push(ir::Projection::StructField { definition: self.definition(*declaration)?, field: self.field(*declaration, *field)?, storage: map_storage(*storage) }),
                 AccessPathStep::TupleMember { declaration, position, .. } => place.projections.push(ir::Projection::TupleField { definition: self.definition(*declaration)?, field: self.field(*declaration, *position)? }),
@@ -1293,7 +1295,16 @@ impl<'a, 'b, 'source, 'ast> BodyLowerer<'a, 'b, 'source, 'ast> {
                     let projection = if matches!(step, AccessPathStep::ListIndex { .. }) {
                         ir::Projection::ListIndex { index: index_place.local, failure: self.failure(suffix.span, ir::FailureOperation::ListIndex)? }
                     } else {
-                        ir::Projection::MapIndex { key: index_place.local, failure: self.failure(suffix.span, ir::FailureOperation::MapIndex)? }
+                        let mode = if operator == AssignmentOperator::Assign && step_index + 1 == annotation.steps.len() {
+                            ir::MapAccessMode::Insert
+                        } else {
+                            ir::MapAccessMode::Read
+                        };
+                        let operation = match mode {
+                            ir::MapAccessMode::Read => ir::FailureOperation::MapIndex,
+                            ir::MapAccessMode::Insert => ir::FailureOperation::MapInsert,
+                        };
+                        ir::Projection::MapIndex { key: index_place.local, failure: self.failure(suffix.span, operation)?, mode }
                     };
                     place.projections.push(projection);
                 }

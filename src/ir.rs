@@ -245,8 +245,11 @@ pub(crate) enum Projection {
     StructField { definition: DefinitionId, field: FieldId, storage: MemberStorage },
     TupleField { definition: DefinitionId, field: FieldId },
     ListIndex { index: LocalId, failure: FailureSiteId },
-    MapIndex { key: LocalId, failure: FailureSiteId },
+    MapIndex { key: LocalId, failure: FailureSiteId, mode: MapAccessMode },
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MapAccessMode { Read, Insert }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ConstantValue {
@@ -285,7 +288,7 @@ pub(crate) enum Aggregate {
     Struct { definition: DefinitionId, fields: Vec<(FieldId, Operand)>, failure: FailureSiteId },
     Tuple { definition: DefinitionId, elements: Vec<Operand> },
     List { ty: TypeId, elements: Vec<Operand>, failure: FailureSiteId },
-    Map { ty: TypeId, entries: Vec<(Operand, Operand)> },
+    Map { ty: TypeId, entries: Vec<(Operand, Operand)>, failure: FailureSiteId },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -306,7 +309,7 @@ pub(crate) enum FailureOperation {
     FloatAdd, FloatSubtract, FloatMultiply, FloatDivision, FloatToInt,
     ListIndex, MapIndex, StringIndex, ListAppend, ListRemoveIndex,
     MapRemoveKey, StructAllocation, Output, ExplicitPanic, UnhandledError,
-    ListAllocation,
+    ListAllocation, MapAllocation, MapInsert,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -586,7 +589,7 @@ impl Renderer<'_, '_> {
             Aggregate::Struct { definition, fields, failure } => format!("struct {definition} {{{}}} ! {failure}", fields.iter().map(|(field, operand)| format!("{field}: {}", self.operand(operand))).collect::<Vec<_>>().join(", ")),
             Aggregate::Tuple { definition, elements } => format!("tuple {definition}({})", self.operands(elements)),
             Aggregate::List { ty, elements, failure } => format!("list {ty}[{}] ! {failure}", self.operands(elements)),
-            Aggregate::Map { ty, entries } => format!("map {ty} {{{}}}", entries.iter().map(|(key, value)| format!("{}: {}", self.operand(key), self.operand(value))).collect::<Vec<_>>().join(", ")),
+            Aggregate::Map { ty, entries, failure } => format!("map {ty} {{{}}} ! {failure}", entries.iter().map(|(key, value)| format!("{}: {}", self.operand(key), self.operand(value))).collect::<Vec<_>>().join(", ")),
         }
     }
 
@@ -640,7 +643,7 @@ impl Renderer<'_, '_> {
                 Projection::StructField { definition, field, storage } => { let _ = write!(rendered, ".{definition}.{field}:{}", storage_name(*storage)); }
                 Projection::TupleField { definition, field } => { let _ = write!(rendered, ".{definition}.{field}"); }
                 Projection::ListIndex { index, failure } => { let _ = write!(rendered, "[{index} ! {failure}]"); }
-                Projection::MapIndex { key, failure } => { let _ = write!(rendered, "[key {key} ! {failure}]"); }
+                Projection::MapIndex { key, failure, mode } => { let _ = write!(rendered, "[key {key} ! {failure} {}]", map_access_mode_name(*mode)); }
             }
         }
         rendered
@@ -691,7 +694,9 @@ fn escape_bytes(bytes: &[u8]) -> String {
     FailureOperation::MapRemoveKey => "map-remove-key", FailureOperation::StructAllocation => "struct-allocation", FailureOperation::Output => "output",
     FailureOperation::ExplicitPanic => "explicit-panic", FailureOperation::UnhandledError => "unhandled-error",
     FailureOperation::ListAllocation => "list-allocation",
+    FailureOperation::MapAllocation => "map-allocation", FailureOperation::MapInsert => "map-insert",
 } }
+#[allow(dead_code)] fn map_access_mode_name(value: MapAccessMode) -> &'static str { match value { MapAccessMode::Read => "read", MapAccessMode::Insert => "insert" } }
 fn runtime_check_failure(check: &RuntimeCheck) -> FailureSiteId { match check {
     RuntimeCheck::IntegerOverflow { failure, .. } | RuntimeCheck::IntegerNegation { failure, .. }
     | RuntimeCheck::Division { failure, .. } | RuntimeCheck::Remainder { failure, .. }
@@ -823,7 +828,7 @@ mod tests {
         let main_identity = FunctionId::from_index(1);
         let site = |program: &mut Program, operation| program.intern_failure_site(FailureSite { location, function: main_identity, operation, line: 1, column: 5 });
         let list_index_failure = site(&mut program, FailureOperation::ListIndex);
-        let map_index_failure = site(&mut program, FailureOperation::MapIndex);
+        let _map_index_failure = site(&mut program, FailureOperation::MapIndex);
         let string_index_failure = site(&mut program, FailureOperation::StringIndex);
         let struct_allocation_failure = site(&mut program, FailureOperation::StructAllocation);
         let output_failure = site(&mut program, FailureOperation::Output);
@@ -862,7 +867,9 @@ mod tests {
             Operand::Copy(Place::local(input)), constant(types.float, ConstantValue::Float(0)),
         ] } }, location);
         entry.push(OperationKind::Aggregate { destination: list_local, aggregate: Aggregate::List { ty: list_type, elements: vec![integer(&types, 1)], failure: list_allocation_failure } }, location);
-        entry.push(OperationKind::Aggregate { destination: map_local, aggregate: Aggregate::Map { ty: map_type, entries: vec![(integer(&types, 1), constant(types.string, ConstantValue::String(b"one".to_vec())))] } }, location);
+        let map_allocation_failure = site(&mut program, FailureOperation::MapAllocation);
+        let map_insert_failure = site(&mut program, FailureOperation::MapInsert);
+        entry.push(OperationKind::Aggregate { destination: map_local, aggregate: Aggregate::Map { ty: map_type, entries: vec![(integer(&types, 1), constant(types.string, ConstantValue::String(b"one".to_vec())))], failure: map_allocation_failure } }, location);
         entry.push(OperationKind::UnionInject { destination: choice_local, union_type: choice_type, alternative: choice_a, payload: Operand::Copy(Place::local(input)) }, location);
         entry.push(OperationKind::UnionTest { destination: bool_temp, union: Operand::Copy(Place::local(choice_local)), alternative: choice_a }, location);
         entry.push(OperationKind::UnionPayload { destination: int_temp, union: Operand::Copy(Place::local(choice_local)), alternative: choice_a }, location);
@@ -870,7 +877,7 @@ mod tests {
         entry.push(OperationKind::Assign { destination: Place::projected(point_local, vec![Projection::StructField { definition: point_definition, field: point_x, storage: MemberStorage::Inline }]), value: integer(&types, 3) }, location);
         entry.push(OperationKind::Copy { destination: int_temp, operand: Operand::Copy(Place::projected(pair_local, vec![Projection::TupleField { definition: pair_definition, field: pair_first }])) }, location);
         entry.push(OperationKind::Assign { destination: Place::projected(list_local, vec![Projection::ListIndex { index, failure: list_index_failure }]), value: integer(&types, 4) }, location);
-        entry.push(OperationKind::Assign { destination: Place::projected(map_local, vec![Projection::MapIndex { key: index, failure: map_index_failure }]), value: constant(types.string, ConstantValue::String(b"four".to_vec())) }, location);
+        entry.push(OperationKind::Assign { destination: Place::projected(map_local, vec![Projection::MapIndex { key: index, failure: map_insert_failure, mode: MapAccessMode::Insert }]), value: constant(types.string, ConstantValue::String(b"four".to_vec())) }, location);
         entry.push(OperationKind::Call { destination: int_temp, function: identity_id, arguments: vec![Operand::Copy(Place::local(input))] }, location);
         entry.push(OperationKind::Intrinsic { destination: unit_temp, intrinsic: Intrinsic::Print, arguments: vec![Operand::Copy(Place::local(pair_local))], failure: output_failure }, location);
         entry.push(OperationKind::Check(RuntimeCheck::IterationUnlocked { receiver: Operand::Copy(Place::local(list_local)), failure: append_failure }), location);
@@ -1194,7 +1201,14 @@ impl<'a> Validator<'a> {
         match ty {
             Type::Unit | Type::Primitive(_) => Ok(()),
             Type::List(element) => { self.ty(*element)?; Ok(()) }
-            Type::Map { key, value } => { self.ty(*key)?; self.ty(*value)?; Ok(()) }
+            Type::Map { key, value } => {
+                self.ty(*key)?;
+                self.ty(*value)?;
+                if !self.is_valid_map_key(*key, &mut HashSet::new()) {
+                    return Err(self.error(format!("{id} has an invalid map key type")));
+                }
+                Ok(())
+            }
             Type::Nominal(definition) => { self.definition(*definition)?; Ok(()) }
             Type::Union(alternatives) => self.validate_alternatives(id.to_string(), alternatives),
         }
@@ -1435,7 +1449,8 @@ impl<'a> Validator<'a> {
                 let failure = match aggregate {
                     crate::ir::Aggregate::Struct { failure, .. } => Some((failure, "struct allocation")),
                     crate::ir::Aggregate::List { failure, .. } => Some((failure, "list allocation")),
-                    crate::ir::Aggregate::Tuple { .. } | crate::ir::Aggregate::Map { .. } => None,
+                    crate::ir::Aggregate::Tuple { .. } => None,
+                    crate::ir::Aggregate::Map { failure, .. } => Some((failure, "map allocation")),
                 };
                 if let Some((failure, description)) = failure
                     && self.program.failure_sites[failure.index()].location != operation.location
@@ -1464,7 +1479,7 @@ impl<'a> Validator<'a> {
                 self.destination(function, *destination, self.primitive(PrimitiveType::Char)?, "string index")
             }
             Assign { destination, value } => {
-                let destination_ty = self.place_type(function, destination)?;
+                let destination_ty = self.place_type_with_mode(function, destination, true)?;
                 self.expect_operand(function, value, destination_ty, "assignment")
             }
             Call { destination, function: callee, arguments } => {
@@ -1551,8 +1566,10 @@ impl<'a> Validator<'a> {
                 for operand in elements { self.expect_operand(function, operand, *element, "list element")?; }
                 Ok(*ty)
             }
-            Aggregate::Map { ty, entries } => {
+            Aggregate::Map { ty, entries, failure } => {
+                self.failure_site(*failure, FailureOperation::MapAllocation)?;
                 let Type::Map { key, value } = self.ty(*ty)? else { return Err(self.error("map aggregate has a non-map type")); };
+                if !self.is_valid_map_key(*key, &mut HashSet::new()) { return Err(self.error("map aggregate has an invalid key type")); }
                 for (entry_key, entry_value) in entries {
                     self.expect_operand(function, entry_key, *key, "map key")?;
                     self.expect_operand(function, entry_value, *value, "map value")?;
@@ -1689,6 +1706,13 @@ impl<'a> Validator<'a> {
     }
 
     fn place_type(&self, function: &Function, place: &Place) -> Result<TypeId, ValidationError> {
+        self.place_type_impl(function, place, false)
+    }
+
+    fn place_type_impl(&self, function: &Function, place: &Place, allow_insert: bool) -> Result<TypeId, ValidationError> {
+        if !allow_insert && place.projections.iter().any(|projection| matches!(projection, Projection::MapIndex { mode: MapAccessMode::Insert, .. })) {
+            return Err(self.error("map insertion projection is only valid as an assignment destination"));
+        }
         let mut current = self.local_in(function, place.local)?.ty;
         for projection in &place.projections {
             current = match projection {
@@ -1710,10 +1734,10 @@ impl<'a> Validator<'a> {
                     let Type::List(element) = self.ty(current)? else { return Err(self.error("list-index projection is applied to a non-list")); };
                     *element
                 }
-                Projection::MapIndex { key, failure } => {
+                Projection::MapIndex { key, failure, mode } => {
                     let Type::Map { key: expected, value } = self.ty(current)? else { return Err(self.error("map-index projection is applied to a non-map")); };
                     self.expect_local(function, *key, *expected, "map key")?;
-                    self.failure_site(*failure, FailureOperation::MapIndex)?;
+                    self.failure_site(*failure, match mode { MapAccessMode::Read => FailureOperation::MapIndex, MapAccessMode::Insert => FailureOperation::MapInsert })?;
                     *value
                 }
             };
@@ -1733,6 +1757,32 @@ impl<'a> Validator<'a> {
     fn expect_operand(&self, function: &Function, operand: &Operand, expected: TypeId, description: &str) -> Result<(), ValidationError> {
         if self.operand_type(function, operand)? != expected { return Err(self.error(format!("{description} has the wrong type"))); }
         Ok(())
+    }
+
+    fn place_type_with_mode(&self, function: &Function, place: &Place, allow_insert: bool) -> Result<TypeId, ValidationError> {
+        for (index, projection) in place.projections.iter().enumerate() {
+            if let Projection::MapIndex { mode: MapAccessMode::Insert, .. } = projection {
+                if !allow_insert || index + 1 != place.projections.len() {
+                    return Err(self.error("map insertion projection must be the final assignment projection"));
+                }
+            }
+        }
+        self.place_type_impl(function, place, allow_insert)
+    }
+
+    fn is_valid_map_key(&self, ty: TypeId, visiting: &mut HashSet<DefinitionId>) -> bool {
+        match self.program.types.get(ty.index()) {
+            Some(Type::Unit | Type::Primitive(PrimitiveType::Int | PrimitiveType::Str | PrimitiveType::Bool)) => true,
+            Some(Type::Nominal(definition)) => {
+                let Some(definition_value) = self.program.definitions.get(definition.index()) else { return false; };
+                let DefinitionLayout::Tuple(fields) = &definition_value.layout else { return false; };
+                if !visiting.insert(*definition) { return false; }
+                let valid = fields.iter().all(|field| self.is_valid_map_key(*field, visiting));
+                visiting.remove(definition);
+                valid
+            }
+            _ => false,
+        }
     }
 
     fn conversion_result(&self, conversion: NumericConversion, source: TypeId) -> Result<TypeId, ValidationError> {
