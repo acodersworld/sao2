@@ -183,10 +183,7 @@ panics at the original source operation without corrupting the container.
 
 ## Stage 5: Recursive tracing and growth hardening
 
-Status: current.
-
-The detailed implementation plan is in
-[Current Stage: Recursive Tracing and Growth Hardening](CURRENT_STAGE.md).
+Status: complete.
 
 Stress the shared runtime across recursive combinations: lists of lists, maps
 of containers, tuples and unions containing containers, containers containing
@@ -213,7 +210,10 @@ on unused capacity being zero or traced.
 
 ## Stage 6: Integration and milestone closure
 
-Status: pending.
+Status: current.
+
+The detailed implementation plan is in
+[Current Stage: Integration and Milestone Closure](CURRENT_STAGE.md).
 
 Exercise the full public pipeline with readable programs combining lists,
 maps, structs, tuples, unions, strings, command-line arguments, calls,

@@ -193,7 +193,7 @@ Status: current.
 The milestone breakdown is in
 [Current Milestone: Containers](CURRENT_MILESTONE.md). The active
 implementation plan is in
-[Current Stage: Recursive Tracing and Growth Hardening](CURRENT_STAGE.md).
+[Current Stage: Integration and Milestone Closure](CURRENT_STAGE.md).
 
 - Implement lists, maps, indexing, membership, iteration, and mutation.
 - Preserve insertion order in maps.
