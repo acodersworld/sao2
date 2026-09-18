@@ -51,7 +51,7 @@ test.
 
 ## Stage 1: Compile-time diagnostic model and rendering
 
-Status: current.
+Status: complete.
 
 The detailed implementation plan is in
 [Current Stage: Compile-time Diagnostic Model and Rendering](CURRENT_STAGE.md).

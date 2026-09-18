@@ -487,12 +487,14 @@ struct PendingMapKey<'ast> {
 pub(crate) struct TypeName {
     pub(crate) name: Box<str>,
     pub(crate) id: TypeDeclarationId,
+    pub(crate) first_span: Span,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FunctionName {
     pub(crate) name: Box<str>,
     pub(crate) id: FunctionId,
+    pub(crate) first_span: Span,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -961,16 +963,28 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
             match (record.id, record.node) {
                 (DeclarationId::Type(id), DeclarationNode::Type(declaration)) => {
                     let name = self.identifier_text(declaration.name.span).to_owned();
-                    if self.type_by_name(&name).is_some() {
-                        self.diagnostics.push(Diagnostic::source(
-                            self.source,
-                            declaration.name.span,
-                            format!("duplicate type declaration '{name}'"),
-                        ));
+                    if let Some(first) = self
+                        .type_names
+                        .iter()
+                        .find(|entry| entry.name.as_ref() == name.as_str())
+                    {
+                        self.diagnostics.push(
+                            Diagnostic::source(
+                                self.source,
+                                declaration.name.span,
+                                format!("duplicate type declaration '{name}'"),
+                            )
+                            .with_related(
+                                self.source,
+                                first.first_span,
+                                "previous declaration is here",
+                            ),
+                        );
                     } else {
                         self.type_names.push(TypeName {
                             name: name.into_boxed_str(),
                             id,
+                            first_span: declaration.name.span,
                         });
                     }
                 }
@@ -983,15 +997,29 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
                             format!("function name '{name}' is reserved for a compiler intrinsic"),
                         ));
                     } else if self.function_by_name(&name).is_some() {
-                        self.diagnostics.push(Diagnostic::source(
-                            self.source,
-                            function.name.span,
-                            format!("duplicate function declaration '{name}'"),
-                        ));
+                        let first = self
+                            .function_names
+                            .iter()
+                            .find(|entry| entry.name.as_ref() == name.as_str())
+                            .expect("duplicate function name has an accepted first declaration")
+                            .first_span;
+                        self.diagnostics.push(
+                            Diagnostic::source(
+                                self.source,
+                                function.name.span,
+                                format!("duplicate function declaration '{name}'"),
+                            )
+                            .with_related(
+                                self.source,
+                                first,
+                                "previous declaration is here",
+                            ),
+                        );
                     } else {
                         self.function_names.push(FunctionName {
                             name: name.into_boxed_str(),
                             id,
+                            first_span: function.name.span,
                         });
                     }
                     self.check_parameter_names(function);
@@ -1031,20 +1059,23 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
     }
 
     fn check_parameter_names(&mut self, function: &'ast FunctionDeclaration) {
-        let mut names: Vec<Box<str>> = Vec::new();
+        let mut names: Vec<(Box<str>, Span)> = Vec::new();
         for parameter in &function.parameters {
             let name = self.identifier_text(parameter.name.span).to_owned();
-            if names
+            if let Some((_, first_span)) = names
                 .iter()
-                .any(|existing| existing.as_ref() == name.as_str())
+                .find(|(existing, _)| existing.as_ref() == name.as_str())
             {
-                self.diagnostics.push(Diagnostic::source(
-                    self.source,
-                    parameter.name.span,
-                    format!("duplicate parameter name '{name}'"),
-                ));
+                self.diagnostics.push(
+                    Diagnostic::source(
+                        self.source,
+                        parameter.name.span,
+                        format!("duplicate parameter name '{name}'"),
+                    )
+                    .with_related(self.source, *first_span, "previous parameter is here"),
+                );
             } else {
-                names.push(name.into_boxed_str());
+                names.push((name.into_boxed_str(), parameter.name.span));
             }
         }
     }
@@ -1142,7 +1173,7 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
         }
 
         if has_named {
-            let mut names: Vec<Box<str>> = Vec::new();
+            let mut names: Vec<(Box<str>, Span)> = Vec::new();
             let mut members = Vec::with_capacity(declaration.members.len());
             for member in &declaration.members {
                 let TypeMemberKind::Named {
@@ -1154,13 +1185,20 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
                     unreachable!("mixed member forms were rejected above")
                 };
                 let spelling = self.identifier_text(name.span).to_owned();
-                if names
+                if let Some((_, first_span)) = names
                     .iter()
-                    .any(|existing| existing.as_ref() == spelling.as_str())
+                    .find(|(existing, _)| existing.as_ref() == spelling.as_str())
                 {
-                    self.error(name.span, format!("duplicate struct member '{spelling}'"));
+                    self.diagnostics.push(
+                        Diagnostic::source(
+                            self.source,
+                            name.span,
+                            format!("duplicate struct member '{spelling}'"),
+                        )
+                        .with_related(self.source, *first_span, "previous member is here"),
+                    );
                 } else {
-                    names.push(spelling.into_boxed_str());
+                    names.push((spelling.into_boxed_str(), name.span));
                 }
                 let resolved = self.resolve_type(ty);
                 let storage = if *referenced {
@@ -1263,9 +1301,9 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
                 let mut resolved = Vec::with_capacity(alternatives.len());
                 let mut failed = false;
                 let mut style = None;
-                let mut untagged = Vec::new();
-                let mut tags: Vec<Box<str>> = Vec::new();
-                let mut saw_error = false;
+                let mut untagged: Vec<(TypeId, Span)> = Vec::new();
+                let mut tags: Vec<(Box<str>, Span)> = Vec::new();
+                let mut first_error_span = None;
                 for alternative in alternatives {
                     match &alternative.kind {
                         TypeKind::Tagged { tag, payload } => {
@@ -1273,11 +1311,23 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
                             let tag = self.identifier_text(tag.span).to_owned();
                             let payload_state = self.resolve_type(payload);
                             if tag == "Error" {
-                                if saw_error {
-                                    self.error(tag_span, "duplicate Error alternative");
+                                if let Some(first_span) = first_error_span {
+                                    self.diagnostics.push(
+                                        Diagnostic::source(
+                                            self.source,
+                                            tag_span,
+                                            "duplicate Error alternative",
+                                        )
+                                        .with_related(
+                                            self.source,
+                                            first_span,
+                                            "previous Error alternative is here",
+                                        ),
+                                    );
                                     failed = true;
+                                } else {
+                                    first_error_span = Some(tag_span);
                                 }
-                                saw_error = true;
                                 if !std::ptr::eq(alternative, alternatives.last().unwrap()) {
                                     self.error(alternative.span, "Error must be the final union alternative");
                                     failed = true;
@@ -1288,11 +1338,25 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
                                     failed = true;
                                 }
                                 style = Some(UnionStyle::Tagged);
-                                if tags.iter().any(|existing| existing.as_ref() == tag.as_str()) {
-                                    self.error(tag_span, format!("duplicate union tag '{tag}'"));
+                                if let Some((_, first_span)) = tags
+                                    .iter()
+                                    .find(|(existing, _)| existing.as_ref() == tag.as_str())
+                                {
+                                    self.diagnostics.push(
+                                        Diagnostic::source(
+                                            self.source,
+                                            tag_span,
+                                            format!("duplicate union tag '{tag}'"),
+                                        )
+                                        .with_related(
+                                            self.source,
+                                            *first_span,
+                                            "previous tag is here",
+                                        ),
+                                    );
                                     failed = true;
                                 } else {
-                                    tags.push(tag.clone().into_boxed_str());
+                                    tags.push((tag.clone().into_boxed_str(), tag_span));
                                 }
                             }
                             match payload_state {
@@ -1321,11 +1385,25 @@ impl<'source, 'ast> Analysis<'source, 'ast> {
                             style = Some(UnionStyle::Untagged);
                             match self.resolve_type(alternative) {
                                 TypeState::Resolved(ty) => {
-                                    if untagged.contains(&ty) {
-                                        self.error(alternative.span, "duplicate untagged union alternative");
+                                    if let Some((_, first_span)) = untagged
+                                        .iter()
+                                        .find(|(existing, _)| *existing == ty)
+                                    {
+                                        self.diagnostics.push(
+                                            Diagnostic::source(
+                                                self.source,
+                                                alternative.span,
+                                                "duplicate untagged union alternative",
+                                            )
+                                            .with_related(
+                                                self.source,
+                                                *first_span,
+                                                "first alternative is here",
+                                            ),
+                                        );
                                         failed = true;
                                     } else {
-                                        untagged.push(ty);
+                                        untagged.push((ty, alternative.span));
                                     }
                                     resolved.push(UnionAlternative::Untagged(ty));
                                 }
@@ -4442,7 +4520,7 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
         match self.analysis.type_definition(declaration).kind.clone() {
             TypeDefinitionKind::Struct(members) => {
                 let mut selected = Vec::new();
-                let mut seen = Vec::new();
+                let mut seen: Vec<(usize, Span)> = Vec::new();
                 let mut failed = false;
                 let mut states = Vec::new();
                 for argument in arguments {
@@ -4462,11 +4540,25 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
                         failed = true;
                         continue;
                     };
-                    if seen.contains(&member) {
-                        self.analysis.error(name.span, format!("duplicate struct argument '{spelling}'"));
+                    if let Some((_, first_span)) = seen
+                        .iter()
+                        .find(|(first_member, _)| *first_member == member)
+                    {
+                        self.analysis.diagnostics.push(
+                            Diagnostic::source(
+                                self.analysis.source,
+                                name.span,
+                                format!("duplicate struct argument '{spelling}'"),
+                            )
+                            .with_related(
+                                self.analysis.source,
+                                *first_span,
+                                "first argument is here",
+                            ),
+                        );
                         failed = true;
                     }
-                    seen.push(member);
+                    seen.push((member, name.span));
                     selected.push(member);
                     let expected = self.resolved(members[member].ty);
                     let state = self.resolve_expression(value, expected);
@@ -4474,7 +4566,7 @@ impl<'analysis, 'source, 'ast> ExpectedTypeResolver<'analysis, 'source, 'ast> {
                     states.push(state);
                 }
                 for (index, member) in members.iter().enumerate() {
-                    if !seen.contains(&index) {
+                    if !seen.iter().any(|(member_index, _)| *member_index == index) {
                         let name = self.analysis.identifier_text(member.name.span).to_owned();
                         self.analysis.error(expression.span, format!("missing struct argument '{name}'"));
                         failed = true;
@@ -6186,6 +6278,90 @@ mod tests {
         ] {
             assert!(diagnostics.contains(expected), "{diagnostics}");
         }
+    }
+
+    #[test]
+    fn duplicate_diagnostics_point_to_the_first_occurrence() {
+        fn assert_related(text: &str, message: &str, first: &str, second: &str, label: &str) {
+            let source = source(text);
+            let program = parser::parse(&source).unwrap();
+            let analysis = analyze(&source, &program);
+            let rendered = analysis.diagnostics.to_string();
+            let first_offset = text.find(first).unwrap();
+            let second_offset = text.rfind(second).unwrap();
+            let (first_line, first_column) = source.line_and_column(first_offset);
+            let (second_line, second_column) = source.line_and_column(second_offset);
+            assert!(rendered.contains(message), "{rendered}");
+            assert!(
+                rendered.contains(&format!(
+                    "test.sao2:{second_line}:{second_column}: {message}"
+                )),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains(&format!(
+                    "  = related: test.sao2:{first_line}:{first_column}: {label}"
+                )),
+                "{rendered}"
+            );
+        }
+
+        assert_related(
+            "type Thing(int); type Thing(str); fn main() {}",
+            "duplicate type declaration 'Thing'",
+            "Thing",
+            "Thing",
+            "previous declaration is here",
+        );
+        assert_related(
+            "fn work() {} fn work() {} fn main() {}",
+            "duplicate function declaration 'work'",
+            "work",
+            "work",
+            "previous declaration is here",
+        );
+        assert_related(
+            "fn work(value int, value str) {} fn main() {}",
+            "duplicate parameter name 'value'",
+            "value",
+            "value",
+            "previous parameter is here",
+        );
+        assert_related(
+            "type Pair(name int, name str); fn main() {}",
+            "duplicate struct member 'name'",
+            "name",
+            "name",
+            "previous member is here",
+        );
+        assert_related(
+            "type Choice(Tag(int) | Tag(str)); fn main() {}",
+            "duplicate union tag 'Tag'",
+            "Tag",
+            "Tag",
+            "previous tag is here",
+        );
+        assert_related(
+            "type Choice(Error(str) | Error(int)); fn main() {}",
+            "duplicate Error alternative",
+            "Error",
+            "Error",
+            "previous Error alternative is here",
+        );
+        assert_related(
+            "type Choice(int | int); fn main() {}",
+            "duplicate untagged union alternative",
+            "int",
+            "int",
+            "first alternative is here",
+        );
+        assert_related(
+            "type Point(x int, y int); fn main() { Point(x = 1, x = 2, y = 3); }",
+            "duplicate struct argument 'x'",
+            "x = 1",
+            "x = 2",
+            "first argument is here",
+        );
     }
 
     #[test]

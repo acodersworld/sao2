@@ -1,6 +1,6 @@
 # Current Stage: Compile-time Diagnostic Model and Rendering
 
-Status: current.
+Status: complete.
 
 This is Stage 1 of milestone 12, Diagnostics and Hardening. It completes the
 compile-time diagnostic data model and presentation contract before later

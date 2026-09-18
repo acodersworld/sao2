@@ -244,6 +244,28 @@ fn malformed_source_has_stable_diagnostic() {
 }
 
 #[test]
+fn duplicate_declaration_renders_its_first_occurrence_publicly() {
+    let directory = TestDirectory::new("related diagnostics");
+    let source_path = directory.write_source(
+        "duplicate declaration ! [spaces].sao2",
+        b"fn work() {}\nfn work() {}",
+    );
+    let output = sao2(
+        &directory.0,
+        &[OsStr::new("build"), source_path.as_os_str()],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let path = source_path.display();
+    let expected = format!(
+        "sao2: source error: {path}:2:4: duplicate function declaration 'work'\n  |\n2 | fn work() {{}}\n  |    ^^^^\n  = related: {path}:1:4: previous declaration is here\n  |\n1 | fn work() {{}}\n  |    ^^^^\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), expected);
+    assert!(!directory.0.join("build/program.c").exists());
+}
+
+#[test]
 fn help_reports_the_public_commands_and_argument_forwarding() {
     let directory = TestDirectory::new("help");
     let output = sao2(&directory.0, &[OsStr::new("--help")]);

@@ -1,4 +1,4 @@
-use crate::source::{SourceFile, Span};
+use crate::source::{DiagnosticExcerpt, SourceFile, Span};
 use std::fmt;
 use std::path::PathBuf;
 
@@ -16,20 +16,23 @@ pub enum DiagnosticKind {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct PrimarySpan {
+struct SourceAnnotation {
     path: PathBuf,
     span: Span,
     line: usize,
     column: usize,
     source_line: String,
+    caret_offset: usize,
     caret_width: usize,
+    label: Option<String>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct Diagnostic {
     kind: DiagnosticKind,
     message: String,
-    primary: Option<PrimarySpan>,
+    primary: Option<SourceAnnotation>,
+    related: Vec<SourceAnnotation>,
 }
 
 impl Diagnostic {
@@ -64,18 +67,17 @@ impl Diagnostic {
         kind: DiagnosticKind,
         message: impl Into<String>,
     ) -> Self {
-        let (line, column, source_line, caret_width) = source.diagnostic_excerpt(span);
+        let excerpt = source.diagnostic_excerpt(span);
         Self {
             kind,
             message: message.into(),
-            primary: Some(PrimarySpan {
-                path: source.path.clone(),
+            primary: Some(SourceAnnotation::new(
+                source.path.clone(),
                 span,
-                line,
-                column,
-                source_line,
-                caret_width,
-            }),
+                excerpt,
+                None,
+            )),
+            related: Vec::new(),
         }
     }
 
@@ -84,7 +86,50 @@ impl Diagnostic {
             kind,
             message: message.into(),
             primary: None,
+            related: Vec::new(),
         }
+    }
+
+    /// Adds a source excerpt which explains or identifies the primary error.
+    ///
+    /// Related annotations are meaningful only for source diagnostics. Keep
+    /// this assertion loud so compiler code cannot accidentally discard
+    /// source context on a message-only diagnostic.
+    pub fn related(
+        mut self,
+        source: &SourceFile,
+        span: Span,
+        label: impl Into<String>,
+    ) -> Self {
+        assert!(
+            matches!(
+                self.kind,
+                DiagnosticKind::Source | DiagnosticKind::SourceWarning
+            ),
+            "related annotations require a source diagnostic"
+        );
+        assert!(
+            self.primary.is_some(),
+            "related annotations require a primary source annotation"
+        );
+        let excerpt = source.diagnostic_excerpt(span);
+        self.related.push(SourceAnnotation::new(
+            source.path.clone(),
+            span,
+            excerpt,
+            Some(label.into()),
+        ));
+        self
+    }
+
+    /// Alias for [`Diagnostic::related`] with a construction-oriented name.
+    pub fn with_related(
+        self,
+        source: &SourceFile,
+        span: Span,
+        label: impl Into<String>,
+    ) -> Self {
+        self.related(source, span, label)
     }
 
     pub fn primary_span(&self) -> Option<Span> {
@@ -123,24 +168,71 @@ impl fmt::Display for Diagnostic {
                 primary.column,
                 self.message
             )?;
-            let gutter_width = primary.line.to_string().len();
-            writeln!(formatter, "{:gutter_width$} |", "")?;
-            writeln!(
-                formatter,
-                "{:>gutter_width$} | {}",
-                primary.line, primary.source_line
-            )?;
-            write!(
-                formatter,
-                "{:gutter_width$} | {}{}",
-                "",
-                " ".repeat(primary.column - 1),
-                "^".repeat(primary.caret_width)
-            )
+            write_excerpt(formatter, primary)?;
+            for related in &self.related {
+                write!(formatter, "\n  = related: ")?;
+                if let Some(label) = &related.label {
+                    writeln!(
+                        formatter,
+                        "{}:{}:{}: {}",
+                        related.path.display(),
+                        related.line,
+                        related.column,
+                        label
+                    )?;
+                } else {
+                    writeln!(
+                        formatter,
+                        "{}:{}:{}",
+                        related.path.display(),
+                        related.line,
+                        related.column
+                    )?;
+                }
+                write_excerpt(formatter, related)?;
+            }
+            Ok(())
         } else {
             write!(formatter, "{}", self.message)
         }
     }
+}
+
+impl SourceAnnotation {
+    fn new(
+        path: PathBuf,
+        span: Span,
+        excerpt: DiagnosticExcerpt,
+        label: Option<String>,
+    ) -> Self {
+        Self {
+            path,
+            span,
+            line: excerpt.line,
+            column: excerpt.column,
+            source_line: excerpt.source_line,
+            caret_offset: excerpt.caret_offset,
+            caret_width: excerpt.caret_width,
+            label,
+        }
+    }
+}
+
+fn write_excerpt(formatter: &mut fmt::Formatter<'_>, annotation: &SourceAnnotation) -> fmt::Result {
+    let gutter_width = annotation.line.to_string().len();
+    writeln!(formatter, "{:gutter_width$} |", "")?;
+    writeln!(
+        formatter,
+        "{:>gutter_width$} | {}",
+        annotation.line, annotation.source_line
+    )?;
+    write!(
+        formatter,
+        "{:gutter_width$} | {}{}",
+        "",
+        " ".repeat(annotation.caret_offset),
+        "^".repeat(annotation.caret_width)
+    )
 }
 
 /// A bounded collection used by recovering frontend stages.
@@ -309,6 +401,32 @@ mod tests {
             "sao2: source warning: test.sao2:2:5: unreachable source\n  |\n2 |     unused\n  |     ^^^^^^"
         );
         assert_eq!(warning.exit_code(), 0);
+    }
+
+    #[test]
+    fn related_annotations_render_in_insertion_order_without_affecting_exit_code() {
+        let source = source("first\nsecond");
+        let diagnostic = Diagnostic::source(&source, Span::new(6, 12), "later declaration")
+            .with_related(&source, Span::new(0, 5), "previous declaration is here")
+            .related(&source, Span::empty(12), "another related location");
+        assert_eq!(diagnostic.exit_code(), 1);
+        assert_eq!(
+            diagnostic.to_string(),
+            "sao2: source error: test.sao2:2:1: later declaration\n  |\n2 | second\n  | ^^^^^^\n  = related: test.sao2:1:1: previous declaration is here\n  |\n1 | first\n  | ^^^^^\n  = related: test.sao2:2:7: another related location\n  |\n2 | second\n  |       ^"
+        );
+    }
+
+    #[test]
+    fn source_annotations_own_their_rendering_snapshot() {
+        let diagnostic = {
+            let source = SourceFile::new(
+                PathBuf::from("directory/name with punctuation!.sao2"),
+                "value".to_owned(),
+            );
+            Diagnostic::source(&source, Span::new(0, 5), "bad value")
+        };
+        assert!(diagnostic.to_string().contains("name with punctuation!.sao2:1:1"));
+        assert!(diagnostic.to_string().contains("1 | value"));
     }
 
     #[test]
