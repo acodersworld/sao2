@@ -51,7 +51,10 @@ test.
 
 ## Stage 1: Compile-time diagnostic model and rendering
 
-Status: pending.
+Status: current.
+
+The detailed implementation plan is in
+[Current Stage: Compile-time Diagnostic Model and Rendering](CURRENT_STAGE.md).
 
 Extend the diagnostic representation from one primary span to a primary span
 plus ordered related spans. Use related annotations for high-value conflicts

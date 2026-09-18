@@ -212,8 +212,8 @@ Status: current.
 
 This is the final implementation milestone in the v0 roadmap. Its staged plan
 is in [Current Milestone: Diagnostics and Hardening](CURRENT_MILESTONE.md).
-Stage 1 is next and will receive a detailed plan in `CURRENT_STAGE.md` before
-implementation begins.
+Stage 1 is current; its detailed plan is in
+[Current Stage: Compile-time Diagnostic Model and Rendering](CURRENT_STAGE.md).
 
 - Render compile-time diagnostics with primary and related source spans.
 - Map every runtime panic to its SAO2 operation and function.
