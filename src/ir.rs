@@ -848,8 +848,8 @@ mod tests {
         let point_local = main.add_local(point_type, Some("point".to_owned()), LocalOrigin::Binding);
         let pair_local = main.add_local(pair_type, None, LocalOrigin::Temporary);
         let choice_local = main.add_local(choice_type, None, LocalOrigin::Temporary);
-        let list_local = main.add_local(list_type, Some("items".to_owned()), LocalOrigin::Binding);
-        let map_local = main.add_local(map_type, Some("lookup".to_owned()), LocalOrigin::Binding);
+        let list_local = main.add_local(list_type, Some("items".to_owned()), LocalOrigin::Temporary);
+        let map_local = main.add_local(map_type, Some("lookup".to_owned()), LocalOrigin::Temporary);
         let string_local = main.add_local(types.string, None, LocalOrigin::Temporary);
         let character_temp = main.add_local(types.character, None, LocalOrigin::Temporary);
         let blocks = (0..7).map(|_| main.add_block()).collect::<Vec<_>>();
@@ -977,6 +977,126 @@ mod tests {
         let main = program.add_function(function);
         program.entry = Some(main);
         assert_eq!(program.validate().unwrap_err().message, "iteration operand is not a list or map");
+    }
+
+    #[test]
+    fn validates_iteration_scope_balance_across_reachable_control_flow() {
+        let (mut balanced, types, location) = program();
+        let list = balanced.intern_type(Type::List(types.int));
+        let mut function = Function::new("main", types.int);
+        let iterable = function.add_local(list, None, LocalOrigin::Temporary);
+        let block = function.add_block();
+        function.entry = Some(block);
+        function.blocks[block.index()].push(
+            OperationKind::BeginIteration { iterable: Operand::Copy(Place::local(iterable)) },
+            location,
+        );
+        function.blocks[block.index()].push(
+            OperationKind::EndIteration { iterable: Operand::Copy(Place::local(iterable)) },
+            location,
+        );
+        function.blocks[block.index()].terminate(TerminatorKind::Return(integer(&types, 0)), location);
+        let main = balanced.add_function(function);
+        balanced.entry = Some(main);
+        assert!(balanced.validate().is_ok());
+
+        let mut unbalanced = balanced.clone();
+        unbalanced.functions[main.index()].blocks[block.index()].operations.pop();
+        assert_eq!(unbalanced.validate().unwrap_err().message, "normal return exits with active iterations");
+
+        let (mut joined, types, location) = program();
+        let list = joined.intern_type(Type::List(types.int));
+        let mut function = Function::new("main", types.int);
+        let iterable = function.add_local(list, None, LocalOrigin::Temporary);
+        let condition = function.add_local(types.boolean, None, LocalOrigin::Temporary);
+        let entry = function.add_block();
+        let left = function.add_block();
+        let right = function.add_block();
+        let merge = function.add_block();
+        function.entry = Some(entry);
+        function.blocks[entry.index()].push(
+            OperationKind::Copy { destination: condition, operand: constant(types.boolean, ConstantValue::Boolean(true)) },
+            location,
+        );
+        function.blocks[entry.index()].terminate(
+            TerminatorKind::Branch { condition: Operand::Copy(Place::local(condition)), then_block: left, else_block: right },
+            location,
+        );
+        function.blocks[left.index()].push(
+            OperationKind::BeginIteration { iterable: Operand::Copy(Place::local(iterable)) },
+            location,
+        );
+        function.blocks[left.index()].terminate(TerminatorKind::Jump(merge), location);
+        function.blocks[right.index()].terminate(TerminatorKind::Jump(merge), location);
+        function.blocks[merge.index()].terminate(TerminatorKind::Return(integer(&types, 0)), location);
+        let main = joined.add_function(function);
+        joined.entry = Some(main);
+        assert_eq!(joined.validate().unwrap_err().message, "control-flow join has unequal active iteration stacks");
+    }
+
+    #[test]
+    fn rejects_active_iteration_local_overwrite_and_unstable_operands() {
+        let (mut overwritten, types, location) = program();
+        let list = overwritten.intern_type(Type::List(types.int));
+        let mut function = Function::new("main", types.int);
+        let iterable = function.add_local(list, None, LocalOrigin::Temporary);
+        let block = function.add_block();
+        function.entry = Some(block);
+        function.blocks[block.index()].push(
+            OperationKind::BeginIteration { iterable: Operand::Copy(Place::projected(iterable, vec![])) },
+            location,
+        );
+        function.blocks[block.index()].push(
+            OperationKind::Copy { destination: iterable, operand: Operand::Copy(Place::local(iterable)) },
+            location,
+        );
+        function.blocks[block.index()].terminate(TerminatorKind::Return(integer(&types, 0)), location);
+        let main = overwritten.add_function(function);
+        overwritten.entry = Some(main);
+        assert_eq!(overwritten.validate().unwrap_err().message, "active iterable temporary is overwritten");
+
+        let (mut projected, types, location) = program();
+        let element_list = projected.intern_type(Type::List(types.int));
+        let outer_list = projected.intern_type(Type::List(element_list));
+        let mut function = Function::new("main", types.int);
+        let iterable = function.add_local(outer_list, None, LocalOrigin::Temporary);
+        let index = function.add_local(types.int, None, LocalOrigin::Temporary);
+        let block = function.add_block();
+        function.entry = Some(block);
+        let failure = projected.intern_failure_site(FailureSite {
+            location,
+            function: FunctionId::from_index(0),
+            operation: FailureOperation::ListIndex,
+            line: 1,
+            column: 1,
+        });
+        function.blocks[block.index()].push(
+            OperationKind::BeginIteration {
+                iterable: Operand::Copy(Place::projected(iterable, vec![
+                    Projection::ListIndex { index, failure },
+                ])),
+            },
+            location,
+        );
+        function.blocks[block.index()].terminate(TerminatorKind::Return(integer(&types, 0)), location);
+        let main = projected.add_function(function);
+        projected.entry = Some(main);
+        assert_eq!(projected.validate().unwrap_err().message, "iteration operand is projected instead of stabilized");
+
+        let (mut non_temporary, types, location) = program();
+        let list = non_temporary.intern_type(Type::List(types.int));
+        let mut function = Function::new("main", types.int);
+        let iterable = function.add_local(list, None, LocalOrigin::Binding);
+        let block = function.add_block();
+        function.entry = Some(block);
+        function.blocks[block.index()].push(
+            OperationKind::BeginIteration { iterable: Operand::Copy(Place::local(iterable)) },
+            location,
+        );
+        function.blocks[block.index()].terminate(TerminatorKind::Return(integer(&types, 0)), location);
+        let main = non_temporary.add_function(function);
+        non_temporary.entry = Some(main);
+        assert_eq!(non_temporary.validate().unwrap_err().message, "iteration operand is not a stabilized temporary");
     }
 
     #[test]
@@ -1315,8 +1435,125 @@ impl<'a> Validator<'a> {
             self.location(terminator.location)?;
             self.validate_terminator(function, terminator)?;
         }
+        self.validate_iteration_balance(function)?;
         self.block = None;
         self.site = None;
+        Ok(())
+    }
+
+    fn validate_iteration_balance(&mut self, function: &Function) -> Result<(), ValidationError> {
+        let entry = function.entry.expect("validated function entry");
+        let mut states: Vec<Option<Vec<Operand>>> = vec![None; function.blocks.len()];
+        let mut worklist = vec![entry];
+        states[entry.index()] = Some(Vec::new());
+        let mut next = 0;
+
+        while let Some(block_id) = worklist.get(next).copied() {
+            next += 1;
+            let mut active = states[block_id.index()].clone().expect("reachable block state");
+            let block = &function.blocks[block_id.index()];
+            self.block = Some(block_id);
+            for (operation_index, operation) in block.operations.iter().enumerate() {
+                self.site = Some(OperationSite::Operation(operation_index));
+                self.transfer_iteration_operation(function, &mut active, &operation.kind)?;
+            }
+
+            self.site = Some(OperationSite::Terminator);
+            let terminator = block.terminator.as_ref().expect("validated block terminator");
+            if matches!(&terminator.kind, TerminatorKind::Return(_)) {
+                if !active.is_empty() {
+                    return Err(self.error("normal return exits with active iterations"));
+                }
+            }
+
+            let successors = match &terminator.kind {
+                TerminatorKind::Jump(target) => vec![*target],
+                TerminatorKind::Branch { then_block, else_block, .. } => vec![*then_block, *else_block],
+                TerminatorKind::Switch { targets, .. } => targets.iter().map(|(_, target)| *target).collect(),
+                TerminatorKind::Return(_)
+                | TerminatorKind::Panic { .. }
+                | TerminatorKind::ErrorPanic { .. }
+                | TerminatorKind::Unreachable => Vec::new(),
+            };
+            for successor in successors {
+                let slot = states.get_mut(successor.index()).expect("validated successor");
+                match slot {
+                    None => {
+                        *slot = Some(active.clone());
+                        worklist.push(successor);
+                    }
+                    Some(existing) if *existing == active => {}
+                    Some(_) => {
+                        self.block = Some(successor);
+                        self.site = None;
+                        return Err(self.error("control-flow join has unequal active iteration stacks"));
+                    }
+                }
+            }
+        }
+
+        self.block = None;
+        self.site = None;
+        Ok(())
+    }
+
+    fn transfer_iteration_operation(
+        &self,
+        function: &Function,
+        active: &mut Vec<Operand>,
+        operation: &OperationKind,
+    ) -> Result<(), ValidationError> {
+        if let Some(local) = operation_destination_local(operation) {
+            if active.iter().any(|operand| iteration_operand_local(operand) == Some(local)) {
+                return Err(self.error("active iterable temporary is overwritten"));
+            }
+        }
+
+        match operation {
+            OperationKind::BeginIteration { iterable } => {
+                self.require_stabilized_iteration_operand(function, iterable)?;
+                active.push(iterable.clone());
+            }
+            OperationKind::IterationValue { iterable, .. } => {
+                self.require_stabilized_iteration_operand(function, iterable)?;
+                match active.last() {
+                    Some(current) if current == iterable => {}
+                    Some(_) => return Err(self.error("iteration value does not name the innermost active iterable")),
+                    None => return Err(self.error("iteration value has no active iteration")),
+                }
+            }
+            OperationKind::EndIteration { iterable } => {
+                self.require_stabilized_iteration_operand(function, iterable)?;
+                match active.last() {
+                    Some(current) if current == iterable => { active.pop(); }
+                    Some(_) => return Err(self.error("iteration end does not match the innermost active iterable")),
+                    None => return Err(self.error("iteration end has no active iteration")),
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn require_stabilized_iteration_operand(
+        &self,
+        function: &Function,
+        operand: &Operand,
+    ) -> Result<(), ValidationError> {
+        let Operand::Copy(place) = operand else {
+            return Err(self.error("iteration operand is not a stabilized temporary"));
+        };
+        if !place.projections.is_empty() {
+            return Err(self.error("iteration operand is projected instead of stabilized"));
+        }
+        let local = self.local_in(function, place.local)?;
+        if local.origin != LocalOrigin::Temporary {
+            return Err(self.error("iteration operand is not a stabilized temporary"));
+        }
+        let ty = self.operand_type(function, operand)?;
+        if !matches!(self.ty(ty)?, Type::List(_) | Type::Map { .. }) {
+            return Err(self.error("iteration operand is not a list or map"));
+        }
         Ok(())
     }
 
@@ -1899,5 +2136,35 @@ impl<'a> Validator<'a> {
     }
     fn location(&self, id: LocationId) -> Result<&'a ByteSpan, ValidationError> {
         self.program.locations.get(id.index()).ok_or_else(|| self.error(format!("invalid location identity {id}")))
+    }
+}
+
+fn iteration_operand_local(operand: &Operand) -> Option<LocalId> {
+    match operand {
+        Operand::Copy(place) if place.projections.is_empty() => Some(place.local),
+        _ => None,
+    }
+}
+
+fn operation_destination_local(operation: &OperationKind) -> Option<LocalId> {
+    match operation {
+        OperationKind::Copy { destination, .. }
+        | OperationKind::Unary { destination, .. }
+        | OperationKind::Binary { destination, .. }
+        | OperationKind::Convert { destination, .. }
+        | OperationKind::Aggregate { destination, .. }
+        | OperationKind::UnionInject { destination, .. }
+        | OperationKind::UnionTest { destination, .. }
+        | OperationKind::UnionPayload { destination, .. }
+        | OperationKind::StringIndex { destination, .. }
+        | OperationKind::Call { destination, .. }
+        | OperationKind::Intrinsic { destination, .. }
+        | OperationKind::Builtin { destination, .. }
+        | OperationKind::IterationValue { destination, .. } => Some(*destination),
+        OperationKind::Assign { destination, .. } if destination.projections.is_empty() => Some(destination.local),
+        OperationKind::Assign { .. }
+        | OperationKind::BeginIteration { .. }
+        | OperationKind::EndIteration { .. }
+        | OperationKind::Check(_) => None,
     }
 }

@@ -103,6 +103,24 @@ List iteration follows index order. Map iteration yields keys in insertion
 order. Structurally modifying a container during iteration causes a runtime
 panic. Container mutation requires a `var` reference.
 
+The iterable expression of a for statement is evaluated exactly once before
+iteration begins and remains live until the loop exits. The loop snapshots the
+container length after acquiring its iteration lock. A list binding copies the
+value at the current index when that iteration begins; replacing a later list
+element can therefore affect a later binding, while replacing the current
+element cannot change a binding that has already been copied. A map binding
+copies the key from the insertion-order sequence, and replacing an existing
+map value never changes the yielded keys or their order. Inline values are
+copied and object carriers retain their ordinary reference identity.
+
+List indexed replacement and replacement of an existing map value are
+non-structural and are permitted while iterating. List append/removal and map
+insertion/removal are structural and panic through every alias while any
+iteration of that container is active. Nested loops add one shared lock for
+each active scope. Continue retains the current lock; normal exhaustion,
+break, return, and postfix-try propagation release the scopes they leave. A
+panic terminates the process without language-level cleanup.
+
 Characters and strings initially support ASCII only. All strings are immutable
 and interned. Equal strings therefore share one canonical runtime value.
 

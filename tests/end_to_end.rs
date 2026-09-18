@@ -308,6 +308,115 @@ fn runs_complete_list_operations_and_aliasing() {
 }
 
 #[test]
+fn iterates_lists_in_index_order_and_sees_replacement() {
+    let directory = TestDirectory::new("list iteration");
+    let source = br#"
+        fn main() {
+            var values := [1, 2, 3];
+            for value in values {
+                println(value);
+                if value == 1 {
+                    values[1] = 20;
+                }
+            }
+        }
+    "#;
+    let output = run_source(&directory, source);
+    assert!(!compiler_is_missing(&output), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"1\n20\n3\n");
+}
+
+#[test]
+fn iterates_maps_in_insertion_order_and_allows_value_replacement() {
+    let directory = TestDirectory::new("map iteration");
+    let source = br#"
+        fn main() {
+            var values := {2: 20, 1: 10, 3: 30};
+            for key in values {
+                println(key);
+                if key == 1 {
+                    values[2] = 22;
+                }
+            }
+            println(values[2]);
+        }
+    "#;
+    let output = run_source(&directory, source);
+    assert!(!compiler_is_missing(&output), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"2\n1\n3\n22\n");
+}
+
+#[test]
+fn balances_nested_alias_iteration_and_normal_exits() {
+    let directory = TestDirectory::new("nested iteration cleanup");
+    let source = br#"
+        fn first(values [int]) int {
+            for value in values {
+                return value;
+            }
+            0
+        }
+        fn main() {
+            var values := [1, 2, 3];
+            var alias := values;
+            for outer in values {
+                for inner in alias {
+                    if inner == 2 {
+                        continue;
+                    }
+                    println(outer * 10 + inner);
+                    if inner == 3 {
+                        break;
+                    }
+                }
+            }
+            println(first(values));
+            values.append(4);
+            println(values.len());
+        }
+    "#;
+    let output = run_source(&directory, source);
+    assert!(!compiler_is_missing(&output), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"11\n13\n21\n23\n31\n33\n1\n4\n");
+}
+
+#[test]
+fn rejects_structural_mutation_during_list_and_map_iteration() {
+    for (label, source) in [
+        (
+            "list mutation during iteration",
+            br#"fn main() {
+                var values := [1];
+                for value in values {
+                    values.append(value);
+                }
+            }"#.as_slice(),
+        ),
+        (
+            "map mutation during iteration",
+            br#"fn main() {
+                var values := {1: 10};
+                for key in values {
+                    values[2] = 20;
+                }
+            }"#.as_slice(),
+        ),
+    ] {
+        let directory = TestDirectory::new(label);
+        let output = run_source(&directory, source);
+        assert!(!compiler_is_missing(&output), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(!output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("container structurally modified during iteration"), "{stderr}");
+        assert!(stderr.contains(":4:"), "{stderr}");
+    }
+}
+
+#[test]
 fn runs_ordered_map_operations_and_reinsertion() {
     let directory = TestDirectory::new("map operations");
     let source = br#"

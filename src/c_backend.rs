@@ -269,8 +269,12 @@ impl<'a> CapabilityValidator<'a> {
             OperationKind::Builtin { method: ir::BuiltinMethod::MapRemoveKey, receiver, arguments, .. }
                 if arguments.len() == 1 && matches!(self.program.types[self.operand_type(function, receiver).index()], Type::Map { .. }) => Ok(()),
             OperationKind::Builtin { .. } => self.unsupported("built-in container operation"),
-            OperationKind::BeginIteration { .. } | OperationKind::EndIteration { .. }
-            | OperationKind::IterationValue { .. } => self.unsupported("container iteration"),
+            OperationKind::BeginIteration { iterable } | OperationKind::EndIteration { iterable } =>
+                self.container_iteration_type(function, iterable),
+            OperationKind::IterationValue { destination, iterable, .. } => {
+                self.container_iteration_type(function, iterable)?;
+                self.executable_union_use(function.locals[destination.index()].ty)
+            }
             OperationKind::Check(RuntimeCheck::IterationUnlocked { receiver, .. }) =>
                 if matches!(self.program.types[self.operand_type(function, receiver).index()], Type::List(_) | Type::Map { .. }) {
                     Ok(())
@@ -329,6 +333,13 @@ impl<'a> CapabilityValidator<'a> {
     fn is_string_list(&self, ty: TypeId) -> bool {
         matches!(&self.program.types[ty.index()], Type::List(element)
             if matches!(&self.program.types[element.index()], Type::Primitive(PrimitiveType::Str)))
+    }
+
+    fn container_iteration_type(&self, function: &Function, operand: &Operand) -> Result<(), CEmissionError> {
+        match &self.program.types[self.operand_type(function, operand).index()] {
+            Type::List(_) | Type::Map { .. } => Ok(()),
+            _ => self.unsupported("iteration operand is not a list or map"),
+        }
     }
 
     fn is_scalar(&self, ty: TypeId) -> bool {
@@ -1760,6 +1771,27 @@ impl<'a> Renderer<'a> {
             let _ = writeln!(self.output, "static int64_t sao2_list_length_ty_{ty}(sao2_ref reference) {{");
             let _ = writeln!(self.output, "    return (int64_t)sao2_list_control_ty_{ty}(reference)->length;\n}}\n\n");
 
+            let _ = writeln!(self.output, "static void sao2_list_begin_iteration_ty_{ty}(sao2_ref reference) {{");
+            let _ = writeln!(self.output, "    {control} *control = sao2_list_control_ty_{ty}(reference);");
+            self.output.push_str("    if (control->lock_count == UINT64_MAX) sao2_compiler_invariant();\n    control->lock_count += UINT64_C(1);\n}\n\n");
+
+            let _ = writeln!(self.output, "static void sao2_list_end_iteration_ty_{ty}(sao2_ref reference) {{");
+            let _ = writeln!(self.output, "    {control} *control = sao2_list_control_ty_{ty}(reference);");
+            self.output.push_str("    if (control->lock_count == 0) sao2_compiler_invariant();\n    control->lock_count -= UINT64_C(1);\n}\n\n");
+
+            let _ = writeln!(self.output, "static void sao2_list_iteration_value_ty_{ty}(sao2_ref reference, int64_t index, {element_c_type} *destination) {{");
+            self.output.push_str("    uint64_t position; const ");
+            let _ = writeln!(self.output, "{record} *records; {control} *control; unsigned char *body;");
+            self.output.push_str("    if (destination == NULL) sao2_compiler_invariant();\n");
+            let _ = writeln!(self.output, "    control = sao2_list_control_ty_{ty}(reference);");
+            self.output.push_str("    if (control->lock_count == 0 || index < 0) sao2_compiler_invariant();\n");
+            self.output.push_str("    position = (uint64_t)index;\n");
+            self.output.push_str("    if (position >= control->length) sao2_compiler_invariant();\n");
+            let _ = writeln!(self.output, "    body = sao2_resolve_body(control->elements, &{layout});");
+            let _ = writeln!(self.output, "    records = (const {record} *)(body + UINT64_C({offset}));");
+            let _ = writeln!(self.output, "    {descriptor}.copy(destination, &records[position].value);");
+            self.output.push_str("}\n\n");
+
             let _ = writeln!(self.output, "static void sao2_check_list_iteration_unlocked_ty_{ty}(sao2_ref reference, size_t site) {{");
             self.output.push_str("    uint32_t operation = sao2_failure(site)->operation;\n");
             self.output.push_str("    if (operation != SAO2_FAILURE_LIST_APPEND && operation != SAO2_FAILURE_LIST_REMOVE_INDEX) sao2_compiler_invariant();\n");
@@ -1922,6 +1954,27 @@ impl<'a> Renderer<'a> {
             self.output.push_str("        for (step = 0; step < slot_capacity; ++step) {\n            if (slots[position] == 0) { slots[position] = index + UINT64_C(1); break; }\n            position = (position + UINT64_C(1)) & (slot_capacity - UINT64_C(1));\n        }\n        if (step == slot_capacity) sao2_compiler_invariant();\n    }\n}\n\n");
 
             let _ = writeln!(self.output, "static int64_t sao2_map_length_ty_{ty}(sao2_ref reference) {{ return (int64_t)sao2_map_control_ty_{ty}(reference)->length; }}\n");
+            let _ = writeln!(self.output, "static void sao2_map_begin_iteration_ty_{ty}(sao2_ref reference) {{");
+            let _ = writeln!(self.output, "    {control} *control = sao2_map_control_ty_{ty}(reference);");
+            self.output.push_str("    if (control->lock_count == UINT64_MAX) sao2_compiler_invariant();\n    control->lock_count += UINT64_C(1);\n}\n\n");
+
+            let _ = writeln!(self.output, "static void sao2_map_end_iteration_ty_{ty}(sao2_ref reference) {{");
+            let _ = writeln!(self.output, "    {control} *control = sao2_map_control_ty_{ty}(reference);");
+            self.output.push_str("    if (control->lock_count == 0) sao2_compiler_invariant();\n    control->lock_count -= UINT64_C(1);\n}\n\n");
+
+            let _ = writeln!(self.output, "static void sao2_map_iteration_value_ty_{ty}(sao2_ref reference, int64_t index, {key_c_type} *destination) {{");
+            self.output.push_str("    uint64_t position; const ");
+            let _ = writeln!(self.output, "{entry_record} *entries; {control} *control; unsigned char *body;");
+            self.output.push_str("    if (destination == NULL) sao2_compiler_invariant();\n");
+            let _ = writeln!(self.output, "    control = sao2_map_control_ty_{ty}(reference);");
+            self.output.push_str("    if (control->lock_count == 0 || index < 0) sao2_compiler_invariant();\n");
+            self.output.push_str("    position = (uint64_t)index;\n");
+            self.output.push_str("    if (position >= control->length) sao2_compiler_invariant();\n");
+            let _ = writeln!(self.output, "    body = sao2_resolve_body(control->ordered_entries, &{entry_layout});");
+            let _ = writeln!(self.output, "    entries = (const {entry_record} *)(body + UINT64_C({entry_offset}));");
+            let _ = writeln!(self.output, "    {key_descriptor}.copy(destination, &entries[position].key);");
+            self.output.push_str("}\n\n");
+
             let _ = writeln!(self.output, "static void sao2_check_map_iteration_unlocked_ty_{ty}(sao2_ref reference, size_t site) {{");
             self.output.push_str("    uint32_t operation = sao2_failure(site)->operation;\n");
             self.output.push_str("    if (operation != SAO2_FAILURE_MAP_INSERT && operation != SAO2_FAILURE_MAP_REMOVE_KEY) sao2_compiler_invariant();\n");
@@ -3097,10 +3150,49 @@ impl<'a> Renderer<'a> {
                 let _ = writeln!(self.output, "    {} = (sao2_unit){{0}};", self.local(*destination));
                 self.output.push_str("    }\n");
             }
+            OperationKind::BeginIteration { iterable } => {
+                let receiver = self.operand(iterable);
+                let ty = self.operand_type(function, iterable);
+                match &self.program.types[ty.index()] {
+                    Type::List(_) => {
+                        let _ = writeln!(self.output, "    sao2_list_begin_iteration_ty_{}({receiver});", ty.index());
+                    }
+                    Type::Map { .. } => {
+                        let _ = writeln!(self.output, "    sao2_map_begin_iteration_ty_{}({receiver});", ty.index());
+                    }
+                    _ => unreachable!("capability validation rejected non-container iteration"),
+                }
+            }
+            OperationKind::EndIteration { iterable } => {
+                let receiver = self.operand(iterable);
+                let ty = self.operand_type(function, iterable);
+                match &self.program.types[ty.index()] {
+                    Type::List(_) => {
+                        let _ = writeln!(self.output, "    sao2_list_end_iteration_ty_{}({receiver});", ty.index());
+                    }
+                    Type::Map { .. } => {
+                        let _ = writeln!(self.output, "    sao2_map_end_iteration_ty_{}({receiver});", ty.index());
+                    }
+                    _ => unreachable!("capability validation rejected non-container iteration"),
+                }
+            }
+            OperationKind::IterationValue { destination, iterable, index } => {
+                let receiver = self.operand(iterable);
+                let index = self.operand(index);
+                let ty = self.operand_type(function, iterable);
+                match &self.program.types[ty.index()] {
+                    Type::List(_) => {
+                        let _ = writeln!(self.output, "    sao2_list_iteration_value_ty_{}({receiver}, {index}, &{});", ty.index(), self.local(*destination));
+                    }
+                    Type::Map { .. } => {
+                        let _ = writeln!(self.output, "    sao2_map_iteration_value_ty_{}({receiver}, {index}, &{});", ty.index(), self.local(*destination));
+                    }
+                    _ => unreachable!("capability validation rejected non-container iteration"),
+                }
+            }
             OperationKind::Check(check) => self.render_check(function, check),
             OperationKind::Builtin { .. }
-            | OperationKind::BeginIteration { .. } | OperationKind::EndIteration { .. }
-            | OperationKind::IterationValue { .. } => unreachable!("capability validation rejected operation"),
+            => unreachable!("capability validation rejected operation"),
         }
     }
 

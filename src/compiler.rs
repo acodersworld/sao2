@@ -362,18 +362,23 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_source_does_not_truncate_existing_output() {
+    fn failed_compilation_does_not_truncate_existing_output() {
         let build_directory = temporary_directory("preserve-output");
         fs::create_dir(&build_directory).unwrap();
         let output_path = build_directory.join("program.c");
         fs::write(&output_path, "existing generated C").unwrap();
 
-        let source = source("fn main() { for item in [1, 2] { print(item); } }");
-        let diagnostic = compile_into(&source, &build_directory)
+        let source = source("fn main() { print(\"still valid\"); }");
+        let diagnostic = compile_into_with_invariants(
+            &source,
+            &build_directory,
+            || Ok(()),
+            |program| program.functions[0].blocks[0].terminator = None,
+        )
             .unwrap_err()
             .to_string();
 
-        assert!(diagnostic.contains("current C backend"));
+        assert!(diagnostic.contains("post-lowering IR validation boundary failed"));
         assert_eq!(fs::read_to_string(output_path).unwrap(), "existing generated C");
         fs::remove_dir_all(build_directory).unwrap();
     }
