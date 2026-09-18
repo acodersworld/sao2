@@ -311,9 +311,9 @@ impl<'a> CapabilityValidator<'a> {
             },
             Type::Union(_) => Ok(()),
             // Containers are permanent packed managed references in every
-            // storage position.  Their operations remain capability-gated
-            // below, but declarations and aggregate carriers are valid in
-            // this foundation stage.
+            // storage position. Their descriptors and operations are rendered
+            // by the production backend; only explicitly out-of-scope uses
+            // such as container printing remain capability errors.
             Type::List(_) | Type::Map { .. } => Ok(()),
         }
     }
@@ -1672,7 +1672,7 @@ impl<'a> Renderer<'a> {
             .cloned()
             .collect::<Vec<_>>();
         if !lists.is_empty() {
-        self.output.push_str("\n/* Stage 2 typed list operations. */\n");
+        self.output.push_str("\n/* Managed typed list operations. */\n");
         for container in lists {
             let ty = container.ty.index();
             let element = container.element.expect("list element");
@@ -1880,7 +1880,7 @@ impl<'a> Renderer<'a> {
             .collect::<Vec<_>>();
         if maps.is_empty() || !self.collection_enabled() { return; }
 
-        self.output.push_str("\n/* Stage 3 typed ordered-map operations. */\n");
+        self.output.push_str("\n/* Managed typed ordered-map operations. */\n");
         for container in maps {
             let ty = container.ty.index();
             let key = container.key.expect("map key");

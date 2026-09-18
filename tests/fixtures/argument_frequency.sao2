@@ -1,0 +1,27 @@
+// Expected output for: run argument_frequency.sao2 alpha beta alpha
+// alpha
+// 2
+// beta
+// 1
+//
+// Arguments are counted in first-seen order.  The map replacement is
+// non-structural, so the compound assignment keeps that order stable.
+fn main(args [str]) {
+    var frequencies := {} : {str: int};
+    known := {"alpha": true};
+    for argument in args {
+        if argument in frequencies {
+            frequencies[argument] += 1;
+        } else {
+            frequencies[argument] = 1;
+        }
+        // This lookup compares a command-line string with a source literal.
+        if argument in known {
+            frequencies[argument] += 0;
+        }
+    }
+    for argument in frequencies {
+        println(argument);
+        println(frequencies[argument]);
+    }
+}

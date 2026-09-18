@@ -50,6 +50,70 @@ fn run_fixture(directory: &TestDirectory, name: &str, source: &[u8]) -> Output {
     sao2(&directory.0, &[OsStr::new("run"), source_path.as_os_str()])
 }
 
+fn run_fixture_with_arguments(
+    directory: &TestDirectory,
+    name: &str,
+    source: &[u8],
+    arguments: &[&str],
+) -> Output {
+    let source_path = directory.write_source(name, source);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sao2"));
+    command
+        .arg("run")
+        .arg(&source_path)
+        .args(arguments)
+        .current_dir(&directory.0);
+    command.output().unwrap()
+}
+
+// Stage 6 container conformance ledger.  Each row names the narrow regression
+// and the public witness; implementation-only layout, trace, growth, failure
+// injection, and epoch rows remain in the focused c_backend probes.
+//
+// Lists: empty/contextual literals (runs_complete_list_operations_and_aliasing,
+// runs_nested_lists_and_union_membership), literal order and len/indexing
+// (runs_complete_list_operations_and_aliasing), replacement/compound mutation
+// (iterates_lists_in_index_order_and_sees_replacement), growth/removal and
+// negative bounds (runs_complete_list_operations_and_aliasing), primitive,
+// aggregate, union, struct, nested-list, and identity membership (stores_
+// reference_and_inline_values_in_lists, runs_nested_lists_and_union_membership),
+// aliasing through calls/results/aggregates (balances_nested_alias_iteration_
+// and_normal_exits, runs_maps_with_reference_values_and_nested_projection),
+// iteration/copy/lock cleanup (iterates_lists_in_index_order_and_sees_replacement,
+// balances_nested_alias_iteration_and_normal_exits), and structural rejection
+// (rejects_structural_mutation_during_list_and_map_iteration).  The public
+// growing_graph and tag_system fixtures add returned/nested worklists.
+//
+// Maps: contextual and non-empty literals, duplicate first-position/last-value,
+// lookup/len/membership, replacement, removal/reinsertion, ordered iteration,
+// and identity (runs_ordered_map_operations_and_reinsertion,
+// iterates_maps_in_insertion_order_and_allows_value_replacement); nested and
+// reference values plus repeated growth (runs_maps_with_reference_values_and_
+// nested_projection, preserves_recursive_container_graphs_during_growth);
+// string and tuple keys (runs_string_and_tuple_map_keys); missing operations
+// and alias-wide locks (reports_missing_map_keys_as_language_panics,
+// rejects_structural_mutation_during_list_and_map_iteration).  Unit, boolean,
+// integer-extreme, and nested immutable-tuple key cases are covered by the
+// semantic matrix and backend/native probes; argument_frequency and
+// growing_graph provide public string/int map paths.
+//
+// Storage/flow: struct, tuple, union, list, map, and string carriers are
+// exercised by runs_inline_and_referenced_struct_graphs,
+// constructs_compares_projects_and_narrows_tuples, stores_reference_and_inline_
+// values_in_lists, runs_maps_with_reference_values_and_nested_projection,
+// runs_integrated_gc_graphs_through_the_public_pipeline, and the argument
+// frequency, graph, and tag fixtures. Recursive calls, switch/narrowing,
+// normal loop exits, postfix-try cleanup, and collection pressure remain
+// localized in lowering/semantic/native tests and gc_integrated.
+//
+// CLI/failure ledger: malformed_source_has_stable_diagnostic and
+// rejects_invalid_struct_programs_before_c_emission cover source ownership;
+// reports_missing_map_keys_as_language_panics, reports_string_index_failures,
+// rejects_structural_mutation_during_list_and_map_iteration, and the GC tests
+// cover runtime ownership; missing_configured_compiler and
+// failing_compiler_reports_captured_failure cover toolchain ownership; and
+// returns_integer_main_result covers a successful program result.
+
 fn compiler_is_missing(output: &Output) -> bool {
     String::from_utf8_lossy(&output.stderr).contains("no supported C compiler found")
 }
@@ -180,6 +244,141 @@ fn malformed_source_has_stable_diagnostic() {
 }
 
 #[test]
+fn help_reports_the_public_commands_and_argument_forwarding() {
+    let directory = TestDirectory::new("help");
+    let output = sao2(&directory.0, &[OsStr::new("--help")]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("sao2 build [--show-c] <source>"));
+    assert!(stdout.contains("sao2 run [--show-c] <source> [--] [program-argument ...]"));
+    assert!(stdout.contains("forwards program arguments"));
+}
+
+#[test]
+fn runs_readable_container_algorithm_fixtures() {
+    let directory = TestDirectory::new("container fixtures");
+
+    let graph = run_fixture(
+        &directory,
+        "growing graph !.sao2",
+        include_bytes!("fixtures/growing_graph.sao2"),
+    );
+    assert!(!compiler_is_missing(&graph), "{}", String::from_utf8_lossy(&graph.stderr));
+    assert!(graph.status.success(), "{}", String::from_utf8_lossy(&graph.stderr));
+    assert_eq!(graph.stdout, b"28\n8\ntrue\n0\n1\n2\n3\n4\n5\n6\n7\n");
+
+    let tag_system = run_fixture(
+        &directory,
+        "tag system (growth).sao2",
+        include_bytes!("fixtures/tag_system.sao2"),
+    );
+    assert!(!compiler_is_missing(&tag_system), "{}", String::from_utf8_lossy(&tag_system.stderr));
+    assert!(tag_system.status.success(), "{}", String::from_utf8_lossy(&tag_system.stderr));
+    assert_eq!(tag_system.stdout, b"17\n8\n8\n");
+
+    let try_containers = run_fixture(
+        &directory,
+        "try containers.sao2",
+        include_bytes!("fixtures/try_containers.sao2"),
+    );
+    assert!(!compiler_is_missing(&try_containers), "{}", String::from_utf8_lossy(&try_containers.stderr));
+    assert!(try_containers.status.success(), "{}", String::from_utf8_lossy(&try_containers.stderr));
+    assert_eq!(try_containers.stdout, b"3\n3\n1\n");
+}
+
+#[test]
+fn run_forwards_arguments_to_frequency_fixture_in_order() {
+    let directory = TestDirectory::new("argument frequency");
+    let empty = run_fixture_with_arguments(
+        &directory,
+        "argument frequency !.sao2",
+        include_bytes!("fixtures/argument_frequency.sao2"),
+        &[],
+    );
+    assert!(!compiler_is_missing(&empty), "{}", String::from_utf8_lossy(&empty.stderr));
+    assert!(empty.status.success(), "{}", String::from_utf8_lossy(&empty.stderr));
+    assert!(empty.stdout.is_empty());
+
+    let output = run_fixture_with_arguments(
+        &directory,
+        "argument frequency !.sao2",
+        include_bytes!("fixtures/argument_frequency.sao2"),
+        &["alpha", "beta", "alpha"],
+    );
+    assert!(!compiler_is_missing(&output), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"alpha\n2\nbeta\n1\n");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("using C compiler:"));
+}
+
+#[test]
+fn runs_all_v0_map_key_shapes_through_the_public_pipeline() {
+    let directory = TestDirectory::new("map key matrix");
+    let output = run_source(
+        &directory,
+        br#"
+            type Inner(int, bool);
+            type Outer(Inner, str);
+            fn main() {
+                units := {(): 7};
+                println(units[()]);
+                booleans := {false: 2, true: 3};
+                println(booleans[true]);
+                extremes := {-9223372036854775808: "low", 9223372036854775807: "high"};
+                println(extremes[-9223372036854775808]);
+                println(extremes[9223372036854775807]);
+                nested := {Outer(Inner(4, true), "key"): 11};
+                println(Outer(Inner(4, true), "key") in nested);
+                println(nested[Outer(Inner(4, true), "key")]);
+            }
+        "#,
+    );
+    assert!(!compiler_is_missing(&output), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"7\n3\nlow\nhigh\ntrue\n11\n");
+}
+
+#[test]
+fn show_c_and_build_run_use_the_same_artifact_for_unusual_filenames() {
+    let directory = TestDirectory::new("CLI artifact boundaries");
+    let source_path = directory.write_source(
+        "container fixture ! [spaces].sao2",
+        include_bytes!("fixtures/growing_graph.sao2"),
+    );
+    let built = sao2(
+        &directory.0,
+        &[OsStr::new("build"), source_path.as_os_str()],
+    );
+    assert!(!compiler_is_missing(&built), "{}", String::from_utf8_lossy(&built.stderr));
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    assert!(String::from_utf8_lossy(&built.stdout).contains("built "));
+    assert!(String::from_utf8_lossy(&built.stderr).contains("using C compiler:"));
+    let first_c = fs::read(directory.0.join("build/program.c")).unwrap();
+
+    let shown = sao2(
+        &directory.0,
+        &[
+            OsStr::new("build"),
+            OsStr::new("--show-c"),
+            source_path.as_os_str(),
+        ],
+    );
+    assert!(shown.status.success(), "{}", String::from_utf8_lossy(&shown.stderr));
+    assert!(shown.stdout.starts_with(&first_c));
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("built "));
+    assert_eq!(fs::read(directory.0.join("build/program.c")).unwrap(), first_c);
+
+    let run = sao2(
+        &directory.0,
+        &[OsStr::new("run"), source_path.as_os_str()],
+    );
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    assert_eq!(run.stdout, b"28\n8\ntrue\n0\n1\n2\n3\n4\n5\n6\n7\n");
+    assert_eq!(fs::read(directory.0.join("build/program.c")).unwrap(), first_c);
+}
+
+#[test]
 fn missing_configured_compiler_is_a_toolchain_error() {
     let directory = TestDirectory::new("missing compiler");
     let source_path = directory.write_source("hello.sao2", b"fn main() { print(\"hello\"); }");
@@ -192,6 +391,35 @@ fn missing_configured_compiler_is_a_toolchain_error() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("configured C compiler"));
+}
+
+#[test]
+fn uses_a_configured_compiler_through_the_public_cli() {
+    let directory = TestDirectory::new("configured compiler");
+    let source_path = directory.write_source("configured compiler.sao2", b"fn main() { print(\"ok\"); }");
+    let candidates: &[&str] = if cfg!(windows) {
+        &["cl.exe", "clang.exe", "gcc.exe", "cc.exe"]
+    } else {
+        &["cc", "clang", "gcc"]
+    };
+    let compiler_path = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .flat_map(|directory| candidates.iter().map(move |candidate| directory.join(candidate)))
+        .find(|path| path.is_file());
+    let Some(compiler_path) = compiler_path else {
+        eprintln!("skipping configured compiler test: no supported compiler is available");
+        return;
+    };
+    let output = Command::new(env!("CARGO_BIN_EXE_sao2"))
+        .args([OsStr::new("build"), source_path.as_os_str()])
+        .env("SAO2_CC", &compiler_path)
+        .current_dir(&directory.0)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains(&format!("using C compiler: {}", compiler_path.display())));
 }
 
 #[test]
@@ -500,6 +728,18 @@ fn reports_missing_map_keys_as_language_panics() {
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("sao2: panic: map key not found"), "{stderr}");
+    assert!(stderr.contains("program with spaces.sao2:1:"), "{stderr}");
+}
+
+#[test]
+fn reports_list_bounds_as_a_language_panic() {
+    let directory = TestDirectory::new("list bounds failure");
+    let output = run_source(&directory, b"fn main() { values := [1]; values[1]; }");
+    assert!(!compiler_is_missing(&output), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("sao2: panic: list index out of range"), "{stderr}");
     assert!(stderr.contains("program with spaces.sao2:1:"), "{stderr}");
 }
 

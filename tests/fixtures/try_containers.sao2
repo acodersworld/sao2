@@ -1,0 +1,40 @@
+// Expected output:
+// 3
+// 3
+// 1
+//
+// `ensure_nonempty` propagates from a list loop with `?`; its caller then
+// receives a list, mutates it, and returns it through the ordinary union path.
+type Values([int] | Error(str));
+
+fn ensure_nonempty(values [int]) () | Error(str) {
+    for value in values {
+        if value > 0 {
+            return ();
+        }
+    }
+    return Error("empty");
+}
+
+fn make_values() Values {
+    var values := [1];
+    ensure_nonempty(values)?;
+    values.append(2);
+    values
+}
+
+fn main() {
+    var result := make_values();
+    if result is [int] {
+        result.append(3);
+        println(result.len());
+        println(result.len());
+    } else {
+        println("error");
+    }
+    choice := Values([4]);
+    switch choice {
+        [int]: println(choice.len());
+        Error: println("error");
+    }
+}

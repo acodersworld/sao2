@@ -1,6 +1,6 @@
 # Current Stage: Integration and Milestone Closure
 
-Status: current.
+Status: complete.
 
 This document expands Stage 6 of
 [Current Milestone: Containers](CURRENT_MILESTONE.md). Stages 1-5 completed the

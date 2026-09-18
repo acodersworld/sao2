@@ -49,6 +49,7 @@ fn build(options: cli::CompileOptions, requested_run: bool) -> i32 {
         compiled,
         options.show_c,
         requested_run,
+        &options.program_arguments,
         &mut std::io::stderr(),
         host_compiler::compile,
         program::run,
@@ -70,6 +71,7 @@ fn finish_build<W, H, R>(
     compiled: compiler::CompileOutput,
     show_c: bool,
     requested_run: bool,
+    program_arguments: &[OsString],
     standard_error: &mut W,
     compile_c: H,
     run_program: R,
@@ -77,7 +79,7 @@ fn finish_build<W, H, R>(
 where
     W: Write,
     H: FnOnce(&Path) -> Result<PathBuf, diagnostic::Diagnostic>,
-    R: FnOnce(&Path) -> Result<i32, diagnostic::Diagnostic>,
+    R: FnOnce(&Path, &[OsString]) -> Result<i32, diagnostic::Diagnostic>,
 {
     if !compiled.warnings.is_empty() {
         let _ = writeln!(standard_error, "{}", compiled.warnings);
@@ -97,7 +99,7 @@ where
     }
     let result = compile_c(&generated_c);
     match result {
-        Ok(executable) if requested_run => match run_program(&executable) {
+        Ok(executable) if requested_run => match run_program(&executable, program_arguments) {
             Ok(exit_code) => exit_code,
             Err(diagnostic) => {
                 eprintln!("{diagnostic}");
@@ -160,6 +162,7 @@ mod tests {
             },
             false,
             false,
+            &[],
             &mut sink,
             move |_| {
                 let rendered = String::from_utf8(observed.borrow().clone()).unwrap();
@@ -167,7 +170,7 @@ mod tests {
                 assert!(rendered.contains("synthetic warning"));
                 Ok(PathBuf::from("unused-program"))
             },
-            |_| unreachable!("build must not run the executable"),
+            |_, _| unreachable!("build must not run the executable"),
         );
         assert_eq!(status, 0);
     }

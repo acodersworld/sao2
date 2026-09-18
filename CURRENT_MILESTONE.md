@@ -1,6 +1,6 @@
 # Current Milestone: Containers
 
-Status: current.
+Status: complete.
 
 This document maps milestone 11 of `ROADMAP.md` into implementation stages.
 The frontend and typed IR already represent list and map types, literals,
@@ -210,7 +210,7 @@ on unused capacity being zero or traced.
 
 ## Stage 6: Integration and milestone closure
 
-Status: current.
+Status: complete.
 
 The detailed implementation plan is in
 [Current Stage: Integration and Milestone Closure](CURRENT_STAGE.md).
@@ -277,7 +277,7 @@ The following remain outside milestone 11:
 - FFI, modules, closures, or standard-library APIs beyond the v0 design; and
 - diagnostics-wide presentation work belonging to milestone 12.
 
-Contributor guidance prohibits compiling, running tests, or formatting while
-implementing this milestone. Generated artifacts must not be committed, and
-every stage must preserve filenames and byte-oriented source locations for
-diagnostics.
+Contributor guidance authorizes compilation and tests for this completed stage
+while continuing to prohibit formatting files. Generated artifacts must not be
+committed, and every stage must preserve filenames and byte-oriented source
+locations for diagnostics.

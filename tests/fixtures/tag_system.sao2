@@ -1,0 +1,36 @@
+// Expected output:
+// 17
+// 8
+// 8
+//
+// Each processed symbol appends a two-symbol production.  The cursor makes
+// the finite source implement a growing abstract machine without recursion.
+type Rule(int, int);
+
+fn main() {
+    var rules := {0: Rule(1, 0), 1: Rule(1, 0)};
+    var word := [0];
+    var cursor := 0;
+    while cursor < 8 {
+        symbol := word[cursor];
+        rule := rules[symbol];
+        if symbol == 0 {
+            word.append(rule.0);
+            word.append(rule.1);
+        } else {
+            word.append(rule.1);
+            word.append(rule.0);
+        }
+        cursor += 1;
+    }
+
+    var ones := 0;
+    for symbol in word {
+        if symbol == 1 {
+            ones += 1;
+        }
+    }
+    println(word.len());
+    println(ones);
+    println(cursor);
+}

@@ -188,11 +188,14 @@ end-to-end coverage.
 
 ## 11. Containers
 
-Status: current.
+Status: complete.
+
+This milestone is complete. Its public integration evidence is retained in the
+readable fixtures and end-to-end conformance ledger under `tests/`.
 
 The milestone breakdown is in
 [Current Milestone: Containers](CURRENT_MILESTONE.md). The active
-implementation plan is in
+implementation plan, now complete, is in
 [Current Stage: Integration and Milestone Closure](CURRENT_STAGE.md).
 
 - Implement lists, maps, indexing, membership, iteration, and mutation.
@@ -205,6 +208,11 @@ Outcome: programs can perform useful computation with unbounded containers and
 the abstract language is Turing-complete.
 
 ## 12. Diagnostics and hardening
+
+Status: pending.
+
+The next active milestone will establish its detailed plan before implementation
+begins.
 
 - Render compile-time diagnostics with primary and related source spans.
 - Map every runtime panic to its SAO2 operation and function.

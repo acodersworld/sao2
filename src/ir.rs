@@ -1,9 +1,8 @@
 //! Owned typed control-flow IR.
 //!
-//! Lowering is the sole owned construction boundary for this IR. Milestone 6
-//! validates and retains it alongside the temporary resolved-AST backend;
-//! milestone 7 replaces that backend with IR-based C generation. No IR value
-//! borrows the frontend.
+//! Lowering is the sole owned construction boundary for this IR. The production
+//! backend consumes this validated representation directly; no IR value borrows
+//! the frontend.
 
 use std::collections::HashSet;
 use std::fmt::{self, Write as _};

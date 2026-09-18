@@ -1,0 +1,59 @@
+// Expected output:
+// 28
+// 8
+// true
+// 0 1 2 3 4 5 6 7 (one value per line)
+//
+// The graph is returned by build_graph and stored inside Graph.  The worklist
+// uses a cursor because SAO2 deliberately has no queue API.
+type Graph(adjacency {int: [int]}, start int);
+
+fn neighbors(first int, second int) [int] {
+    var values := [first];
+    values.append(second);
+    values
+}
+
+fn build_graph() Graph {
+    var adjacency := {} : {int: [int]};
+    adjacency[0] = neighbors(1, 2);
+    adjacency[1] = neighbors(3, 4);
+    adjacency[2] = neighbors(4, 5);
+    adjacency[3] = neighbors(0, 5);
+    adjacency[4] = neighbors(6, 7);
+    adjacency[5] = neighbors(1, 7);
+    adjacency[6] = neighbors(7, 0);
+    adjacency[7] = [] : [int];
+    Graph(adjacency = adjacency, start = 0)
+}
+
+fn main() {
+    graph := build_graph();
+    var work := [graph.start];
+    var alias := work;
+    var seen := {} : {int: bool};
+    seen[graph.start] = true;
+    var cursor := 0;
+    var total := 0;
+    while cursor < work.len() {
+        node := work[cursor];
+        cursor += 1;
+        total += node;
+        next := graph.adjacency[node];
+        var index := 0;
+        while index < next.len() {
+            neighbor := next[index];
+            if !(neighbor in seen) {
+                seen[neighbor] = true;
+                work.append(neighbor);
+            }
+            index += 1;
+        }
+    }
+    println(total);
+    println(work.len());
+    println(work == alias);
+    for node in work {
+        println(node);
+    }
+}
