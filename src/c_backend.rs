@@ -1445,9 +1445,8 @@ impl<'a> Renderer<'a> {
                     (layout.payload_offset, layout.record_stride)
                 };
                 let _ = writeln!(self.output, "static sao2_arena_result sao2_allocate_container_backing_ty_{}_{}(uint64_t capacity, sao2_ref *reference, unsigned char **body) {{", container.ty.index(), backing_role_name(*role));
-                self.output.push_str("    uint64_t body_size;");
-                let _ = writeln!(self.output, " if (capacity > (UINT64_MAX - UINT64_C({})) / UINT64_C({})) return SAO2_ARENA_EXHAUSTED;", payload_offset, record_stride);
-                let _ = writeln!(self.output, "    body_size = UINT64_C({}) + capacity * UINT64_C({});", payload_offset, record_stride);
+                self.output.push_str("    uint64_t payload_size, body_size;");
+                let _ = writeln!(self.output, "\n    if (capacity > UINT64_C(9223372036854775807) || !sao2_checked_mul_u64(capacity, UINT64_C({}), &payload_size) || !sao2_checked_add_u64(UINT64_C({}), payload_size, &body_size) || body_size > UINT64_C(4294967296)) return SAO2_ARENA_EXHAUSTED;", record_stride, payload_offset);
                 let _ = writeln!(self.output, "    return sao2_allocate_managed(&{}, body_size, reference, body);", backing_layout_name(container.ty, *role));
                 self.output.push_str("}\n");
             }
@@ -1683,6 +1682,18 @@ impl<'a> Renderer<'a> {
             let layout = backing_layout_name(container.ty, BackingRole::Elements);
             let offset = self.managed_layout(container.ty, BackingRole::Elements).payload_offset;
             let descriptor = format!("sao2_value_descriptor_ty_{}", element.index());
+            let transaction = format!("sao2_list_transaction_ty_{ty}");
+
+            if self.collection_enabled() {
+                let _ = writeln!(self.output, "typedef struct {transaction} {{");
+                self.output.push_str("    sao2_shadow_frame header;\n    sao2_ref old_destination;\n");
+                let _ = writeln!(self.output, "}} {transaction};");
+                let _ = writeln!(self.output, "static void sao2_trace_{transaction}(sao2_trace_context *context, const sao2_shadow_frame *frame) {{");
+                let _ = writeln!(self.output, "    const {transaction} *typed = (const {transaction} *)frame;");
+                self.output.push_str("    if (context->result != SAO2_TRACE_OK) return;\n");
+                let _ = writeln!(self.output, "    if (typed->old_destination.owner_ptr != 0 || typed->old_destination.member_ptr != 0) sao2_trace_enqueue(context, typed->old_destination, &sao2_layout_control_ty_{ty});");
+                self.output.push_str("}\n\n");
+            }
 
             let _ = writeln!(self.output, "static _Noreturn void sao2_list_fail_ty_{ty}(size_t site, uint32_t operation, sao2_arena_result status) {{");
             self.output.push_str("    static const unsigned char exhausted[] = \"heap arena exhausted\";\n");
@@ -1728,14 +1739,15 @@ impl<'a> Renderer<'a> {
 
             let _ = writeln!(self.output, "static unsigned char *sao2_list_begin_construct_ty_{ty}(sao2_ref *destination, uint64_t count, size_t site, sao2_ref *backing) {{");
             self.output.push_str("    sao2_arena_result status;\n    uint64_t capacity;\n    unsigned char *control_body;\n    unsigned char *backing_body;\n");
-            self.output.push_str("    if (destination == NULL || backing == NULL) sao2_compiler_invariant();\n    *destination = (sao2_ref){0};\n    *backing = (sao2_ref){0};\n");
+            self.output.push_str("    if (destination == NULL || backing == NULL) sao2_compiler_invariant();\n");
+            let _ = writeln!(self.output, "    if (count != 0 && !sao2_list_capacity_ty_{ty}(count, UINT64_C(0), &capacity)) sao2_list_fail_ty_{ty}(site, SAO2_FAILURE_LIST_ALLOCATION, SAO2_ARENA_EXHAUSTED);");
+            self.output.push_str("    *destination = (sao2_ref){0};\n    *backing = (sao2_ref){0};\n");
             let _ = writeln!(self.output, "    status = sao2_allocate_container_control_ty_{ty}(destination, &control_body);");
             self.output.push_str("    if (status != SAO2_ARENA_OK) {\n");
             let _ = writeln!(self.output, "        sao2_list_fail_ty_{ty}(site, SAO2_FAILURE_LIST_ALLOCATION, status);");
             self.output.push_str("    }\n");
             let _ = writeln!(self.output, "    memset(control_body, 0, sizeof({control}));");
             self.output.push_str("    if (count == 0) return NULL;\n");
-            let _ = writeln!(self.output, "    if (!sao2_list_capacity_ty_{ty}(count, UINT64_C(0), &capacity)) sao2_list_fail_ty_{ty}(site, SAO2_FAILURE_LIST_ALLOCATION, SAO2_ARENA_EXHAUSTED);");
             let _ = writeln!(self.output, "    status = sao2_allocate_container_backing_ty_{ty}_elements(capacity, backing, &backing_body);");
             self.output.push_str("    if (status != SAO2_ARENA_OK) {\n");
             let _ = writeln!(self.output, "        sao2_list_fail_ty_{ty}(site, SAO2_FAILURE_LIST_ALLOCATION, status);");
@@ -1888,13 +1900,15 @@ impl<'a> Renderer<'a> {
 
             let _ = writeln!(self.output, "typedef struct {transaction} {{");
             self.output.push_str("    sao2_shadow_frame header;\n");
-            self.output.push_str("    sao2_ref ordered_entries;\n    sao2_ref lookup_slots;\n");
+            let _ = writeln!(self.output, "    sao2_ref ordered_entries;\n    sao2_ref lookup_slots;\n    sao2_ref old_destination;\n    {value_c_type} source_value;");
             let _ = writeln!(self.output, "}} {transaction};");
             let _ = writeln!(self.output, "static void sao2_trace_{transaction}(sao2_trace_context *context, const sao2_shadow_frame *frame) {{");
             let _ = writeln!(self.output, "    const {transaction} *typed = (const {transaction} *)frame;");
             self.output.push_str("    if (context->result != SAO2_TRACE_OK) return;\n");
             let _ = writeln!(self.output, "    if (typed->ordered_entries.owner_ptr != 0 || typed->ordered_entries.member_ptr != 0) sao2_trace_enqueue(context, typed->ordered_entries, &{entry_layout});");
             let _ = writeln!(self.output, "    if (typed->lookup_slots.owner_ptr != 0 || typed->lookup_slots.member_ptr != 0) sao2_trace_enqueue(context, typed->lookup_slots, &{slot_layout});");
+            let _ = writeln!(self.output, "    if (typed->old_destination.owner_ptr != 0 || typed->old_destination.member_ptr != 0) sao2_trace_enqueue(context, typed->old_destination, &sao2_layout_control_ty_{ty});");
+            self.render_trace_value(value, MemberStorage::Referenced, "typed->source_value", 1);
             self.output.push_str("}\n\n");
 
             let _ = writeln!(self.output, "static _Noreturn void sao2_map_fail_ty_{ty}(size_t site, uint32_t operation, sao2_arena_result status) {{");
@@ -1923,7 +1937,7 @@ impl<'a> Renderer<'a> {
             self.output.push_str("    owner = (uint64_t)(reference.owner_ptr & ~SAO2_REF_OWNER_TAG_MASK);\n");
             self.output.push_str("    if ((reference.owner_ptr & SAO2_REF_OWNER_TAG_MASK) != SAO2_REF_HEAP_TAG || reference.member_ptr != (uint32_t)owner || owner == 0) sao2_compiler_invariant();\n");
             let _ = writeln!(self.output, "    value = ({control} *)sao2_resolve_body(reference, &sao2_layout_control_ty_{ty});");
-            self.output.push_str("    if (value->length > value->entry_capacity || value->length > value->slot_capacity / UINT64_C(2) || value->entry_capacity > (uint64_t)INT64_MAX || value->slot_capacity > (uint64_t)INT64_MAX) sao2_compiler_invariant();\n");
+            self.output.push_str("    if (value->length > value->entry_capacity || value->length > value->slot_capacity / UINT64_C(2) || value->entry_capacity > (uint64_t)INT64_MAX || value->slot_capacity > (uint64_t)INT64_MAX || (value->slot_capacity != 0 && (value->slot_capacity & (value->slot_capacity - UINT64_C(1))) != 0)) sao2_compiler_invariant();\n");
             self.output.push_str("    if ((value->ordered_entries.owner_ptr == 0 && value->ordered_entries.member_ptr == 0) != (value->entry_capacity == 0) || (value->lookup_slots.owner_ptr == 0 && value->lookup_slots.member_ptr == 0) != (value->slot_capacity == 0)) sao2_compiler_invariant();\n");
             self.output.push_str("    if (value->entry_capacity != 0) {\n");
             let _ = writeln!(self.output, "        entries_prefix = (const sao2_backing_prefix *)sao2_resolve_body(value->ordered_entries, &{entry_layout});");
@@ -1946,9 +1960,10 @@ impl<'a> Renderer<'a> {
             let _ = writeln!(self.output, "    for (step = 0; step < control->slot_capacity; ++step) {{\n        uint64_t encoded = slots[position];\n        if (encoded == 0) return false;\n        if (encoded > control->length) sao2_compiler_invariant();\n        if ({key_descriptor}.equal(&entries[encoded - UINT64_C(1)].key, wanted)) {{ *entry_position = encoded - UINT64_C(1); *slot_position = position; return true; }}\n        position = (position + UINT64_C(1)) & (control->slot_capacity - UINT64_C(1));\n    }}\n    sao2_compiler_invariant();\n}}\n\n");
 
             let _ = writeln!(self.output, "static void sao2_map_rebuild_slots_ty_{ty}(uint64_t slot_capacity, uint64_t length, {slot_record} *slots, const {entry_record} *entries) {{");
-            self.output.push_str("    uint64_t index, position, step, hash;\n");
+            self.output.push_str("    uint64_t index, position, step, hash, slot_bytes;\n");
             self.output.push_str("    if (slot_capacity == 0 || length > slot_capacity / UINT64_C(2) || slots == NULL || entries == NULL) sao2_compiler_invariant();\n");
-            self.output.push_str("    memset(slots, 0, (size_t)(slot_capacity * UINT64_C(8)));\n");
+            self.output.push_str("    if (!sao2_checked_mul_u64(slot_capacity, UINT64_C(8), &slot_bytes) || slot_bytes > (uint64_t)SIZE_MAX) sao2_compiler_invariant();\n");
+            self.output.push_str("    memset(slots, 0, (size_t)slot_bytes);\n");
             self.output.push_str("    for (index = 0; index < length; ++index) {\n");
             let _ = writeln!(self.output, "        hash = {key_descriptor}.hash(&entries[index].key); position = hash & (slot_capacity - UINT64_C(1));");
             self.output.push_str("        for (step = 0; step < slot_capacity; ++step) {\n            if (slots[position] == 0) { slots[position] = index + UINT64_C(1); break; }\n            position = (position + UINT64_C(1)) & (slot_capacity - UINT64_C(1));\n        }\n        if (step == slot_capacity) sao2_compiler_invariant();\n    }\n}\n\n");
@@ -2012,6 +2027,7 @@ impl<'a> Renderer<'a> {
             let _ = writeln!(self.output, "{control} *control; {entry_record} *entries; {slot_record} *slots; {entry_record} *new_entries; {slot_record} *new_slots; unsigned char *body;");
             self.output.push_str("    if (key_value == NULL || source == NULL || transaction_frame == NULL) sao2_compiler_invariant();\n");
             let _ = writeln!(self.output, "    control = sao2_map_control_ty_{ty}(reference); hash = {key_descriptor}.hash(key_value);");
+            self.output.push_str("    transaction_frame->source_value = *source;\n");
             let _ = writeln!(self.output, "    if (sao2_map_find_ty_{ty}(reference, key_value, &entry, &slot)) {{ entries = ({entry_record} *)(sao2_resolve_body(control->ordered_entries, &{entry_layout}) + UINT64_C({entry_offset})); {value_descriptor}.copy(&entries[entry].value, source); return; }}");
             self.output.push_str("    sao2_require_operation(site, SAO2_FAILURE_MAP_INSERT);\n");
             let _ = writeln!(self.output, "    if (control->lock_count != 0) {{ static const unsigned char reason[] = \"container structurally modified during iteration\"; sao2_fail(site, SAO2_FAILURE_MAP_INSERT, reason, sizeof reason - 1); }}");
@@ -2052,8 +2068,8 @@ impl<'a> Renderer<'a> {
             self.output.push_str("    uint64_t entry_capacity, slot_capacity, index, existing, unique; sao2_arena_result status; unsigned char *body; ");
             let _ = writeln!(self.output, "{control} *control; {entry_record} *entries; {slot_record} *slots;");
             self.output.push_str("    if (destination == NULL || transaction_frame == NULL || (count != 0 && (keys == NULL || values == NULL))) sao2_compiler_invariant();\n");
+            let _ = writeln!(self.output, "    if (count != 0 && (!sao2_map_entry_capacity_ty_{ty}(count, UINT64_C(0), &entry_capacity) || !sao2_map_slot_capacity_ty_{ty}(count, UINT64_C(0), &slot_capacity))) sao2_map_fail_ty_{ty}(site, SAO2_FAILURE_MAP_ALLOCATION, SAO2_ARENA_EXHAUSTED);");
             let _ = writeln!(self.output, "    *destination = (sao2_ref){{0}}; status = sao2_allocate_container_control_ty_{ty}(destination, &body); if (status != SAO2_ARENA_OK) sao2_map_fail_ty_{ty}(site, SAO2_FAILURE_MAP_ALLOCATION, status); memset(body, 0, sizeof({control})); if (count == 0) return;");
-            let _ = writeln!(self.output, "    if (!sao2_map_entry_capacity_ty_{ty}(count, UINT64_C(0), &entry_capacity) || !sao2_map_slot_capacity_ty_{ty}(count, UINT64_C(0), &slot_capacity)) sao2_map_fail_ty_{ty}(site, SAO2_FAILURE_MAP_ALLOCATION, SAO2_ARENA_EXHAUSTED);");
             self.output.push_str("    transaction_frame->ordered_entries = (sao2_ref){0}; transaction_frame->lookup_slots = (sao2_ref){0};\n");
             let _ = writeln!(self.output, "    status = sao2_allocate_container_backing_ty_{ty}_ordered_entries(entry_capacity, &transaction_frame->ordered_entries, &body); if (status != SAO2_ARENA_OK) sao2_map_fail_ty_{ty}(site, SAO2_FAILURE_MAP_ALLOCATION, status);");
             let _ = writeln!(self.output, "    status = sao2_allocate_container_backing_ty_{ty}_lookup_slots(slot_capacity, &transaction_frame->lookup_slots, &body); if (status != SAO2_ARENA_OK) sao2_map_fail_ty_{ty}(site, SAO2_FAILURE_MAP_ALLOCATION, status);");
@@ -2536,6 +2552,7 @@ impl<'a> Renderer<'a> {
             "struct sao2_layout_descriptor;\n",
             "static void sao2_trace_enqueue(sao2_trace_context *context, sao2_ref reference, const struct sao2_layout_descriptor *layout);\n",
             "static bool sao2_layout_validate_body(const struct sao2_layout_descriptor *layout, const unsigned char *body, uint64_t body_size, uint64_t *capacity);\n",
+            "static unsigned char *sao2_resolve_body(sao2_ref reference, const struct sao2_layout_descriptor *layout);\n",
         ));
         for definition in &self.trace_plan.struct_callbacks {
             let _ = writeln!(self.output, "static void sao2_trace_body_def_{}(sao2_trace_context *context, const unsigned char *body, uint64_t body_size);", definition.index());
@@ -2651,14 +2668,26 @@ impl<'a> Renderer<'a> {
         match container.kind {
             ContainerKind::List => {
                 let backing = backing_layout_name(container.ty, BackingRole::Elements);
+                self.output.push_str("    const sao2_backing_prefix *elements_prefix;\n");
                 self.output.push_str("    if ((value->elements.owner_ptr == 0 && value->elements.member_ptr == 0) != (value->capacity == 0)) { context->result = SAO2_TRACE_INVALID; return; }\n");
+                self.output.push_str("    if (value->capacity != 0) {\n");
+                let _ = writeln!(self.output, "        elements_prefix = (const sao2_backing_prefix *)sao2_resolve_body(value->elements, &{backing});");
+                self.output.push_str("        if (elements_prefix->capacity != value->capacity || elements_prefix->initialized != value->length) { context->result = SAO2_TRACE_INVALID; return; }\n    }\n");
                 self.output.push_str("    if (value->elements.owner_ptr != 0 || value->elements.member_ptr != 0) {");
                 let _ = writeln!(self.output, " sao2_trace_enqueue(context, value->elements, &{}); }}", backing);
             }
             ContainerKind::Map => {
                 let entries = backing_layout_name(container.ty, BackingRole::OrderedEntries);
                 let slots = backing_layout_name(container.ty, BackingRole::LookupSlots);
+                self.output.push_str("    const sao2_backing_prefix *entries_prefix; const sao2_backing_prefix *slots_prefix;\n");
+                self.output.push_str("    if (value->length > value->entry_capacity || value->length > value->slot_capacity / UINT64_C(2)) { context->result = SAO2_TRACE_INVALID; return; }\n");
                 self.output.push_str("    if ((value->ordered_entries.owner_ptr == 0 && value->ordered_entries.member_ptr == 0) != (value->entry_capacity == 0) || (value->lookup_slots.owner_ptr == 0 && value->lookup_slots.member_ptr == 0) != (value->slot_capacity == 0)) { context->result = SAO2_TRACE_INVALID; return; }\n");
+                self.output.push_str("    if (value->entry_capacity != 0) {\n");
+                let _ = writeln!(self.output, "        entries_prefix = (const sao2_backing_prefix *)sao2_resolve_body(value->ordered_entries, &{entries});");
+                self.output.push_str("        if (entries_prefix->capacity != value->entry_capacity || entries_prefix->initialized != value->length) { context->result = SAO2_TRACE_INVALID; return; }\n    }\n");
+                self.output.push_str("    if (value->slot_capacity != 0) {\n");
+                let _ = writeln!(self.output, "        slots_prefix = (const sao2_backing_prefix *)sao2_resolve_body(value->lookup_slots, &{slots});");
+                self.output.push_str("        if (slots_prefix->capacity != value->slot_capacity || slots_prefix->initialized != value->length) { context->result = SAO2_TRACE_INVALID; return; }\n    }\n");
                 self.output.push_str("    if (value->ordered_entries.owner_ptr != 0 || value->ordered_entries.member_ptr != 0) {");
                 let _ = writeln!(self.output, " sao2_trace_enqueue(context, value->ordered_entries, &{}); }}", entries);
                 self.output.push_str("    if (value->lookup_slots.owner_ptr != 0 || value->lookup_slots.member_ptr != 0) {");
@@ -2900,12 +2929,13 @@ impl<'a> Renderer<'a> {
         let control = container_control_name(list_ty);
         let _ = writeln!(self.output, "    {control} *control; {record} *records;");
         self.output.push_str("    if (destination == NULL || pool == NULL || argc < 0) return 5;\n");
-        self.output.push_str("    *destination = (sao2_ref){0}; count = argc > 0 ? (uint64_t)(argc - 1) : UINT64_C(0);\n");
+        self.output.push_str("    count = argc > 0 ? (uint64_t)(argc - 1) : UINT64_C(0);\n");
+        let _ = writeln!(self.output, "    if (count != 0 && !sao2_list_capacity_ty_{}(count, UINT64_C(0), &capacity)) return 1;", list_ty.index());
+        self.output.push_str("    *destination = (sao2_ref){0};\n");
         let _ = writeln!(self.output, "    status = sao2_allocate_container_control_ty_{}(destination, &control_body);", list_ty.index());
         self.output.push_str("    if (status != SAO2_ARENA_OK) return sao2_entry_arena_status(status);\n");
         let _ = writeln!(self.output, "    memset(control_body, 0, sizeof({control}));");
         self.output.push_str("    if (count == 0) return 0;\n");
-        let _ = writeln!(self.output, "    if (!sao2_list_capacity_ty_{}(count, UINT64_C(0), &capacity)) return 1;", list_ty.index());
         let _ = writeln!(self.output, "    status = sao2_allocate_container_backing_ty_{}_elements(capacity, &backing, &backing_body);", list_ty.index());
         self.output.push_str("    if (status != SAO2_ARENA_OK) return sao2_entry_arena_status(status);\n");
         let _ = writeln!(self.output, "    control = sao2_list_control_ty_{}(*destination);", list_ty.index());
@@ -3243,20 +3273,29 @@ impl<'a> Renderer<'a> {
         let layout = backing_layout_name(ty, BackingRole::Elements);
         let offset = self.managed_layout(ty, BackingRole::Elements).payload_offset;
         let descriptor = format!("sao2_value_descriptor_ty_{}", element.index());
+        let transaction = format!("sao2_list_transaction_ty_{}", ty.index());
         let id = destination.index();
         let destination_name = self.local(destination);
 
         self.output.push_str("    {\n");
+        let _ = writeln!(self.output, "    {transaction} sao2_list_transaction_{id} = {{0}};");
+        let _ = writeln!(self.output, "    sao2_list_transaction_{id}.header.trace = sao2_trace_{transaction};");
+        let _ = writeln!(self.output, "    sao2_shadow_link(&sao2_list_transaction_{id}.header);");
+        let _ = writeln!(self.output, "    sao2_list_transaction_{id}.old_destination = {destination_name};");
+        if !operands.is_empty() {
+            let element_c_type = self.c_type(element);
+            let _ = writeln!(self.output, "    {element_c_type} sao2_list_values_{id}[{}];", operands.len());
+            for (index, operand) in operands.iter().enumerate() {
+                let value = self.operand(operand);
+                let _ = writeln!(self.output, "    sao2_list_values_{id}[{index}] = {value};");
+            }
+        }
         let _ = writeln!(self.output, "    sao2_ref sao2_list_backing_{id} = {{0}};");
         let _ = writeln!(self.output, "    unsigned char *sao2_list_body_{id} = sao2_list_begin_construct_ty_{}(&{destination_name}, UINT64_C({}), {}, &sao2_list_backing_{id});", ty.index(), operands.len(), failure.index());
         if !operands.is_empty() {
             let _ = writeln!(self.output, "    {record} *sao2_list_records_{id} = ({record} *)(sao2_list_body_{id} + UINT64_C({offset}));");
-            for (index, operand) in operands.iter().enumerate() {
-                let value = self.operand(operand);
-                let value_name = format!("sao2_list_value_{id}_{index}");
-                let element_c_type = self.c_type(element);
-                let _ = writeln!(self.output, "    {element_c_type} {value_name} = {value};");
-                let _ = writeln!(self.output, "    {descriptor}.copy(&sao2_list_records_{id}[{index}].value, &{value_name});");
+            for index in 0..operands.len() {
+                let _ = writeln!(self.output, "    {descriptor}.copy(&sao2_list_records_{id}[{index}].value, &sao2_list_values_{id}[{index}]);");
                 let _ = writeln!(self.output, "    ((sao2_backing_prefix *)sao2_list_body_{id})->initialized = UINT64_C({});", index + 1);
             }
             let control = container_control_name(ty);
@@ -3264,6 +3303,7 @@ impl<'a> Renderer<'a> {
             let _ = writeln!(self.output, "    sao2_list_control_{id}->length = UINT64_C({});", operands.len());
             let _ = writeln!(self.output, "    (void)sao2_resolve_body(sao2_list_control_{id}->elements, &{layout});");
         }
+        let _ = writeln!(self.output, "    sao2_shadow_unlink(&sao2_list_transaction_{id}.header);");
         self.output.push_str("    }\n");
     }
 
@@ -3281,6 +3321,7 @@ impl<'a> Renderer<'a> {
         let _ = writeln!(self.output, "    sao2_map_transaction_{id}.header.trace = sao2_trace_{transaction};");
         self.output.push_str("    sao2_shadow_link(&sao2_map_transaction_" );
         let _ = writeln!(self.output, "{id}.header);");
+        let _ = writeln!(self.output, "    sao2_map_transaction_{id}.old_destination = {destination_name};");
         if !entries.is_empty() {
             let key_type = self.c_type(key);
             let value_type = self.c_type(value);
@@ -4087,6 +4128,9 @@ typedef struct {
 _Static_assert(sizeof(sao2_heap_header) != 0, "SAO2 heap header must not be empty");
 _Static_assert(sizeof(sao2_heap_header) == 48, "SAO2 heap header ABI");
 _Static_assert(sizeof(sao2_heap_header) % 8 == 0, "SAO2 heap header must preserve body alignment");
+_Static_assert((uint64_t)(SAO2_ARENA_CAPACITY) >= SAO2_ARENA_INITIAL_CURSOR
+    && (uint64_t)(SAO2_ARENA_CAPACITY) <= UINT64_C(4294967296),
+    "SAO2 arena capacity must fit the packed reference ABI");
 _Static_assert((SAO2_GC_ALLOCATION_THRESHOLD) >= 0
     && (uintmax_t)(SAO2_GC_ALLOCATION_THRESHOLD) > (uintmax_t)0
     && (uintmax_t)(SAO2_GC_ALLOCATION_THRESHOLD) <= (uintmax_t)UINT64_MAX,
@@ -4250,6 +4294,18 @@ static bool sao2_align_eight(uint64_t value, uint64_t *result) {
     return true;
 }
 
+static bool sao2_checked_add_u64(uint64_t left, uint64_t right, uint64_t *result) {
+    if (result == NULL || left > UINT64_MAX - right) return false;
+    *result = left + right;
+    return true;
+}
+
+static bool sao2_checked_mul_u64(uint64_t left, uint64_t right, uint64_t *result) {
+    if (result == NULL || (left != 0 && right > UINT64_MAX / left)) return false;
+    *result = left * right;
+    return true;
+}
+
 static sao2_arena_result sao2_arena_commit_through(sao2_arena *arena, uint64_t end) {
     uint64_t committed_end, remainder;
     if (arena->base == NULL || arena->page_size == 0 || end > arena->capacity)
@@ -4257,8 +4313,8 @@ static sao2_arena_result sao2_arena_commit_through(sao2_arena *arena, uint64_t e
     remainder = end % arena->page_size;
     if (remainder == 0) committed_end = end;
     else {
-        if (end > UINT64_MAX - (arena->page_size - remainder)) return SAO2_ARENA_EXHAUSTED;
-        committed_end = end + (arena->page_size - remainder);
+        if (!sao2_checked_add_u64(end, arena->page_size - remainder, &committed_end))
+            return SAO2_ARENA_EXHAUSTED;
     }
     if (committed_end > arena->capacity) return SAO2_ARENA_EXHAUSTED;
     if (committed_end > arena->committed) {
@@ -4320,10 +4376,8 @@ static bool sao2_ref_kind(sao2_ref reference, sao2_arena_kind *kind) {
 static bool sao2_heap_span(uint64_t body_size, uint64_t *result) {
     uint64_t payload = body_size < SAO2_REF_ALIGNMENT ? SAO2_REF_ALIGNMENT : body_size;
     uint64_t rounded_payload;
-    if (!sao2_align_eight(payload, &rounded_payload)
-        || rounded_payload > UINT64_MAX - (uint64_t)sizeof(sao2_heap_header)) return false;
-    *result = (uint64_t)sizeof(sao2_heap_header) + rounded_payload;
-    return true;
+    return sao2_align_eight(payload, &rounded_payload)
+        && sao2_checked_add_u64((uint64_t)sizeof(sao2_heap_header), rounded_payload, result);
 }
 
 static sao2_heap_header *sao2_heap_header_at(uint64_t offset) {
@@ -4344,7 +4398,9 @@ static bool sao2_heap_block_valid(uint64_t offset, uint64_t frontier, uint64_t *
     payload_capacity = header->span_size - (uint64_t)sizeof(sao2_heap_header);
     if (header->block_state == SAO2_HEAP_BLOCK_ALLOCATED) {
         if (header->body_size > payload_capacity || header->next_free != 0
-            || header->lifetime != SAO2_HEAP_LIFETIME || header->reserved != 0) return false;
+            || header->lifetime != SAO2_HEAP_LIFETIME
+            || header->mark_epoch > (uint32_t)SAO2_GC_EPOCH_LIMIT
+            || header->reserved != 0) return false;
     } else if (header->block_state == SAO2_HEAP_BLOCK_FREE) {
         if (header->body_size != 0 || header->layout_identity != 0 || header->lifetime != 0
             || header->mark_epoch != 0 || header->reserved != 0
@@ -4370,7 +4426,10 @@ static bool sao2_heap_find_block(uint64_t wanted, sao2_heap_header **result) {
 static bool sao2_heap_validate(void) {
     uint64_t offset, next, prior_free = 0, free_offset, free_count = 0, listed_count = 0;
     bool previous_free = false;
-    if (sao2_heap_arena.base == NULL || sao2_heap_arena.frontier < SAO2_ARENA_INITIAL_CURSOR
+    if (sao2_heap_arena.base == NULL || sao2_heap_arena.page_size == 0
+        || sao2_heap_arena.committed > sao2_heap_arena.capacity
+        || sao2_heap_arena.committed % sao2_heap_arena.page_size != 0
+        || sao2_heap_arena.frontier < SAO2_ARENA_INITIAL_CURSOR
         || sao2_heap_arena.frontier > sao2_heap_arena.capacity
         || (sao2_heap_arena.frontier > SAO2_ARENA_INITIAL_CURSOR
             && sao2_heap_arena.frontier > sao2_heap_arena.committed)
@@ -4487,7 +4546,8 @@ static sao2_arena_result sao2_heap_allocate_raw(uint64_t body_size, uint64_t ali
         sao2_heap_header *header;
         if (header_offset > sao2_heap_arena.capacity || required_span > sao2_heap_arena.capacity - header_offset)
             return SAO2_ARENA_EXHAUSTED;
-        end = header_offset + required_span;
+        if (!sao2_checked_add_u64(header_offset, required_span, &end))
+            return SAO2_ARENA_EXHAUSTED;
         body_offset = header_offset + (uint64_t)sizeof(sao2_heap_header);
         if (end > UINT64_C(4294967296) || !sao2_ref_root(SAO2_ARENA_HEAP, body_offset, &published))
             return SAO2_ARENA_EXHAUSTED;
@@ -4601,9 +4661,13 @@ typedef uint64_t sao2_scoped_mark;
 static sao2_scoped_mark sao2_scoped_mark_current(void) { return sao2_scoped_arena.frontier; }
 
 static sao2_arena_result sao2_scoped_allocate(uint64_t body_size, sao2_ref *result) {
-    uint64_t offset, predicted_start;
+    uint64_t offset, predicted_start, predicted_end, stored_size;
     if (!sao2_align_eight(sao2_scoped_arena.frontier, &predicted_start) || predicted_start > UINT32_MAX)
         return SAO2_ARENA_EXHAUSTED;
+    stored_size = body_size == 0 ? SAO2_REF_ALIGNMENT : body_size;
+    if (!sao2_checked_add_u64(predicted_start, stored_size, &predicted_end)
+        || !sao2_align_eight(predicted_end, &predicted_end)
+        || predicted_end > UINT64_C(4294967296)) return SAO2_ARENA_EXHAUSTED;
     sao2_arena_result status = sao2_scoped_bump_allocate(&sao2_scoped_arena, body_size, SAO2_REF_ALIGNMENT, &offset);
     if (status != SAO2_ARENA_OK) return status;
     if (!sao2_ref_root(SAO2_ARENA_SCOPED, offset, result)) return SAO2_ARENA_INVALID;

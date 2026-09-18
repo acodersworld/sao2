@@ -632,6 +632,57 @@ fn stores_reference_and_inline_values_in_lists() {
 }
 
 #[test]
+fn preserves_recursive_container_graphs_during_growth() {
+    let directory = TestDirectory::new("recursive container growth");
+    let source = br#"
+        type Node(children [Node], table {int: Node});
+        fn main() {
+            var root := Node(
+                children = [] : [Node],
+                table = {} : {int: Node}
+            );
+            root.children.append(root);
+            root.table[0] = root;
+            var index := 0;
+            while index < 1000 {
+                var child := Node(
+                    children = [] : [Node],
+                    table = {} : {int: Node}
+                );
+                root.children.append(child);
+                root.table[index + 1] = child;
+                index += 1;
+            }
+            println(root.children.len());
+            println(root.children[0].children.len());
+            println(root.table.len());
+            println(root.table[0].table.len());
+        }
+    "#;
+    let output = run_source(&directory, source);
+    assert!(!compiler_is_missing(&output), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"1001\n1001\n1001\n1001\n");
+}
+
+#[test]
+fn evaluates_container_assignment_operands_before_replacement() {
+    let directory = TestDirectory::new("container assignment aliasing");
+    let source = br#"fn main() {
+        var values := [1, 2];
+        values = [values[0]];
+        println(values[0]);
+        var table := {1: [2]};
+        table = {1: table[1]};
+        println(table[1][0]);
+    }"#;
+    let output = run_source(&directory, source);
+    assert!(!compiler_is_missing(&output), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"1\n2\n");
+}
+
+#[test]
 fn compares_and_indexes_strings() {
     let directory = TestDirectory::new("string values");
     let source = br#"fn main() {
