@@ -160,10 +160,7 @@ deterministic generated C.
 
 ## Stage 4: Iteration and structural mutation guards
 
-Status: current.
-
-The detailed implementation plan is in
-[Current Stage: Iteration and Structural Mutation Guards](CURRENT_STAGE.md).
+Status: complete.
 
 Render the existing `BeginIteration`, `IterationValue`, `EndIteration`, and
 `IterationUnlocked` IR operations. List iteration yields values in index order;
@@ -186,7 +183,10 @@ panics at the original source operation without corrupting the container.
 
 ## Stage 5: Recursive tracing and growth hardening
 
-Status: pending.
+Status: current.
+
+The detailed implementation plan is in
+[Current Stage: Recursive Tracing and Growth Hardening](CURRENT_STAGE.md).
 
 Stress the shared runtime across recursive combinations: lists of lists, maps
 of containers, tuples and unions containing containers, containers containing

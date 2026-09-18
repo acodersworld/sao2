@@ -1,542 +1,589 @@
-# Current Stage: Iteration and Structural Mutation Guards
+# Current Stage: Recursive Tracing and Growth Hardening
 
 Status: current.
 
-This document expands Stage 4 of
-[Current Milestone: Containers](CURRENT_MILESTONE.md). Stages 1-3 established
-managed list and ordered-map storage, exact roots and tracing, transactional
-growth, alias-preserving identity, and complete non-iteration operations. This
-stage renders the existing iteration IR and makes the control objects' shared
-lock counts enforce iteration safety through every alias.
+This document expands Stage 5 of
+[Current Milestone: Containers](CURRENT_MILESTONE.md). Stages 1-4 completed the
+public list/map surface, ordered storage, managed growth, exact callbacks,
+iteration, and alias-wide mutation locks. This stage does not add language
+features. It hardens those mechanisms under recursive graphs, repeated backing
+replacement, collection pressure, arithmetic boundaries, injected failures,
+free-list reuse, and collection-epoch rollover.
 
-List iteration yields values in logical index order. Map iteration yields keys
-in insertion order. No iterator object is added to the language or runtime:
-lowering already stabilizes the container once, snapshots its length, advances
-an integer index, and emits explicit begin/value/end operations.
+Stage 5 is the adversarial runtime stage. Public source tests establish that
+the language remains observable only through its designed semantics; focused
+native probes exercise states and timing which source cannot request directly.
 
 ## Outcome
 
-At the end of this stage, source programs can:
+At the end of this stage:
 
-- iterate over empty and non-empty lists and maps;
-- observe list values in index order and map keys in insertion order;
-- nest iteration over different containers or the same container;
-- use `break`, `continue`, ordinary fallthrough, `return`, and `?` propagation
-  without leaking iteration locks;
-- replace list elements and existing map values while iterating;
-- retain copied loop-binding values according to ordinary value/reference
-  semantics; and
-- receive a source-attributed panic when any alias attempts a structural
-  mutation of an actively iterated container.
+- every valid recursive combination of structs, tuples, unions, lists, and
+  maps has a finite deterministic descriptor/trace plan;
+- cycles crossing container controls, backings, structs, and interior
+  references are retained exactly and traced without recursion leaks;
+- repeated list growth and map growth/rehash preserve all live identities while
+  superseded backings become reclaimable;
+- replacement and removal stop retaining dead values even when the surrounding
+  backing remains live;
+- allocation policy and pressure collections can occur at every container safe
+  point without a decoded pointer surviving;
+- capacity and body-size arithmetic fails before overflow or partial mutation;
+- heap exhaustion, platform commitment failure, and trace-scratch failure keep
+  their stable classification and source attribution;
+- failed internal work leaves the published heap graph valid for inspection or
+  termination;
+- free-list rebuild/coalescing and allocation reuse remain correct after heavy
+  container churn; and
+- epoch rollover preserves live recursive graphs and makes old mark values
+  harmless.
 
-The control flow remains explicit:
+The central invariant is:
 
 ```text
-evaluate iterable once into canonical rooted temporary
-                         |
-                         v
-                 BeginIteration
-                 lock_count += 1
-                         |
-                         v
-                  snapshot len()
-                         |
-             +-----------+-----------+
-             | index < snapshot       |
-             v                        |
-       IterationValue                 |
-       execute body                   |
-       advance index -----------------+
-             |
-             v
-       cleanup block
-       EndIteration
-       lock_count -= 1
-             |
-             v
-            exit
+canonical roots
+      |
+      v
+stable controls -----> currently published backings
+      |                         |
+      |                         v
+      +-----------------> initialized live values
+                                |
+                                v
+                  exact (owner, member, layout) graph
+
+new backing transaction: rooted privately -> complete -> publish
+old backing: published until replacement -> unreachable -> later reclaim
 ```
 
-Nested iterations add nested lock ownership to the same shared counter. The
-counter records active loop scopes, not aliases or backing references.
+## No new language semantics
+
+This stage must not invent behavior to simplify a stress test. `DESIGN.md`
+remains authoritative for:
+
+- list index order and map insertion order;
+- value copying versus object identity;
+- tuple and union equality;
+- map key equality and hashing;
+- replacement, removal, reinsertion, and duplicate literal rules;
+- iteration binding and structural mutation behavior;
+- panic reasons and source operations; and
+- ASCII/interned string behavior.
+
+If a hardening test exposes disagreement between implementation and design,
+fix the implementation unless an explicit design decision is made and recorded
+separately. Private capacity, allocation placement, collection timing, backing
+identity, and free-list position remain unobservable.
 
 ## Preserved contracts
 
-Stage 4 must preserve:
+Stage 5 must preserve:
 
-- `DESIGN.md` iteration order, value semantics, map insertion semantics, and
-  structural-mutation rules;
-- the existing `for binding in container` syntax and static binding types;
-- left-to-right, exactly-once evaluation of the iterable expression;
-- the packed `sao2_ref` carrier and canonical shadow-frame rooting;
-- stable controls, replaceable managed backings, exact tracing, and stationary
-  references;
-- the Stage 1 control layouts and their `uint64_t lock_count` fields;
-- Stage 2 list replacement, append, removal, growth, and index behavior;
-- Stage 3 ordered-map lookup, replacement, insertion, removal, growth, and
-  compaction behavior;
-- source attribution for rejected structural mutation at the attempted
-  mutation, never at the loop header;
-- panic-as-process-termination without language-level unwinding;
-- deterministic generated C and unchanged execution for all previously
-  accepted programs; and
-- dependency-free compilation and the existing platform runtime lifecycle.
+- the 8-byte packed `sao2_ref`, arena tags, zero sentinel, stable owner/member
+  offsets, and 4-GiB arena representation;
+- fixed struct/list/map control layouts and variable backing descriptors;
+- canonical typed shadow frames, map transaction frames, and entry-argument
+  roots;
+- allocation as the only collection safe point;
+- no native pointer surviving a managed allocation;
+- exact trace deduplication by owner, member, and layout identity;
+- the distinction between marking an owner allocation and traversing one exact
+  referenced member;
+- initialized-prefix tracing for list elements and ordered map entries;
+- non-tracing lookup-slot metadata;
+- stationary live allocations and context-insensitive escape placement;
+- checked geometric capacity growth and allocate/copy/publish transactions;
+- shared iteration locks and balanced normal cleanup;
+- source failures remaining distinct from runtime invariants, compiler errors,
+  toolchain failures, and program exit status; and
+- dependency-free deterministic generated C on supported 64-bit targets.
 
-Iteration introduces no allocation safe point by itself. Allocations in the
-loop body continue to use the ordinary managed runtime.
+Hardening may add validation and probe-only instrumentation, but production
+semantics and ABI shapes must remain stable.
 
 ## Stage boundaries
 
-This stage does not add:
+This stage does not:
 
-- first-class iterator values, iterator protocols, ranges, enumeration, or
-  user-defined iterables;
-- iteration over strings, tuples, structs, or any type other than lists/maps;
-- mutable loop bindings that write through to a container slot;
-- entry-pair or value iteration for maps—maps yield keys only;
-- reverse iteration or a source-visible order/capacity API;
-- exception unwinding, deferred cleanup, destructors, or recovery from panic;
-- concurrent iteration, mutation, or thread safety; or
-- the broad recursive stress and diagnostics work assigned to Stages 5-6 and
-  milestone 12.
+- add collection syntax, weak references, finalizers, destructors, or explicit
+  user GC controls;
+- expose capacity, addresses, hash slots, epochs, allocation statistics, or
+  backing identities to source;
+- introduce moving/compacting GC, concurrent collection, or thread safety;
+- change the 4-GiB packed-reference model;
+- add new container operations or iterator forms;
+- redesign diagnostics presentation; or
+- replace Stage 6's readable end-to-end algorithms, full conformance sweep,
+  deterministic-output closure, and external platform verification.
 
-No container capability gate remains after this stage, but the later hardening
-and integration stages are still required before milestone 11 closes.
+Stage 5 tests mechanisms at their narrowest useful layer. Stage 6 demonstrates
+the completed language as one integrated system.
 
-## Iteration semantics to make explicit
+## Hardening threat model
 
-The existing design implies these rules; record any wording needed in
-`DESIGN.md` before tests depend on subtle cases:
+Exercise each invariant against four independent pressures:
 
-1. The iterable expression is evaluated exactly once before its lock is
-   acquired and remains rooted for the entire loop.
-2. The loop length is snapshotted after locking. Structural mutation is
-   forbidden, so the snapshot remains equal to the live logical length.
-3. A list binding receives the value currently stored at its index when that
-   iteration begins. Replacing a not-yet-visited element changes the value a
-   later iteration observes.
-4. A map binding receives the key at the corresponding insertion-order entry.
-   Existing-value replacement cannot change yielded keys or order.
-5. The binding is an ordinary copy: inline values copy, while object carriers
-   preserve identity and aliasing.
-6. List indexed replacement and existing-key map value replacement are
-   non-structural and permitted while locked.
-7. List append/removal and map insertion/removal are structural and rejected
-   through every alias while any iteration is active.
-8. Nested iteration, including over the same object, is permitted and increments
-   the shared checked lock count once per active loop scope.
-9. `continue` retains the current loop's lock; `break`, fallthrough, normal
-   return, and error propagation release every loop scope they exit.
-10. Explicit panic and unhandled-error panic terminate the process and do not
-    perform language-level lock cleanup.
+1. **Shape pressure:** deep nesting, cycles, repeated references, multiple
+   interior members of one owner, inactive unions, and zero-sized values.
+2. **Mutation pressure:** repeated growth, replacement, removal, reinsertion,
+   rehash, iteration locks, and aliasing.
+3. **Allocator pressure:** policy collection, capacity pressure, fragmentation,
+   free-list reuse, commitment boundaries, and impossible-size requests.
+4. **Collector pressure:** trace worklist growth, trace-key collisions, scratch
+   allocation failure, repeated collections, and epoch rollover.
 
-Replacement of the currently bound slot does not retroactively alter an inline
-binding value already copied for the body. A binding that is itself an object
-reference continues to alias that object under the ordinary reference rules.
+Test combinations, not merely each axis in isolation. The dangerous cases are
+transitions—for example, a cyclic value copied to a new backing immediately
+before pressure collection, or two distinct interior members of one owner
+reached through old and new container paths.
 
-## Existing IR contract
+## Recursive descriptor closure
 
-Render the existing operations without introducing a runtime iterator value:
+Validate the backend's deterministic closure over every concrete type reachable
+from container elements, map keys/values, aggregate fields, function storage,
+and nested container types.
+
+The planner must:
+
+- insert a type into its visited set before following recursive dependencies;
+- distinguish legal reference cycles from illegal by-value layout cycles;
+- plan each concrete container control/backing exactly once;
+- plan each required value copy/equality/hash/trace capability exactly once;
+- retain stable managed-layout identities independent of discovery order;
+- emit declarations/prototypes in an order valid for mutually recursive trace
+  callbacks; and
+- reject an impossible descriptor dependency as a compiler invariant with
+  concrete type context rather than recursing indefinitely.
+
+Cover legal graphs such as:
+
+- a struct containing a list of its own nominal type;
+- mutually referential structs connected through lists and maps;
+- a union alternative containing a container whose values lead back to the
+  union's owning struct;
+- tuples/unions which contain several container carriers;
+- lists of maps whose values are lists; and
+- maps whose values are structs containing interior referenced members.
+
+The language's map-key restrictions still prevent container/object reference
+cycles through keys. Keys participate in descriptor closure only through valid
+unit, integer, string, boolean, and immutable tuple shapes.
+
+## Recursive graph matrix
+
+Construct graphs which isolate each traversal edge:
+
+- frame root to container control;
+- container control to current backing;
+- list backing to element value;
+- map ordered-entry backing to value;
+- tuple/union value to active contained carrier;
+- struct carrier to exact root or interior body;
+- interior struct member to another managed object; and
+- managed object back to an earlier container, closing a cycle.
+
+Required combinations include:
+
+- list -> list -> struct -> original list;
+- map -> value struct -> list -> original map;
+- list -> active union -> map -> value -> original list;
+- two containers retaining different inline members of one owner allocation;
+- many aliases retaining one control through different aggregate paths;
+- duplicate references to one exact member/layout key; and
+- one owner reached at multiple member offsets and layout identities.
+
+For every graph, separately prove live retention and dead reclamation by
+dropping selected roots or replacing/removing selected edges.
+
+## Exact trace-key behavior
+
+The collector deduplicates traversal by:
 
 ```text
-BeginIteration { iterable }
-IterationValue { destination, iterable, index }
-EndIteration { iterable }
+(owner_ptr, member_ptr, layout_identity)
 ```
 
-The iterable must be the same unprojected, stabilized temporary operand at all
-three operation kinds. Its type determines behavior:
+Stage 5 must prove all three components matter:
 
-- `[T]` makes `IterationValue` produce `T`; and
-- `{K: V}` makes `IterationValue` produce `K`.
+- repeated identical keys are visited once and still retain the complete
+  reachable subgraph;
+- identical owners with different member offsets are traversed independently;
+- an owner mark does not suppress later exact-member traversal;
+- the same member cannot be accepted under an incompatible unregistered or
+  non-containing layout;
+- heap and scoped owner tags resolve through the correct arena; and
+- cycles terminate because repeated exact keys are deduplicated, not because
+  traversal silently drops valid edges.
 
-The index remains `int`. Begin and end return no value and have no source
-failure site. Counter overflow, underflow, inactive value access, changed
-length, invalid index, wrong layout, and mismatched cleanup are compiler/runtime
-invariants, not user-triggerable language failures.
+Use deliberate trace-hash collisions in native probes. Collision behavior must
+fall back to full key equality and remain deterministic; hash-table slot order
+must not affect which objects are marked.
 
-Keep the existing lowering shape:
+## Initialized values and unused capacity
 
-- `BeginIteration` precedes the length snapshot and control-flow header;
-- `IterationValue` occurs at the start of each body execution;
-- the advance block performs checked integer increment;
-- normal exhaustion and `break` converge on the cleanup block;
-- `continue` targets the advance block without ending iteration;
-- return and `?` propagation emit active cleanup operations from innermost to
-  outermost before their terminator; and
-- the normal cleanup block emits one `EndIteration` before entering the exit.
+Container callbacks may inspect only published, initialized language values.
+Harden the agreement among control length, backing prefix, and capacity:
 
-Do not lower iteration into repeated public indexing calls with artificial
-source bounds failures. Iteration state which contradicts valid lowering is an
-invariant.
+- a list's initialized element count equals published logical length;
+- a map's initialized ordered-entry count equals published logical length;
+- lookup-slot occupied metadata agrees with map length but carries no trace
+  edges;
+- zero-capacity controls have zero backing references;
+- spare capacity is never traced or compared as a value;
+- a removed/replaced final slot is cleared sufficiently to be zero-safe but
+  correctness does not depend on spare bytes remaining zero forever; and
+- inactive union storage is not traversed.
 
-## Control-flow validation
+Native probes should poison unused capacity and inactive payload bytes with
+nonzero patterns which resemble packed references. Collection must ignore them
+while retaining every value inside the initialized prefix.
 
-The current type checks are insufficient: individually well-typed begin/end
-operations could still leak or underflow a lock. Add a function-level forward
-dataflow validation over reachable basic blocks.
+During probe-only partial construction, advance `initialized` only after the
+complete record is copy-valid. A collection between record publications must
+trace exactly the prefix already declared initialized.
 
-The abstract state is an ordered stack of active iterable operands. Transfer
-rules are:
+## Allocation safe-point audit
 
-- `BeginIteration` requires an unprojected container temporary, verifies that
-  it is not already invalidated by a write, and pushes it;
-- `IterationValue` requires its iterable to equal the top active operand and
-  validates its destination/index types;
-- `EndIteration` requires exact equality with the top operand and pops it;
-- a direct overwrite of the carrier local for any active iterable is invalid
-  IR; projected mutation still follows the structural rules below;
-- ordinary operations preserve the stack;
-- jumps, branches, and switch edges propagate the complete stack; and
-- every reachable join requires exactly the same ordered stack from all
-  predecessors.
+Create a single audited inventory of every generated operation which can reach
+managed allocation:
 
-Normal `Return` requires an empty stack. `Panic`, `ErrorPanic`, and
-`Unreachable` may terminate with active iterations because execution cannot
-continue. Backedges must converge on the same state; placing a begin operation
-inside its own backedge therefore fails rather than increasing abstract depth
-without bound.
+- struct allocation;
+- list control/backing construction;
+- list append growth;
+- map control and dual-backing construction;
+- missing-key map insertion and dual-backing growth;
+- entry-argument list construction; and
+- any runtime path which invokes collection for allocation policy or pressure.
 
-Reject, with full function/block/operation context:
+For each site, document and test:
 
-- end without begin;
-- end of the wrong operand or in the wrong nesting order;
-- iteration value without the matching active loop;
-- overwriting the stabilized iterable local while active;
-- a normal exit with remaining locks;
-- unequal active stacks at a control-flow join; and
-- a cleanup which is reachable both locked and unlocked.
+- which source/canonical operands must be rooted before the call;
+- which published old references remain the authoritative graph;
+- which transient new references are rooted by a typed transaction frame;
+- which decoded pointers are discarded before the call;
+- which pointers/references are re-resolved after it;
+- the exact initialized prefix visible if collection runs; and
+- the final publication order.
 
-This validation proves compiler-generated balance independently of runtime
-checks. It does not attempt alias analysis: exact stabilized operands establish
-static ownership, while the control object's counter establishes dynamic alias
-enforcement.
+No descriptor copy, equality, hash, lookup, iteration-value, replacement, or
+removal helper may unexpectedly allocate. If a future implementation changes
+that fact, it requires a new safe-point design rather than relying on native
+locals.
 
-## Capability boundary
+## Backing replacement transactions
 
-Enable:
+### Lists
 
-- `BeginIteration`, `IterationValue`, and `EndIteration` for lists and maps;
-- iteration operands and results nested through ordinary tuple, union, struct,
-  list, and map storage;
-- existing `IterationUnlocked` checks for list append/removal and map removal;
+On append growth, the receiver control and appended value remain canonical
+roots. Collection may occur before the new backing allocation succeeds. After
+return, re-resolve the control and old backing, copy exactly the old logical
+prefix, append the new value, and publish backing/capacity/length in the defined
+order. The old backing stays control-reachable until publication.
+
+### Maps
+
+On construction or growth, the typed transaction frame roots the new ordered
+entry backing across allocation of lookup slots. Only after both backings are
+complete and mutually consistent may the stable control publish the pair.
+Old entry and slot backings remain published together until replacement.
+
+### Failure and reclamation
+
+Any checked arithmetic or allocation failure occurs before publication and
+must not alter the old control. Once publication succeeds, no root may retain a
+superseded backing merely because a scratch field or temporary was not cleared.
+The next eligible collection must be able to reclaim old backings while keeping
+the stable control and new pair stationary.
+
+Probe collection immediately before allocation, between map backing
+allocations, immediately after initialization, immediately after publication,
+and after transaction-frame unlinking.
+
+## Replacement, removal, and reachability
+
+Non-growing mutation has no collection safe point, but it changes the graph
+seen by the next collection:
+
+- list replacement must stop retaining the previous element;
+- list removal must stop retaining the removed element and the cleared tail;
+- map value replacement must stop retaining the previous value;
+- map removal/compaction must stop retaining the removed value and cleared
+  final record;
+- map lookup rebuild must not introduce trace edges; and
+- non-structural replacement during iteration must preserve lock count, length,
+  order, and backing identity.
+
+Retain aliases to both old and new objects in selected probes to distinguish
+“edge removed from container” from “object necessarily dead.” Then drop the
+independent alias and verify later reclamation.
+
+## Free-list and stationary-identity hardening
+
+Repeated container growth produces many dead variable-size backings. Exercise
+the production sweep and allocator until it must:
+
+- reclaim isolated controls and backings;
+- coalesce adjacent dead spans;
+- preserve live blocks between free runs;
+- rebuild a sorted, non-overlapping free list;
+- split reusable runs without losing alignment or header boundaries;
+- fall back to the frontier only when no free run fits;
+- reuse reclaimed storage for different compatible layout identities; and
+- retain every live `sao2_ref` owner/member offset unchanged.
+
+Inspect production GC statistics in native probes: blocks examined, live blocks
+retained, dead blocks reclaimed, reclaimed span bytes, and resulting free block
+count. Statistics are test evidence, not a source API.
+
+After reuse, old dead references must never be traced or dereferenced by a
+valid program. A newly allocated object at a reclaimed offset is a distinct
+language object even if its packed carrier later reuses the same bits after the
+old object became unreachable; no live comparison can observe both identities.
+
+## Capacity and size arithmetic
+
+Centralize and exhaustively test all growth equations at boundary values:
+
+- zero, one, minimum capacity, and every power-of-two transition;
+- list doubling and map entry doubling;
+- map slot load-factor multiplication and next-power-of-two selection;
+- backing prefix alignment and payload offset;
+- record stride multiplication;
+- payload plus record bytes;
+- heap header/span alignment;
+- conversions among `uint64_t`, `uint32_t` packed offsets, `size_t`, and
+  language `int64_t` length; and
+- arena frontier/free-run addition.
+
+Every multiplication, addition, rounding, and conversion must be checked before
+mutation or pointer arithmetic. Impossible requests fail as heap exhaustion
+without collecting an otherwise valid heap. Loops which seek a larger capacity
+must terminate on overflow rather than wrapping or repeating.
+
+Include zero-sized unit language values, maximum-alignment records, padded
+tuples/unions, and map entry records whose key/value alignment differs.
+
+## Failure matrix
+
+Exercise each recoverable allocator result at every source-attributed container
+allocation category:
+
+| Runtime result | Stable reason | Source operations |
+| --- | --- | --- |
+| logical/size exhaustion | `heap arena exhausted` | struct/list/map construction, list append, map insert |
+| platform commitment failure | `unable to commit heap storage` | the same allocating operations |
+| trace scratch exhaustion | `unable to allocate garbage collector work storage` | the allocation which triggered collection |
+
+Also retain exact non-allocation failures:
+
+- `list index out of range` for read/replacement/removal;
+- `map key not found` for lookup and removal;
+- `container structurally modified during iteration` for structural mutation;
   and
-- the conditional lock check already performed by missing-key map insertion.
+- existing arithmetic/index failure operations outside containers.
 
-Keep non-structural replacement free of an unconditional lock check. A map
-store must look up the key first: replacement proceeds while locked, whereas a
-missing-key insertion panics before allocation or mutation.
+Verify operation code, filename, byte-derived line/column, reason, stderr form,
+and nonzero termination. A failure must not be relabeled according to an
+internal helper such as backing allocation, hashing, rehash, or collection.
 
-Printing containers and all out-of-scope language features remain rejected by
-their existing independent capability checks.
+Invalid layout identities, corrupt body sizes, broken prefixes, impossible slot
+indices, trace-key/layout mismatch, epoch corruption, lock underflow/overflow,
+and invalid free-list structure remain compiler/runtime invariants. Native
+probes should make each fail closed rather than become a source panic or memory
+access.
 
-## Typed lock helpers
+## Probe-only fault injection
 
-Generate begin/end helpers for each concrete list and map type. Both helpers
-resolve and validate the stable control afresh; neither retains a decoded
-pointer after returning.
+Add narrowly guarded runtime-probe seams only where existing hooks cannot
+reliably select a failure boundary. Suitable probe controls include:
 
-Begin performs:
+- fail-next platform commit;
+- fail-next trace scratch allocation;
+- force policy or pressure collection on the next managed allocation;
+- reduce arena capacity and allocation threshold at compile time;
+- reduce the GC epoch limit; and
+- pause/check transaction state between map backing allocations and before
+  publication.
 
-1. Resolve the carrier with the exact control descriptor.
-2. Validate the complete published container shape.
-3. Reject `UINT64_MAX` as counter overflow via compiler invariant.
-4. Increment `lock_count` exactly once.
+All such controls must be excluded from ordinary emitted C unless the existing
+probe macro is defined. They must not alter production layout, source behavior,
+allocation order, or deterministic output.
 
-End performs:
+Prefer observing production helpers over maintaining a second test allocator.
 
-1. Resolve and validate the same control.
-2. Reject zero as counter underflow via compiler invariant.
-3. Decrement `lock_count` exactly once.
+## Collector scratch failure and recovery
 
-The increment/decrement is not a source-level arithmetic operation and has no
-failure site. The runtime is single-threaded; ordinary checked reads/writes are
-sufficient and no atomic ABI is introduced.
+The trace worklist and deduplication table use host metadata. Force failures
+while growing each structure and verify:
 
-Nested loops over aliases resolve to the same stable control and therefore
-share the count. Iterating distinct objects, even of the same concrete type,
-updates distinct controls.
+- collection reports scratch exhaustion rather than sweeping a partial mark;
+- no heap block is reclaimed from an incomplete trace;
+- temporary host allocations are disposed;
+- `sao2_gc_active` and context state are reset;
+- allocation returns `SAO2_ARENA_COLLECTION_FAILED` to the source operation;
+- the published heap and free list remain valid; and
+- a later collection without injection can succeed and reclaim genuinely dead
+  blocks.
 
-## Iteration value helpers
+Trace scratch remains the only container-related host allocation beyond
+platform/runtime metadata. It must never become language container storage.
 
-Generate a typed, non-allocating value helper for each concrete container type.
-It must:
+## Epoch rollover
 
-- resolve the control on every call;
-- require `lock_count > 0`;
-- require a nonnegative index representable as `uint64_t` and strictly below
-  live length; the surrounding validated loop condition establishes the same
-  bound against the snapshot;
-- resolve the currently published backing with its exact descriptor;
-- copy the selected language value immediately into the canonical destination;
-  and
-- discard every decoded pointer before returning to the loop body.
+Compile native probes with a small positive epoch limit and repeatedly collect
+across rollover. At the boundary:
 
-For a list, select `records[index].value` from the element backing and copy via
-the element descriptor. For a map, select `records[index].key` from the dense
-ordered-entry backing and copy via the key descriptor. Never derive map order
-from lookup slots or repeat a hash lookup during iteration.
+1. Validate the complete heap before resetting marks.
+2. Clear stale mark epochs on every allocated block without changing free
+   blocks, headers, layout identities, bodies, or references.
+3. Reset the global epoch and begin the next mark at one.
+4. Trace all current roots and sweep normally.
 
-The helper must not call the public list-index or map-lookup panic path. If the
-index or published shape is invalid while locked, call the compiler-invariant
-path because valid lowering and mutation guards make that state impossible.
-
-## Snapshot and mutation visibility
-
-Lowering continues to call the ordinary typed `len()` immediately after begin
-and stores the result in an `int` temporary. Since every structural mutation
-consults the shared control, live length and the snapshot cannot diverge during
-valid execution.
-
-Non-structural operations remain observable according to their timing:
-
-- replacing a future list element changes the later binding copy;
-- replacing the current or earlier list element does not change a binding copy
-  already produced;
-- replacing a map value does not change any yielded key;
-- mutating an object reached through a list element binding is ordinary alias
-  mutation and does not change list structure; and
-- assigning through an alias uses the same rules as assigning through the
-  expression named in the loop header.
-
-No cached native backing pointer or entry pointer spans execution of the body.
-This remains true even though structural mutation is locked, because body calls
-may allocate and collect unrelated objects.
-
-## Structural mutation enforcement
-
-Use the existing source-attributed paths:
-
-- list `append` checks before either spare-capacity write or growth;
-- list `removeIndex` checks before index normalization or shifting;
-- map `removeKey` uses its adjacent `IterationUnlocked` check and validates
-  again at the typed mutation boundary as already required;
-- map indexed assignment first looks up the key, permits existing-value
-  replacement, and checks before missing-key insertion; and
-- operations reached through aliases resolve the same control counter.
-
-The stable panic reason remains
-`container structurally modified during iteration`. Its failure operation and
-source location remain those of the attempted append, removal, or insertion.
-The failed operation must leave length, capacities, backings, entries, slots,
-initialized counts, and values unchanged.
-
-Checks should remain at typed mutation helpers even when an adjacent IR check
-exists. IR validation proves compiler sequencing; helper validation protects
-the runtime boundary and conditional map-insertion case.
-
-## Cleanup behavior
-
-Cleanup is lexical and explicit, not an unwind mechanism.
-
-### Fallthrough and exhaustion
-
-The false header edge enters the loop's cleanup block, ends exactly that
-iteration, then reaches the loop exit. Empty containers follow this path after
-beginning and snapshotting, so even a zero-iteration loop balances its lock.
-
-### Break
-
-`break` jumps to the current loop's cleanup block. In nested loops it ends only
-the innermost loop named by the existing semantic target. The outer lock stays
-active until its own cleanup.
-
-### Continue
-
-`continue` jumps to the advance block. It must not emit an end/begin pair or
-temporarily unlock the container between iterations.
-
-### Return and error propagation
-
-A normal `return` and a propagating `?` emit `EndIteration` for every exited
-active loop from innermost to outermost before returning. The return value or
-error payload is evaluated and stabilized before cleanup, preserving source
-evaluation order and keeping structural checks active during that evaluation.
-
-### Panic
-
-Explicit panic, unhandled-error panic in `main`, and runtime panic terminate the
-process. They do not run end operations, and no subsequent code can observe the
-remaining counts. Do not add `setjmp`, host unwinding, or cleanup callbacks.
-
-## Rooting and garbage collection
-
-The stabilized iterable is a canonical container temporary and therefore a
-precise shadow-frame root for the full loop. The loop binding is an ordinary
-canonical local and is traced whenever its type contains references.
-
-Body allocations may collect on every iteration. Collection must retain:
-
-- the iterable control through its stabilized carrier;
-- the published current backing(s) through the control callback;
-- any current binding references through the function frame; and
-- independently live aliases through their normal roots.
-
-Iteration helpers re-resolve packed references after the body and never depend
-on a pointer retained from a prior iteration. The lock count is scalar control
-metadata and adds no trace edge.
+Exercise rollover while live roots include recursive container cycles,
+interior references, superseded backing candidates, active iteration locks,
+and typed map transaction roots. Objects live across rollover remain stationary;
+dead objects are reclaimed according to the new mark, not retained by a stale
+numeric coincidence.
 
 ## Implementation batches
 
-Each batch leaves the generated subset coherent and testable.
+Each batch tightens one class of invariant without expanding the language.
 
-### Batch 1: Semantic clarification and IR balance validation
+### Batch 1: Descriptor and graph closure
 
-- Make replacement visibility and nested-lock rules explicit in `DESIGN.md` if
-  required.
-- Add active-iteration stack dataflow validation across the function CFG.
-- Require stabilized unprojected temporary operands and reject active-local
-  writes, mismatched joins, and unbalanced normal exits.
-- Expand malformed-IR and lowering-cleanup tests.
+- Add planner tests for mutually recursive legal shapes and illegal by-value
+  cycles.
+- Harden deterministic descriptor/callback closure and declaration ordering.
+- Build native graph fixtures covering all control/backing/value/interior edges.
 
-Gate: accepted IR has statically balanced, properly nested iteration scopes on
-every normal reachable path.
+Gate: every valid recursive type graph plans finitely and emits stable exact
+callbacks.
 
-### Batch 2: List iteration runtime
+### Batch 2: Exact tracing and initialized-prefix poisoning
 
-- Generate typed list begin/end/value helpers.
-- Enable list iteration capability and render its three IR operations.
-- Cover empty, single, multi-value, nested, aliased, and reference-bearing list
-  loops.
+- Stress trace-key deduplication, collisions, shared owners, distinct interior
+  members, cycles, active unions, and repeated aliases.
+- Poison unused capacity, inactive payloads, and lookup metadata.
+- Collect during probe-controlled partial initialization.
 
-Gate: lists iterate in index order with exact roots and balanced shared locks.
+Gate: only exact initialized language values affect reachability.
 
-### Batch 3: Map iteration runtime
+### Batch 3: Growth transactions and dead-edge reclamation
 
-- Generate typed map begin/end/value helpers over ordered entries.
-- Enable map iteration capability without consulting lookup-slot order.
-- Cover collisions, replacements, removals/reinsertions before iteration,
-  nested keys, and aliases.
+- Audit every container allocation safe point and publication order.
+- Force collection across list growth and both map transaction allocations.
+- Exercise replacement/removal reachability and reclaim superseded backings.
 
-Gate: maps yield keys in permanent insertion order independently of hash-table
-layout.
+Gate: new storage is rooted until publication, old storage until replacement,
+and neither is retained afterward without a real edge.
 
-### Batch 4: Cleanup exits
+### Batch 4: Capacity, fragmentation, and reuse
 
-- Exercise exhaustion, empty loops, `break`, `continue`, nested exits, ordinary
-  return, and `?` propagation.
-- Verify reverse-order cleanup for nested loops and no cleanup for terminating
-  panic paths.
-- Demonstrate that mutation succeeds after every normal exited scope.
+- Exhaustively test checked capacity/body/span arithmetic boundaries.
+- Drive repeated growth/compaction through reduced arenas.
+- Validate sweep coalescing, free-list ordering/splitting, statistics, reuse,
+  and stationary live identities.
 
-Gate: no normal source control-flow path leaks, duplicates, or prematurely
-releases a lock.
+Gate: churn cannot overflow arithmetic, corrupt heap walks, or strand reusable
+managed storage.
 
-### Batch 5: Mutation matrix
+### Batch 5: Failure classification and recovery
 
-- Prove list replacement and existing map-value replacement remain permitted.
-- Reject list append/removal and map insertion/removal through direct and
-  aliased references.
-- Exercise nested counts and helper calls which receive aliases.
-- Confirm failed mutations are unchanged and report the attempted operation.
+- Add minimal probe-only fault controls where required.
+- Inject exhaustion, commitment, and trace-scratch failures at each allocating
+  container operation.
+- Validate invariant failures separately and prove successful collection after
+  aborted scratch work.
 
-Gate: structural classification is consistent across every public mutation
-path and every alias.
+Gate: every recoverable failure is transactional, exactly attributed, and
+leaves production runtime state valid.
 
-### Batch 6: Collection and integration hardening
+### Batch 6: Epoch and sustained-pressure hardening
 
-- Force body allocations and collections while iterables and bindings remain
-  live.
-- Exercise nested/reference-bearing containers, calls, recursion, branches,
-  switches, and epoch rollover during loops.
-- Confirm deterministic C and all Stage 1-3 regressions.
+- Combine recursive graphs, mutation, iteration, repeated policy/pressure
+  collection, free-list reuse, and a small epoch limit.
+- Run deterministic native stress sequences with explicit expected statistics.
+- Retain focused public regressions without taking over Stage 6 integration.
 
-Gate: iteration stays exact under collection and the complete public container
-surface is executable.
+Gate: the runtime remains precise and stationary through sustained churn and
+multiple epoch rollovers.
 
 ## Verification map
 
-### Semantic and lowering tests
+### Planner and backend tests
 
 Cover:
 
-- list element and map key binding types;
-- iterable evaluation exactly once;
-- binding scope and shadowing;
-- fallthrough, empty, break, continue, return, and `?` cleanup shapes;
-- nested loops over same and different containers;
-- reverse-order active cleanup emission; and
-- mutation authorization remaining distinct from runtime lock rejection.
-
-### IR validation tests
-
-Cover:
-
-- non-container iteration operands and wrong destination/index types;
-- projected or non-temporary iterable operands;
-- iteration value before begin or for a non-top iterable;
-- wrong-order, wrong-operand, duplicate, and missing ends;
-- active iterable-local overwrite;
-- locked/unlocked join disagreement;
-- stable backedge convergence;
-- normal return with active scopes; and
-- permitted panic termination with active scopes.
-
-### Generated-C tests
-
-Assert meaningful ordering:
-
-- begin precedes the length snapshot;
-- value loading occurs before body code;
-- continue reaches advance without end;
-- exhaustion and break pass through end;
-- nested return cleanup is inner-to-outer;
-- each value helper resolves control and backing afresh;
-- map iteration indexes ordered entries, never lookup slots; and
-- no decoded pointer spans body execution or an allocation.
+- recursive container/value descriptor closure;
+- deterministic managed identities and callback ordering;
+- correct trace capability through tuple/union/struct/container combinations;
+- exact transaction-frame fields and callback layouts;
+- audited allocation/re-resolution/publication ordering;
+- checked arithmetic helper emission; and
+- absence of probe controls from production output.
 
 ### Native runtime probes
 
-Use production helpers for:
+Cover:
 
-- zero, one, nested, and near-maximum lock counts;
-- begin overflow and end underflow invariants;
-- nested aliases to the same control;
-- invalid index, inactive value access, and corrupted published shape;
-- typed list values and map keys across all supported representations;
-- structural mutation rejection without partial writes;
-- permitted non-structural replacement while locked;
-- collection with locked controls and live binding references; and
-- epoch rollover during repeated loop-body allocation.
+- every recursive graph edge and cycle shape;
+- trace-key collisions and multi-member shared owners;
+- poisoned unused capacity and inactive unions;
+- collection during construction/growth transactions;
+- replacement/removal dropping the correct edges;
+- dead control and backing reclamation;
+- fragmentation, coalescing, split reuse, and live-reference stationarity;
+- impossible capacity/body requests without spurious collection;
+- commitment and scratch failure injection;
+- recovery after incomplete mark work;
+- iteration locks during body allocation; and
+- repeated epoch rollover.
 
-### Public end-to-end programs
+### Focused public programs
 
-Cover observable behavior with programs that use:
+Use compact source programs to prove observable consequences:
 
-- list order, map insertion order, empty loops, and nested loops;
-- `break` and `continue` in conditional and nested bodies;
-- early return and `?` propagation followed by caller-side mutation;
-- same-container nested iteration;
-- list replacement affecting a future binding;
-- map value replacement without changing yielded keys;
-- structural mutation attempted directly, through an alias, and through a
-  called function;
-- containers and object references as list elements; and
-- tuple keys, command-line string keys, branches, switches, calls, and
-  collection pressure inside loop bodies.
+- cyclic struct/container graphs remain usable after heavy allocation;
+- nested list/map/tuple/union values survive repeated growth;
+- removed and replaced objects become irrelevant while live aliases remain
+  valid;
+- iteration order and mutation rules survive natural collection pressure; and
+- observable output remains independent of private backing replacement and
+  free-list reuse.
 
-Native assertions may skip only when no supported C compiler is available.
+Keep larger algorithms and full-feature combinations for Stage 6.
+
+### Regression coverage
+
+Retain all Stage 1-4 and milestone 1-10 tests. Generated-C compilation failure,
+abnormal native termination, invalid heap statistics, wrong output, unexpected
+panic text/location, nondeterministic output, or a silent runtime fallback is a
+failure. Native assertions may skip only when no supported C compiler exists.
 
 ## Completion checklist
 
-Stage 4 is complete when:
+Stage 5 is complete when:
 
-- list values iterate in index order and map keys in insertion order;
-- each iterable expression is evaluated once and rooted for the whole loop;
-- begin/end update the stable shared checked lock count exactly once per scope;
-- CFG validation rejects every unbalanced normal iteration path;
-- fallthrough, empty loops, break, continue, return, and propagation have the
-  specified cleanup behavior;
-- nested same/different-container loops balance in strict lexical order;
-- non-structural replacement remains permitted and has defined visibility;
-- every structural mutation path rejects all aliases transactionally at its
-  original source operation;
-- body allocations and collections retain iterables and binding values exactly;
-- all container execution capability gates are removed while unrelated gates
-  remain intact;
+- recursive valid type graphs plan finitely and deterministically;
+- exact tracing retains every live root/member/layout path and terminates on
+  cycles;
+- unused capacity, inactive storage, and lookup metadata never create edges;
+- list and map transactions remain safe under collection at every allocation
+  boundary;
+- replacement, removal, and publication make obsolete edges/backings
+  reclaimable;
+- repeated churn preserves stationary live references and produces a valid,
+  reusable free list;
+- all capacity, alignment, body-size, span, offset, and conversion arithmetic is
+  checked before mutation;
+- exhaustion, commitment, and scratch failures retain exact classification and
+  source attribution;
+- incomplete collection work never sweeps and the collector can recover;
+- epoch rollover preserves live recursive graphs and reclaims dead ones;
+- probe-only controls are absent from normal generated C;
 - generated C remains byte-for-byte deterministic;
-- all Stage 1-3 and earlier walking-skeleton programs remain unchanged; and
-- the Stage 4 test matrix passes externally on Rust 1.90 or newer and available
+- all Stage 1-4 and earlier walking-skeleton behavior remains unchanged; and
+- the Stage 5 test matrix passes externally on Rust 1.90 or newer and available
   supported C compilers.
 
 Contributor guidance prohibits compiling, running tests, or formatting while
