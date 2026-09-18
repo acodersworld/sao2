@@ -1,283 +1,206 @@
-# Current Milestone: Containers
+# Current Milestone: Diagnostics and Hardening
 
-Status: complete.
+Status: current.
 
-This document maps milestone 11 of `ROADMAP.md` into implementation stages.
-The frontend and typed IR already represent list and map types, literals,
-index projections, membership, methods, iteration, and mutation checks. This
-milestone replaces the C backend's deliberate container capability boundary
-with permanent managed storage and complete public execution.
+This document maps milestone 12 of `ROADMAP.md` into implementation stages.
+It is the final implementation milestone in the v0 roadmap. Completing it
+closes the remaining diagnostics, robustness, conformance, and measurement
+gaps; the remaining roadmap item is then the v0 release gate rather than a
+further feature milestone.
 
-The milestone must preserve the walking skeleton. Primitive, aggregate,
-struct, scoped-allocation, and garbage-collected programs remain executable
-while container support advances one coherent runtime slice at a time.
+The compiler already has source spans, bounded error and warning collections,
+typed runtime failure sites, distinct outer failure categories, deterministic
+generated C, focused runtime probes, and broad end-to-end coverage. This
+milestone completes and audits those mechanisms. It does not redesign the
+language or add post-v0 features.
 
-## Fixed architecture
+The walking skeleton remains executable throughout. Each stage must preserve
+all accepted v0 programs, keep invalid source out of C emission, and retain
+the distinction between source, compiler/toolchain, runtime-panic, and program
+result channels.
 
-Lists and maps are mutable objects with reference identity. Their language
-carrier is the existing 8-byte packed `sao2_ref`; copying, assignment,
-parameter passing, tuple/union storage, and return copy this carrier and retain
-aliasing. Container equality and inequality compare identity, not contents.
+## Fixed quality contract
 
-Container allocations are conservatively heap-managed in v0. This is a valid
-placement choice because allocation placement is unobservable, and it avoids
-putting independently growing shared storage in the function-scoped arena.
-Any future scoped-container optimization requires a separate proof and is not
-part of this milestone.
+Source diagnostics retain the original filename and half-open byte spans.
+Rendered line and column numbers are one-based, tabs occupy four display
+columns, primary and related annotations are deterministic, and errors and
+warnings retain separate 20-entry limits. Recovery must make progress and may
+not turn malformed input into a compiler panic.
 
-Each container has a stable managed control object and one or more replaceable
-managed backing allocations. A control object records logical length,
-capacity, iteration-lock state, and packed references to its current backing
-storage. Growth follows allocate, initialize/copy, then publish: no decoded
-body pointer survives the allocation safe point and the old backing remains
-reachable until the replacement is published.
+Every source-attributed runtime panic names its reason, exact SAO2 filename,
+line, column, and function without exposing a generated-C location. Failures
+which occur before entry to a SAO2 function remain explicitly classified as
+pre-entry runtime failures rather than receiving invented source provenance.
+Internal runtime invariants remain visibly distinct from language panics.
 
-Container bodies and backings use the GC heap rather than unconstrained host
-`malloc`. The existing 4-GiB arena limit, allocation policy, failure
-classification, exact tracing, stationary references, and epoch rollover
-therefore apply to user container storage. Host allocation remains limited to
-collector scratch and platform/runtime metadata already outside the language
-arenas.
+Generated-C compilation is a compiler/toolchain failure, never a source
+error. Starting or observing a built executable is a program boundary.
+Subprocesses continue to use argument lists rather than shell commands, and
+diagnostic output must tolerate non-UTF-8 host output without losing the
+failure classification.
 
-Generate deterministic descriptors and typed helpers for each concrete
-container type required by the program. Container tracing visits only
-initialized elements or live map entries. Lists and maps are roots even when
-their element, key, and value types contain no further references; nested
-reference-bearing values recursively use the existing exact traversal
-machinery.
+Robustness tests are deterministic and bounded by default. A reported fuzz
+failure must include enough input or seed information to reproduce it. Native
+and sanitizer checks may skip only when their required compiler or facility
+is unavailable, and the unavailable coverage must be explicit.
 
-Lists use contiguous logical index order. Maps use hashed lookup plus an
-explicit insertion-order representation; hash-table slot order is never
-observable and never defines iteration order. Map keys use the equality and
-stable hashing rules already defined for unit, integers, strings, booleans,
-and recursively valid immutable tuples.
+No performance threshold becomes part of the language semantics. Measurements
+record reproducible workloads and counters so regressions can be investigated;
+they do not introduce a benchmark dependency or a timing-sensitive ordinary
+test.
 
-Iteration locking belongs to the container object, not a particular alias.
-Nested iteration is represented by a checked lock count. Structural mutation
-through any alias is rejected while the count is nonzero; non-structural value
-replacement remains governed by the language design.
+## Stage 1: Compile-time diagnostic model and rendering
 
-Generated operations invoke child processes only through existing argument-
-list APIs, add no compiler dependency, and emit deterministic standard C for
-the supported 64-bit POSIX and Windows targets.
+Status: pending.
 
-## Resolved map design decisions
+Extend the diagnostic representation from one primary span to a primary span
+plus ordered related spans. Use related annotations for high-value conflicts
+such as duplicate declarations, prior definitions, or incompatible sites,
+without mechanically attaching noise to every message.
 
-Stage 3 records the map edge semantics in `DESIGN.md`: indexed assignment
-inserts a missing key, replacement retains its insertion position, reinsertion
-after removal appends, the first duplicate literal key establishes position
-while the last supplies the value, missing removal panics, and value
-replacement is permitted during iteration while insertion and removal are
-structural. Allocation and capacity failures retain the shared classified
-managed-allocation reasons at their exact source operations.
+Audit diagnostic ordering, equal-span stability, tab and empty-span rendering,
+line boundaries, end-of-file spans, unusual filenames, independent warning
+and error limits, and warning-before-fatal output. Preserve the existing
+recovery boundaries and ensure every frontend phase reports focused source
+spans owned by the original source file.
 
-## Stage 1: Managed container foundation
+Stage 1 is complete when representative lexer, parser, name, type, semantic,
+and warning diagnostics have stable golden rendering, useful related context
+where the compiler already knows it, and no regression in bounded recovery.
 
-Status: complete.
+## Stage 2: Runtime panic provenance
 
-Define the permanent C carrier, control headers, backing-allocation metadata,
-capacity arithmetic, and generated per-type operation descriptors shared by
-lists and maps. Descriptors provide the size, alignment, copy, equality, hash
-where valid, and trace behavior needed for concrete element/key/value types
-without exposing C types to the language.
+Status: pending.
 
-Extend trace planning and root planning so every list and map value is a
-traceable object carrier regardless of whether its contents contain
-references. Add container control and backing layouts to the existing layout
-registry, including recursive descriptor dependencies. Make the escape
-analysis conservative around container retention without confusing “contains
-a reference” with “is itself an object reference.”
+Audit every fallible typed-IR operation and every generated runtime helper
+against the failure-site table. Complete source operation and function mapping
+for arithmetic, conversions, indexing, allocation, containers, iteration,
+I/O, explicit `panic`, and unhandled `Error` in `main`.
 
-Provide safe internal managed allocation for a control object followed by its
-backing storage. The zero-initialized control must be rooted in canonical frame
-storage before a second allocation can collect. Backing growth must keep the
-old reference published until a fully initialized replacement is ready.
-Failures remain source-attributed and must not publish a partially constructed
-language value.
+Make the runtime presentation contract uniform while keeping pre-entry
+failures and internal invariants honest about their lack of a SAO2 operation.
+Validate filenames with spaces or punctuation, nested calls, multiple failure
+sites on one line, and all supported entry adapters. Generated C locations and
+host addresses must not leak into language panic output.
 
-Implement the non-allocating `str.len()` builtin as the first complete builtin
-rendering seam, then retain capability rejection for list/map execution until
-their operations are enabled by later stages.
+Stage 2 is complete when every reachable language panic has an end-to-end
+witness for its exact reason and SAO2 provenance, while pre-entry and invariant
+failures remain separately recognizable.
 
-Stage 1 is complete when the backend can deterministically plan, render,
-allocate, root, and precisely trace probe container controls and backings using
-production GC paths, while all existing non-container programs remain
-unchanged.
+## Stage 3: Failure boundaries and toolchain hardening
 
-## Stage 2: Complete lists and entry arguments
+Status: pending.
 
-Status: complete.
+Exercise and tighten the complete command boundary: input loading, frontend
+failure, backend invariant failure, generated-C creation, C compiler discovery
+and invocation, executable creation, program launch, program exit, and
+`--show-c`. Preserve warnings, stdout/stderr ownership, exit status, and prior
+artifact guarantees on every path.
 
-Implement list literals, explicitly typed empty lists, length, positive and
-negative indexing, indexed replacement, append, removal by index, membership,
-identity equality, aliasing, and unbounded geometric growth. Preserve
-left-to-right literal evaluation and logical index order. Bounds and allocation
-failures use their existing typed IR sites or new explicitly designed literal-
-allocation sites.
+Make missing, unlaunchable, failing, or falsely successful C compilers
+actionable compiler diagnostics. Preserve captured host stdout and stderr and
+distinguish a program's ordinary nonzero integer result from failure to start
+or abnormal termination. Keep paths and arguments lossless at subprocess
+boundaries.
 
-Element storage must support every v0 storable type: unit, primitives,
-interned strings, tuples, unions, structs, lists, and maps. Copy inline values
-and packed references according to existing value semantics. Growth and
-removal must handle padding without using raw byte comparison as language
-equality.
+Stage 3 is complete when the public CLI has deterministic tests for every
+failure class and no user/source failure can be mistaken for a generated-C,
+toolchain, or program failure.
 
-Materialize `main(args [str])` as an ordinary list in original argument order.
-Validate ASCII before entering `main`, preserve canonical string equality for
-duplicate argument text, root the list during host construction, and release
-any host-side argument interning metadata after the generated program and
-arena lifecycle are complete.
+## Stage 4: Malformed-input corpus and frontend fuzzing
 
-Keep list iteration behind the capability gate until Stage 4. Stage 2 is
-complete when ordinary source programs can construct, pass, return, alias,
-mutate, grow, query, and collect lists—including nested and reference-bearing
-elements—and can consume command-line arguments.
+Status: pending.
 
-## Stage 3: Ordered maps
+Add dependency-free, deterministic lexer and parser fuzzing over arbitrary
+bytes and structured token mutations. Include truncation, delimiter damage,
+operator ambiguity, invalid literals, comments, whitespace, and long recovery
+sequences. Retain minimized readable malformed fixtures for important bugs and
+grammar boundaries.
 
-Status: complete.
+The harness must prove termination, bounded diagnostics, valid source spans,
+stable reruns, and the absence of Rust panics for all generated inputs. Valid
+generated fragments remain covered so hardening cannot simply reject difficult
+syntax. Optional extended runs may use externally supplied seeds or iteration
+counts without making the default suite expensive.
 
-Resolve and document the outstanding map edge semantics, then implement map
-literals, explicitly typed empty maps, lookup, indexed insertion/replacement,
-removal by key, length, key membership, identity equality, aliasing, and
-unbounded growth.
+Stage 4 is complete when lexer/parser fuzz campaigns are reproducible in the
+ordinary test harness, malformed grammar families have durable regression
+fixtures, and failures print a directly reusable reproducer.
 
-Use deterministic open-addressed lookup metadata together with explicit
-insertion-order entries. Rehashing may change private slot placement but must
-not change observable order. Equality and hashing must agree for every valid
-key type, including integer extremes, canonical strings, booleans, unit,
-nested nominal tuples, and positive/negative floating zero only where floats
-occur inside values rather than keys.
+## Stage 5: V0 conformance and sanitizer matrix
 
-Keep partially initialized slots, tombstones, and capacity-only bytes outside
-the traced live set. Rehash and compaction use allocate/copy/publish
-transactions which remain safe if allocation collects or fails. Updating an
-existing key must preserve the design-selected insertion semantics.
+Status: pending.
 
-Keep map iteration behind the Stage 4 gate. Stage 3 is complete when public
-programs can use ordered maps through every non-iteration operation with exact
-failure attribution, stable key semantics, GC-safe nested values, and
-deterministic generated C.
+Build a requirements ledger for every normative rule in `DESIGN.md` and every
+production in `GRAMMAR.ebnf`. Map each item to a focused unit, frontend, IR,
+backend, native, or public end-to-end witness; add tests for genuine gaps and
+record deliberately out-of-scope behavior without treating it as conformance.
 
-## Stage 4: Iteration and structural mutation guards
+Compile and run representative generated programs with the available C
+compiler families and their address/undefined-behavior sanitizers. Include
+primitive checks, value copying, structs and interior references, GC, recursive
+container graphs, growth, iteration locks, panics, and all entry adapters.
+Keep sanitizer flags out of ordinary generated programs and isolate compiler-
+specific capability detection in the test harness.
 
-Status: complete.
+Stage 5 is complete when every v0 design and grammar rule has an evidence
+owner, the complete normal suite passes, and each available sanitizer/compiler
+combination passes its representative native matrix with explicit skips for
+unavailable combinations.
 
-Render the existing `BeginIteration`, `IterationValue`, `EndIteration`, and
-`IterationUnlocked` IR operations. List iteration yields values in index order;
-map iteration yields keys in insertion order. The iteration source is
-evaluated once and kept rooted for the complete loop.
+## Stage 6: Measurement, integration, and v0 closure
 
-Implement checked nested lock counts on the shared container object so every
-alias observes the same active iterations. Reject append, removal, missing-key
-insertion, and any other structural change while locked. Permit or reject
-non-structural replacement exactly as recorded in `DESIGN.md`.
+Status: pending.
 
-Preserve cleanup on fallthrough, `break`, `continue`, and every normal return
-from nested loops. Panic still terminates without language-level unwinding.
-Counter overflow, underflow, mismatched end operations, and invalid iterator
-state are runtime invariants rather than ordinary source outcomes.
+Add stable instrumentation or harnesses for compiler phase time, generated-C
+and executable build time, managed allocation and reclamation counts, peak
+live storage, collection count, and collection work. Measure small, growing,
+and GC-heavy public fixtures without changing their language-visible behavior.
+Document the environment and workload alongside results rather than enforcing
+fragile wall-clock limits.
 
-Stage 4 is complete when nested and aliased list/map loops preserve their
-defined order, every exit balances its lock, and structural mutation reliably
-panics at the original source operation without corrupting the container.
+Run the full diagnostic, malformed-input, conformance, native, sanitizer, CLI,
+and deterministic-output suites as one release audit. Remove stale temporary-
+stage wording and capability gates, confirm generated artifacts stay under
+`build/` or test-owned temporary directories, and record any intentionally
+unsupported post-v0 behavior.
 
-## Stage 5: Recursive tracing and growth hardening
-
-Status: complete.
-
-Stress the shared runtime across recursive combinations: lists of lists, maps
-of containers, tuples and unions containing containers, containers containing
-struct roots and interior references, and cyclic graphs crossing container and
-struct boundaries. Confirm exact trace-key behavior and owner retention remain
-correct when backing allocations are replaced.
-
-Exercise repeated growth, rehash, removal, tombstone reuse or compaction,
-allocation-threshold collection, pressure collection, and epoch rollover.
-Collector safe points may occur while constructing literals, appending,
-inserting, or growing, but no decoded element, entry, control, or backing
-pointer may survive such a point.
-
-Harden arithmetic and failure behavior for capacity growth, byte sizing,
-offset representation, arena exhaustion, commit failure, collector scratch
-failure, index failure, missing keys, iteration locks, and impossible internal
-state. Every recoverable failure is transactional and source-attributed; every
-runtime structure remains walkable after failed internal work.
-
-Stage 5 is complete when arbitrary nested and cyclic container graphs remain
-precise under sustained mutation and collection, dead backings and containers
-are reclaimed, live identities never move, and no correctness property relies
-on unused capacity being zero or traced.
-
-## Stage 6: Integration and milestone closure
-
-Status: complete.
-
-The detailed implementation plan is in
-[Current Stage: Integration and Milestone Closure](CURRENT_STAGE.md).
-
-Exercise the full public pipeline with readable programs combining lists,
-maps, structs, tuples, unions, strings, command-line arguments, calls,
-recursion, branches, loops, mutation, membership, indexing, and all supported
-return shapes. Include useful algorithms whose working sets grow beyond their
-initial capacities and require repeated garbage collections.
-
-Demonstrate reference aliasing, tuple value copying, map insertion order,
-negative list indexing, nested iteration, permitted value replacement, and
-rejected structural mutation. Confirm container identity equality remains
-distinct from structural tuple/key equality.
-
-Retain focused planner, backend, and native probes for details source cannot
-observe: descriptor order, physical layouts, hash slots, capacity arithmetic,
-root/frame selection, exact tracing, growth publication order, iteration-lock
-balance, free-list reuse, failure injection, and epoch rollover. Identical
-input must produce byte-for-byte identical C.
-
-External verification uses Rust 1.90 or newer and supported C compilers on
-both platform families when available. It reports native skips, covers the
-production 4-GiB arena configuration plus reduced stress configurations, and
-leaves generated artifacts only under `build/` or test temporary directories.
-
-Stage 6 and milestone 11 are complete when all designed container programs
-execute through the public compiler, storage grows without a language-visible
-bound other than managed allocation failure, tracing is precise across every
-nested shape, iteration semantics are stable, and the implemented language is
-capable of unbounded container-based computation.
+Stage 6 and milestone 12 are complete when the evidence ledger has no
+unresolved v0 rule, no known correctness defect remains, all available release
+checks pass, measurements are reproducible, and `ROADMAP.md` can mark the v0
+release gate complete.
 
 ## Cross-stage verification
 
-Each stage adds tests at the narrowest useful layer:
+Each stage adds evidence at the narrowest useful layer:
 
-- semantic and IR tests retain existing type, mutability, map-key, failure-site,
-  and cleanup contracts;
-- planner tests cover concrete descriptor closure and deterministic ordering;
-- backend tests cover carrier/layout selection and generated operation order;
-- native probes use production runtime fragments for allocation, hashing,
-  tracing, growth, locking, and injected failure facts;
-- public end-to-end programs prove observable values, aliases, order, panics,
-  arguments, and exit status; and
-- regression tests keep every milestone 1-10 program working unchanged.
+- diagnostic unit tests own rendering, ordering, limits, and related spans;
+- lexer, parser, analysis, and semantic tests own recovery and source subjects;
+- IR and backend tests own failure-site completeness and deterministic tables;
+- native probes own runtime invariants, memory behavior, and injected failures;
+- public end-to-end tests own CLI classification and observable panic text;
+- fuzz tests own arbitrary-input termination and reproducibility; and
+- the conformance ledger points to these tests instead of duplicating them.
 
-Native assertions may be skipped only when no supported C compiler is
-available. Generated-C compile errors, runtime assertion failures, abnormal
-termination, incorrect output, unexpected exit status, or silent capability
-fallback are test failures.
+`cargo test` remains the ordinary regression command. Optional compiler,
+sanitizer, extended-fuzz, and measurement modes must be discoverable, bounded
+when used in automation, and explicit when skipped.
 
 ## Milestone boundaries
 
-The following remain outside milestone 11:
+The following remain outside milestone 12 and v0:
 
-- printing lists or maps, structural container equality, ordering comparisons,
-  sorting, slicing, comprehensions, and iterator values as first-class objects;
-- additional collection types such as sets, queues, or user-defined iterators;
-- user-selectable hashers, capacity reservation, load factors, or allocation
-  placement;
-- weak containers, finalizers, concurrent mutation, or thread safety;
-- changing ASCII-only strings into a general mutable string type;
-- exposing GC, arena, backing-storage, hash-slot, or address details to source;
-- FFI, modules, closures, or standard-library APIs beyond the v0 design; and
-- diagnostics-wide presentation work belonging to milestone 12.
+- new syntax, types, intrinsics, containers, modules, closures, FFI, or a
+  standard library beyond `DESIGN.md`;
+- runtime stack traces, interactive diagnostics, machine-readable diagnostic
+  formats, localization, or terminal color;
+- Unicode source/string semantics beyond the designed ASCII string model;
+- an optimizing backend, incremental compilation, caching, or parallel builds;
+- a general-purpose fuzzing dependency or hosted fuzzing service;
+- hard performance guarantees or platform behavior not promised by the design;
+- concurrent or moving garbage collection; and
+- packaging, distribution channels, or post-v0 compatibility policy.
 
-Contributor guidance authorizes compilation and tests for this completed stage
-while continuing to prohibit formatting files. Generated artifacts must not be
-committed, and every stage must preserve filenames and byte-oriented source
-locations for diagnostics.
+Contributor guidance authorizes compilation and tests while continuing to
+prohibit formatting files. The milestone must remain dependency-free unless a
+separate explicit decision documents a clear benefit.

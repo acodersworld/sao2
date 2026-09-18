@@ -193,10 +193,9 @@ Status: complete.
 This milestone is complete. Its public integration evidence is retained in the
 readable fixtures and end-to-end conformance ledger under `tests/`.
 
-The milestone breakdown is in
-[Current Milestone: Containers](CURRENT_MILESTONE.md). The active
-implementation plan, now complete, is in
-[Current Stage: Integration and Milestone Closure](CURRENT_STAGE.md).
+The completed milestone covered managed container foundations, lists, ordered
+maps, iteration locks, recursive tracing and growth hardening, and final public
+integration.
 
 - Implement lists, maps, indexing, membership, iteration, and mutation.
 - Preserve insertion order in maps.
@@ -209,10 +208,12 @@ the abstract language is Turing-complete.
 
 ## 12. Diagnostics and hardening
 
-Status: pending.
+Status: current.
 
-The next active milestone will establish its detailed plan before implementation
-begins.
+This is the final implementation milestone in the v0 roadmap. Its staged plan
+is in [Current Milestone: Diagnostics and Hardening](CURRENT_MILESTONE.md).
+Stage 1 is next and will receive a detailed plan in `CURRENT_STAGE.md` before
+implementation begins.
 
 - Render compile-time diagnostics with primary and related source spans.
 - Map every runtime panic to its SAO2 operation and function.
