@@ -61,25 +61,15 @@ Generated operations invoke child processes only through existing argument-
 list APIs, add no compiler dependency, and emit deterministic standard C for
 the supported 64-bit POSIX and Windows targets.
 
-## Design decisions required before implementation
+## Resolved map design decisions
 
-`DESIGN.md` defines the core semantics but does not yet state every map edge
-case needed by the runtime. Before the relevant stage, make explicit decisions
-for:
-
-- whether assigning a missing map key inserts it;
-- whether replacing an existing value retains that key's insertion position;
-- where a removed and later reinserted key appears;
-- how duplicate keys in one map literal are resolved and ordered;
-- whether `removeKey` on a missing key panics or is a no-op;
-- the exact source-attributed reasons for list/map allocation and capacity
-  failure; and
-- whether replacing an existing map value is permitted during iteration while
-  insertion remains forbidden.
-
-Do not infer these rules from a convenient C data structure. Update the design
-and corresponding semantic/IR tests as one explicit decision before map
-runtime behavior depends on them.
+Stage 3 records the map edge semantics in `DESIGN.md`: indexed assignment
+inserts a missing key, replacement retains its insertion position, reinsertion
+after removal appends, the first duplicate literal key establishes position
+while the last supplies the value, missing removal panics, and value
+replacement is permitted during iteration while insertion and removal are
+structural. Allocation and capacity failures retain the shared classified
+managed-allocation reasons at their exact source operations.
 
 ## Stage 1: Managed container foundation
 
@@ -144,10 +134,7 @@ elements—and can consume command-line arguments.
 
 ## Stage 3: Ordered maps
 
-Status: current.
-
-The detailed implementation plan is in
-[Current Stage: Ordered Maps](CURRENT_STAGE.md).
+Status: complete.
 
 Resolve and document the outstanding map edge semantics, then implement map
 literals, explicitly typed empty maps, lookup, indexed insertion/replacement,
@@ -173,7 +160,10 @@ deterministic generated C.
 
 ## Stage 4: Iteration and structural mutation guards
 
-Status: pending.
+Status: current.
+
+The detailed implementation plan is in
+[Current Stage: Iteration and Structural Mutation Guards](CURRENT_STAGE.md).
 
 Render the existing `BeginIteration`, `IterationValue`, `EndIteration`, and
 `IterationUnlocked` IR operations. List iteration yields values in index order;
